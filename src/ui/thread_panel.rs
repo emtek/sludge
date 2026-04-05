@@ -3,7 +3,6 @@ use gtk4::{self as gtk, Button, Label, ListBox, ListBoxRow, Picture, ScrolledWin
 use slacko::types::Message;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::rc::Rc;
 
 use crate::slack::client::Client;
 use crate::slack::helpers::format_message_markup;
@@ -24,8 +23,6 @@ pub struct ThreadPanel {
     channel_id: RefCell<Option<String>>,
     /// Message ts to scroll to after thread loads (set by notification click).
     pub pending_scroll: RefCell<Option<String>>,
-    /// Floating widgets that need explicit unparent on clear.
-    pub floating_widgets: Rc<RefCell<Vec<gtk::Widget>>>,
 }
 
 impl ThreadPanel {
@@ -123,7 +120,6 @@ impl ThreadPanel {
             self_user_id: RefCell::new(String::new()),
             channel_id: RefCell::new(None),
             pending_scroll: RefCell::new(None),
-            floating_widgets: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -154,9 +150,11 @@ impl ThreadPanel {
     }
 
     pub fn clear(&self) {
-        // Unparent floating widgets before removing rows (remove doesn't trigger destroy)
-        for w in self.floating_widgets.borrow_mut().drain(..) {
-            w.unparent();
+        // Unparent floating widgets (popovers, emoji choosers) before removing rows
+        let mut idx = 0;
+        while let Some(row) = self.list_box.row_at_index(idx) {
+            crate::ui::message_view::MessageView::unparent_floating_recursive(&row);
+            idx += 1;
         }
         while let Some(child) = self.list_box.first_child() {
             self.list_box.remove(&child);
@@ -180,7 +178,6 @@ impl ThreadPanel {
         for msg in messages {
             let row = make_thread_message_row(
                 msg, users, client, rt, &rcb, &dcb, cid.as_deref(), &self_uid,
-                &self.floating_widgets,
             );
             self.list_box.append(&row);
         }
@@ -201,7 +198,6 @@ impl ThreadPanel {
         let cid = self.channel_id.borrow().clone();
         let row = make_thread_message_row(
             msg, users, client, rt, &rcb, &dcb, cid.as_deref(), &self_uid,
-            &self.floating_widgets,
         );
         self.list_box.append(&row);
         self.scroll_to_bottom();
@@ -267,7 +263,6 @@ fn make_thread_message_row(
     delete_cb: &Option<crate::ui::message_view::DeleteCallback>,
     channel_id: Option<&str>,
     self_user_id: &str,
-    floating_widgets: &Rc<RefCell<Vec<gtk::Widget>>>,
 ) -> ListBoxRow {
     let row = ListBoxRow::new();
 
@@ -440,7 +435,6 @@ fn make_thread_message_row(
                 let btn = crate::ui::message_view::make_reaction_button(
                     reaction, users, &msg.ts,
                     reaction_cb, channel_id,
-                    &floating_widgets,
                 );
                 reactions_box.insert(&btn, -1);
             }
@@ -459,7 +453,6 @@ fn make_thread_message_row(
 
             let cell_click = chooser_cell.clone();
             let btn_weak = add_btn.downgrade();
-            let fw = floating_widgets.clone();
             add_btn.connect_clicked(move |_| {
                 let Some(btn) = btn_weak.upgrade() else { return };
                 let mut cell = cell_click.borrow_mut();
@@ -477,7 +470,6 @@ fn make_thread_message_row(
                         rcb3(&cid3, &ts3, &shortcode, &dummy);
                     });
                     chooser.set_parent(&btn);
-                    fw.borrow_mut().push(chooser.clone().upcast());
                     *cell = Some(chooser);
                 }
                 if let Some(chooser) = cell.as_ref() {

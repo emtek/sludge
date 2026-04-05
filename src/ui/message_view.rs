@@ -42,8 +42,6 @@ pub struct MessageView {
     pub typing_label: Label,
     /// Generation counter; incremented on clear() so in-flight image loads detect staleness.
     image_generation: Rc<Cell<u64>>,
-    /// Floating widgets (popovers, emoji choosers) that need explicit unparent on clear.
-    pub floating_widgets: Rc<RefCell<Vec<gtk::Widget>>>,
 }
 
 impl MessageView {
@@ -128,7 +126,6 @@ impl MessageView {
             reaction_boxes: Rc::new(RefCell::new(HashMap::new())),
             typing_label,
             image_generation: Rc::new(Cell::new(0)),
-            floating_widgets: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -188,6 +185,8 @@ impl MessageView {
             };
             if count <= 1 { break; }
             if let Some(child) = flow_box.child_at_index(0) {
+                // Unparent any popovers attached to this button before removing
+                Self::unparent_floating_recursive(&child);
                 flow_box.remove(&child);
             }
         }
@@ -199,7 +198,6 @@ impl MessageView {
             let btn = make_reaction_button(
                 reaction, users, ts,
                 &reaction_cb, channel_id.as_deref(),
-                &self.floating_widgets,
             );
             let insert_pos = {
                 let mut n = 0;
@@ -222,14 +220,11 @@ impl MessageView {
         // Bump generation so in-flight image downloads from the previous channel bail out
         self.image_generation.set(self.image_generation.get() + 1);
 
-        // Unparent popovers/emoji choosers and clear textures before removing rows.
-        // ListBox.remove() does NOT emit `destroy`, so connect_destroy cleanup never fires.
-        // We must explicitly unparent all child popovers here.
-        // Unparent floating widgets (popovers, emoji choosers) BEFORE removing rows
-        self.clear_floating_widgets();
-
+        // Walk the tree and unparent all popovers/emoji choosers BEFORE removing rows.
+        // ListBox.remove() does NOT emit `destroy`, so set_parent'd widgets leak.
         let mut idx = 0;
         while let Some(row) = self.list_box.row_at_index(idx) {
+            Self::unparent_floating_recursive(&row);
             Self::clear_pictures_recursive(&row);
             idx += 1;
         }
@@ -241,11 +236,25 @@ impl MessageView {
         self.reaction_boxes.borrow_mut().clear();
     }
 
-    /// Unparent all tracked floating widgets (popovers, emoji choosers) to prevent leaks.
+    /// Recursively find and unparent all Popover and EmojiChooser widgets in the tree.
     /// GTK's `remove()` does not emit `destroy`, so connect_destroy cleanup never fires.
-    fn clear_floating_widgets(&self) {
-        for popover in self.floating_widgets.borrow_mut().drain(..) {
-            popover.unparent();
+    /// Popovers attached via `set_parent()` are not regular children — they must be
+    /// explicitly unparented or they leak and cause SEGV on finalization.
+    pub fn unparent_floating_recursive(widget: &impl IsA<gtk::Widget>) {
+        let widget = widget.as_ref();
+        // Check direct children first
+        let mut child = widget.first_child();
+        while let Some(c) = child {
+            // Grab next sibling BEFORE we potentially unparent this child
+            let next = c.next_sibling();
+            if c.downcast_ref::<gtk::Popover>().is_some()
+                || c.downcast_ref::<gtk::EmojiChooser>().is_some()
+            {
+                c.unparent();
+            } else {
+                Self::unparent_floating_recursive(&c);
+            }
+            child = next;
         }
     }
 
@@ -282,7 +291,6 @@ impl MessageView {
         let rb = self.reaction_boxes.clone();
 
         let img_gen = self.image_generation.clone();
-        let fw = self.floating_widgets.clone();
 
         // Slack returns newest-first; display oldest-first
         for msg in messages.iter().rev() {
@@ -290,7 +298,7 @@ impl MessageView {
                 msg, users, client, rt,
                 &thread_cb, &mention_cb, &reaction_cb, &delete_cb,
                 channel_id.as_deref(), &tc.borrow(), &tl, &rb, &self_uid,
-                &img_gen, &fw,
+                &img_gen,
             );
             self.list_box.append(&row);
         }
@@ -315,12 +323,11 @@ impl MessageView {
         let tl = self.thread_labels.clone();
         let rb = self.reaction_boxes.clone();
         let img_gen = self.image_generation.clone();
-        let fw = self.floating_widgets.clone();
         let row = make_message_row(
             msg, users, client, rt,
             &thread_cb, &mention_cb, &reaction_cb, &delete_cb,
             channel_id.as_deref(), &tc.borrow(), &tl, &rb, &self_uid,
-            &img_gen, &fw,
+            &img_gen,
         );
         self.list_box.append(&row);
         self.scroll_to_bottom();
@@ -387,7 +394,6 @@ fn make_message_row(
     reaction_boxes: &Rc<RefCell<HashMap<String, gtk::FlowBox>>>,
     self_user_id: &str,
     image_generation: &Rc<Cell<u64>>,
-    floating_widgets: &Rc<RefCell<Vec<gtk::Widget>>>,
 ) -> ListBoxRow {
     let row = ListBoxRow::new();
 
@@ -678,7 +684,6 @@ fn make_message_row(
                 let btn = make_reaction_button(
                     reaction, users, &msg.ts,
                     reaction_cb, channel_id,
-                    floating_widgets,
                 );
                 reactions_box.insert(&btn, -1);
             }
@@ -697,7 +702,6 @@ fn make_message_row(
 
             let cell_click = chooser_cell.clone();
             let btn_weak = add_btn.downgrade();
-            let fw = floating_widgets.clone();
             add_btn.connect_clicked(move |_| {
                 let Some(btn) = btn_weak.upgrade() else { return };
                 let mut cell = cell_click.borrow_mut();
@@ -715,7 +719,6 @@ fn make_message_row(
                         rcb3(&cid3, &ts3, &shortcode, &dummy);
                     });
                     chooser.set_parent(&btn);
-                    fw.borrow_mut().push(chooser.clone().upcast());
                     *cell = Some(chooser);
                 }
                 if let Some(chooser) = cell.as_ref() {
@@ -757,7 +760,6 @@ pub fn make_reaction_button(
     msg_ts: &str,
     reaction_cb: &Option<ReactionCallback>,
     channel_id: Option<&str>,
-    floating_widgets: &Rc<RefCell<Vec<gtk::Widget>>>,
 ) -> gtk::Button {
     let emoji_unicode = emojis::get_by_shortcode(&reaction.name)
         .map(|e| e.as_str().to_string())
@@ -812,7 +814,6 @@ pub fn make_reaction_button(
         popover.set_child(Some(&list_box));
         popover.set_parent(&btn);
         popover.set_autohide(true);
-        floating_widgets.borrow_mut().push(popover.clone().upcast());
 
         let gesture = gtk::GestureClick::new();
         gesture.set_button(3); // right-click
