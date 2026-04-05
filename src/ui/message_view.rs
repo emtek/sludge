@@ -42,8 +42,8 @@ pub struct MessageView {
     pub typing_label: Label,
     /// Generation counter; incremented on clear() so in-flight image loads detect staleness.
     image_generation: Rc<Cell<u64>>,
-    /// Emoji chooser cells — take + unparent on clear since tree walk can miss them.
-    emoji_chooser_cells: Rc<RefCell<Vec<Rc<RefCell<Option<gtk::EmojiChooser>>>>>>,
+    /// Reaction picker cells — take + unparent on clear.
+    picker_cells: Rc<RefCell<Vec<Rc<RefCell<Option<gtk::Popover>>>>>>,
 }
 
 impl MessageView {
@@ -128,7 +128,7 @@ impl MessageView {
             reaction_boxes: Rc::new(RefCell::new(HashMap::new())),
             typing_label,
             image_generation: Rc::new(Cell::new(0)),
-            emoji_chooser_cells: Rc::new(RefCell::new(Vec::new())),
+            picker_cells: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -228,7 +228,7 @@ impl MessageView {
         // Explicitly unparent all tracked emoji choosers — the tree walk may miss
         // popovers because GTK4 set_parent'd popovers don't always appear in
         // first_child() traversal depending on the container nesting.
-        for cell in self.emoji_chooser_cells.borrow_mut().drain(..) {
+        for cell in self.picker_cells.borrow_mut().drain(..) {
             if let Some(chooser) = cell.borrow_mut().take() {
                 chooser.unparent();
             }
@@ -306,7 +306,7 @@ impl MessageView {
         let rb = self.reaction_boxes.clone();
 
         let img_gen = self.image_generation.clone();
-        let ecc = self.emoji_chooser_cells.clone();
+        let ecc = self.picker_cells.clone();
 
         // Slack returns newest-first; display oldest-first
         for msg in messages.iter().rev() {
@@ -340,7 +340,7 @@ impl MessageView {
         let tl = self.thread_labels.clone();
         let rb = self.reaction_boxes.clone();
         let img_gen = self.image_generation.clone();
-        let ecc = self.emoji_chooser_cells.clone();
+        let ecc = self.picker_cells.clone();
         let row = make_message_row(
             msg, users, client, rt,
             &thread_cb, &mention_cb, &reaction_cb, &delete_cb,
@@ -412,7 +412,7 @@ fn make_message_row(
     reaction_boxes: &Rc<RefCell<HashMap<String, gtk::FlowBox>>>,
     self_user_id: &str,
     image_generation: &Rc<Cell<u64>>,
-    emoji_chooser_cells: &Rc<RefCell<Vec<Rc<RefCell<Option<gtk::EmojiChooser>>>>>>,
+    picker_cells: &Rc<RefCell<Vec<Rc<RefCell<Option<gtk::Popover>>>>>>,
 ) -> ListBoxRow {
     let row = ListBoxRow::new();
 
@@ -713,7 +713,7 @@ fn make_message_row(
             }
         }
 
-        // Add reaction button (emoji chooser created lazily on first click)
+        // Add reaction button with lightweight emoji picker
         if let (Some(rcb), Some(cid)) = (reaction_cb.clone(), channel_id) {
             let add_btn = gtk::Button::from_icon_name("list-add-symbolic");
             add_btn.add_css_class("flat");
@@ -722,46 +722,27 @@ fn make_message_row(
             let rcb2 = rcb.clone();
             let cid2 = cid.to_string();
             let ts2 = msg.ts.clone();
-            let chooser_cell: Rc<RefCell<Option<gtk::EmojiChooser>>> = Rc::new(RefCell::new(None));
-            emoji_chooser_cells.borrow_mut().push(chooser_cell.clone());
+            let picker_cell: Rc<RefCell<Option<gtk::Popover>>> = Rc::new(RefCell::new(None));
+            picker_cells.borrow_mut().push(picker_cell.clone());
 
-            let cell_click = chooser_cell.clone();
+            let cell_click = picker_cell.clone();
             let btn_weak = add_btn.downgrade();
             add_btn.connect_clicked(move |_| {
                 let Some(btn) = btn_weak.upgrade() else { return };
-                // Destroy any previous chooser to release memory
-                if let Some(old) = cell_click.borrow_mut().take() {
-                    old.unparent();
+                if cell_click.borrow().is_none() {
+                    let rcb3 = rcb2.clone();
+                    let cid3 = cid2.clone();
+                    let ts3 = ts2.clone();
+                    let on_pick: Rc<dyn Fn(&str)> = Rc::new(move |shortcode: &str| {
+                        let dummy = gtk::Button::new();
+                        rcb3(&cid3, &ts3, shortcode, &dummy);
+                    });
+                    let picker = crate::ui::emoji_picker::build(&btn, on_pick);
+                    *cell_click.borrow_mut() = Some(picker);
                 }
-                crate::mem::log_mem("EmojiChooser::new() BEFORE");
-                let chooser = gtk::EmojiChooser::new();
-                crate::mem::log_mem("EmojiChooser::new() AFTER");
-                let rcb3 = rcb2.clone();
-                let cid3 = cid2.clone();
-                let ts3 = ts2.clone();
-                let cell_close = cell_click.clone();
-                chooser.connect_emoji_picked(move |_, emoji| {
-                    let shortcode = emojis::get(emoji)
-                        .and_then(|e| e.shortcode())
-                        .unwrap_or(emoji)
-                        .to_string();
-                    let dummy = gtk::Button::new();
-                    rcb3(&cid3, &ts3, &shortcode, &dummy);
-                });
-                // Destroy the chooser when it closes to free memory
-                let cell_closed = cell_click.clone();
-                chooser.connect_closed(move |_| {
-                    crate::mem::log_mem("EmojiChooser CLOSED (before destroy)");
-                    if let Some(old) = cell_closed.borrow_mut().take() {
-                        old.unparent();
-                    }
-                    crate::mem::trim_heap();
-                    crate::mem::log_mem("EmojiChooser CLOSED (after destroy+trim)");
-                });
-                chooser.set_parent(&btn);
-                chooser.popup();
-                crate::mem::log_mem("EmojiChooser POPUP shown");
-                *cell_click.borrow_mut() = Some(chooser);
+                if let Some(picker) = cell_click.borrow().as_ref() {
+                    picker.popup();
+                }
             });
 
             reactions_box.insert(&add_btn, -1);

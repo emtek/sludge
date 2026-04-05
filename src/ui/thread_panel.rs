@@ -24,7 +24,7 @@ pub struct ThreadPanel {
     channel_id: RefCell<Option<String>>,
     /// Message ts to scroll to after thread loads (set by notification click).
     pub pending_scroll: RefCell<Option<String>>,
-    emoji_chooser_cells: Rc<RefCell<Vec<Rc<RefCell<Option<gtk::EmojiChooser>>>>>>,
+    picker_cells: Rc<RefCell<Vec<Rc<RefCell<Option<gtk::Popover>>>>>>,
 }
 
 impl ThreadPanel {
@@ -122,7 +122,7 @@ impl ThreadPanel {
             self_user_id: RefCell::new(String::new()),
             channel_id: RefCell::new(None),
             pending_scroll: RefCell::new(None),
-            emoji_chooser_cells: Rc::new(RefCell::new(Vec::new())),
+            picker_cells: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -154,7 +154,7 @@ impl ThreadPanel {
 
     pub fn clear(&self) {
         // Explicitly unparent tracked emoji choosers
-        for cell in self.emoji_chooser_cells.borrow_mut().drain(..) {
+        for cell in self.picker_cells.borrow_mut().drain(..) {
             if let Some(chooser) = cell.borrow_mut().take() {
                 chooser.unparent();
             }
@@ -186,7 +186,7 @@ impl ThreadPanel {
         let cid = self.channel_id.borrow().clone();
         for msg in messages {
             let row = make_thread_message_row(
-                msg, users, client, rt, &rcb, &dcb, cid.as_deref(), &self_uid, &self.emoji_chooser_cells,
+                msg, users, client, rt, &rcb, &dcb, cid.as_deref(), &self_uid, &self.picker_cells,
             );
             self.list_box.append(&row);
         }
@@ -206,7 +206,7 @@ impl ThreadPanel {
         let self_uid = self.self_user_id.borrow().clone();
         let cid = self.channel_id.borrow().clone();
         let row = make_thread_message_row(
-            msg, users, client, rt, &rcb, &dcb, cid.as_deref(), &self_uid, &self.emoji_chooser_cells,
+            msg, users, client, rt, &rcb, &dcb, cid.as_deref(), &self_uid, &self.picker_cells,
         );
         self.list_box.append(&row);
         self.scroll_to_bottom();
@@ -272,7 +272,7 @@ fn make_thread_message_row(
     delete_cb: &Option<crate::ui::message_view::DeleteCallback>,
     channel_id: Option<&str>,
     self_user_id: &str,
-    emoji_chooser_cells: &Rc<RefCell<Vec<Rc<RefCell<Option<gtk::EmojiChooser>>>>>>,
+    picker_cells: &Rc<RefCell<Vec<Rc<RefCell<Option<gtk::Popover>>>>>>,
 ) -> ListBoxRow {
     let row = ListBoxRow::new();
 
@@ -460,40 +460,28 @@ fn make_thread_message_row(
             let rcb2 = rcb.clone();
             let cid2 = cid.to_string();
             let ts2 = msg.ts.clone();
-            let chooser_cell: Rc<RefCell<Option<gtk::EmojiChooser>>> =
+            let chooser_cell: Rc<RefCell<Option<gtk::Popover>>> =
                 Rc::new(RefCell::new(None));
-            emoji_chooser_cells.borrow_mut().push(chooser_cell.clone());
+            picker_cells.borrow_mut().push(chooser_cell.clone());
 
             let cell_click = chooser_cell.clone();
             let btn_weak = add_btn.downgrade();
             add_btn.connect_clicked(move |_| {
                 let Some(btn) = btn_weak.upgrade() else { return };
-                // Destroy any previous chooser to release memory
-                if let Some(old) = cell_click.borrow_mut().take() {
-                    old.unparent();
+                if cell_click.borrow().is_none() {
+                    let rcb3 = rcb2.clone();
+                    let cid3 = cid2.clone();
+                    let ts3 = ts2.clone();
+                    let on_pick: Rc<dyn Fn(&str)> = Rc::new(move |shortcode: &str| {
+                        let dummy = gtk::Button::new();
+                        rcb3(&cid3, &ts3, shortcode, &dummy);
+                    });
+                    let picker = crate::ui::emoji_picker::build(&btn, on_pick);
+                    *cell_click.borrow_mut() = Some(picker);
                 }
-                let chooser = gtk::EmojiChooser::new();
-                let rcb3 = rcb2.clone();
-                let cid3 = cid2.clone();
-                let ts3 = ts2.clone();
-                chooser.connect_emoji_picked(move |_, emoji| {
-                    let shortcode = emojis::get(emoji)
-                        .and_then(|e| e.shortcode())
-                        .unwrap_or(emoji)
-                        .to_string();
-                    let dummy = gtk::Button::new();
-                    rcb3(&cid3, &ts3, &shortcode, &dummy);
-                });
-                // Destroy when closed to free memory
-                let cell_closed = cell_click.clone();
-                chooser.connect_closed(move |_| {
-                    if let Some(old) = cell_closed.borrow_mut().take() {
-                        old.unparent();
-                    }
-                });
-                chooser.set_parent(&btn);
-                chooser.popup();
-                *cell_click.borrow_mut() = Some(chooser);
+                if let Some(picker) = cell_click.borrow().as_ref() {
+                    picker.popup();
+                }
             });
 
             reactions_box.insert(&add_btn, -1);

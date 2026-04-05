@@ -166,37 +166,27 @@ pub fn build_app(
     emoji_entry.set_width_chars(10);
     emoji_row.append(&emoji_entry);
 
-    // Emoji chooser button — created fresh each click, destroyed on close to free memory
+    // Lightweight emoji picker for status
     let emoji_choose_btn = gtk::Button::from_icon_name("face-smile-symbolic");
     emoji_choose_btn.add_css_class("flat");
     {
         let emoji_entry_ref = emoji_entry.clone();
-        let chooser_cell: Rc<RefCell<Option<gtk::EmojiChooser>>> = Rc::new(RefCell::new(None));
-        let cell_click = chooser_cell.clone();
+        let picker_cell: Rc<RefCell<Option<gtk::Popover>>> = Rc::new(RefCell::new(None));
+        let cell_click = picker_cell.clone();
         let btn_weak = emoji_choose_btn.downgrade();
         emoji_choose_btn.connect_clicked(move |_| {
             let Some(btn) = btn_weak.upgrade() else { return };
-            if let Some(old) = cell_click.borrow_mut().take() {
-                old.unparent();
+            if cell_click.borrow().is_none() {
+                let entry = emoji_entry_ref.clone();
+                let on_pick: Rc<dyn Fn(&str)> = Rc::new(move |shortcode: &str| {
+                    entry.set_text(&format!(":{shortcode}:"));
+                });
+                let picker = crate::ui::emoji_picker::build(&btn, on_pick);
+                *cell_click.borrow_mut() = Some(picker);
             }
-            let chooser = gtk::EmojiChooser::new();
-            let entry = emoji_entry_ref.clone();
-            chooser.connect_emoji_picked(move |_, emoji| {
-                let shortcode = emojis::get(emoji)
-                    .and_then(|e| e.shortcode())
-                    .map(|s| format!(":{s}:"))
-                    .unwrap_or_else(|| emoji.to_string());
-                entry.set_text(&shortcode);
-            });
-            let cell_closed = cell_click.clone();
-            chooser.connect_closed(move |_| {
-                if let Some(old) = cell_closed.borrow_mut().take() {
-                    old.unparent();
-                }
-            });
-            chooser.set_parent(&btn);
-            chooser.popup();
-            *cell_click.borrow_mut() = Some(chooser);
+            if let Some(picker) = cell_click.borrow().as_ref() {
+                picker.popup();
+            }
         });
     }
     emoji_row.append(&emoji_choose_btn);
