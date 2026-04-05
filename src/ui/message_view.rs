@@ -662,23 +662,23 @@ fn make_message_row(
                 Ok(Ok(bytes)) => {
                     let gbytes = gtk4::glib::Bytes::from(&bytes);
                     let stream = gtk4::gio::MemoryInputStream::from_bytes(&gbytes);
-                    match gtk4::gdk_pixbuf::Pixbuf::from_stream(
+                    // Decode at display size (max 400px wide) to avoid holding
+                    // full-resolution RGBA buffers (a 5712x4284 photo = 93 MiB).
+                    match gtk4::gdk_pixbuf::Pixbuf::from_stream_at_scale(
                         &stream,
+                        400,  // max width
+                        -1,   // auto height (preserve aspect ratio)
+                        true, // preserve_aspect_ratio
                         gtk4::gio::Cancellable::NONE,
                     ) {
                         Ok(pixbuf) => {
                             let w = pixbuf.width();
                             let h = pixbuf.height();
-                            let raw_size = w as usize * h as usize * 4;
-                            tracing::info!("[MEM] Image decoded: {w}x{h} = {:.1} MiB raw", raw_size as f64 / 1048576.0);
                             let texture = gtk4::gdk::Texture::for_pixbuf(&pixbuf);
                             picture.set_paintable(Some(&texture));
                             *stored_texture.borrow_mut() = Some(texture);
                             if w > 0 && h > 0 {
-                                let display_w = 400.min(w);
-                                let display_h =
-                                    (h as f64 * display_w as f64 / w as f64) as i32;
-                                picture.set_size_request(display_w, display_h);
+                                picture.set_size_request(w, h);
                             }
                         }
                         Err(e) => {

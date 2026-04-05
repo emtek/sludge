@@ -410,8 +410,11 @@ fn make_thread_message_row(
             if let Ok(bytes) = bytes_result {
                 let gbytes = gtk4::glib::Bytes::from(&bytes);
                 let stream = gtk4::gio::MemoryInputStream::from_bytes(&gbytes);
-                if let Ok(pixbuf) = gtk4::gdk_pixbuf::Pixbuf::from_stream(
+                if let Ok(pixbuf) = gtk4::gdk_pixbuf::Pixbuf::from_stream_at_scale(
                     &stream,
+                    300,  // max width for thread panel
+                    -1,
+                    true,
                     gtk4::gio::Cancellable::NONE,
                 ) {
                     let texture = gtk4::gdk::Texture::for_pixbuf(&pixbuf);
