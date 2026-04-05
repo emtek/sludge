@@ -3,6 +3,7 @@ use gtk4::{self as gtk, Button, Label, ListBox, ListBoxRow, Picture, ScrolledWin
 use slacko::types::Message;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use crate::slack::client::Client;
 use crate::slack::helpers::format_message_markup;
@@ -23,6 +24,7 @@ pub struct ThreadPanel {
     channel_id: RefCell<Option<String>>,
     /// Message ts to scroll to after thread loads (set by notification click).
     pub pending_scroll: RefCell<Option<String>>,
+    emoji_chooser_cells: Rc<RefCell<Vec<Rc<RefCell<Option<gtk::EmojiChooser>>>>>>,
 }
 
 impl ThreadPanel {
@@ -120,6 +122,7 @@ impl ThreadPanel {
             self_user_id: RefCell::new(String::new()),
             channel_id: RefCell::new(None),
             pending_scroll: RefCell::new(None),
+            emoji_chooser_cells: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -150,7 +153,13 @@ impl ThreadPanel {
     }
 
     pub fn clear(&self) {
-        // Unparent floating widgets (popovers, emoji choosers) before removing rows
+        // Explicitly unparent tracked emoji choosers
+        for cell in self.emoji_chooser_cells.borrow_mut().drain(..) {
+            if let Some(chooser) = cell.borrow_mut().take() {
+                chooser.unparent();
+            }
+        }
+        // Unparent remaining floating widgets (reaction popovers)
         let mut idx = 0;
         while let Some(row) = self.list_box.row_at_index(idx) {
             crate::ui::message_view::MessageView::unparent_floating_recursive(&row);
@@ -177,7 +186,7 @@ impl ThreadPanel {
         let cid = self.channel_id.borrow().clone();
         for msg in messages {
             let row = make_thread_message_row(
-                msg, users, client, rt, &rcb, &dcb, cid.as_deref(), &self_uid,
+                msg, users, client, rt, &rcb, &dcb, cid.as_deref(), &self_uid, &self.emoji_chooser_cells,
             );
             self.list_box.append(&row);
         }
@@ -197,7 +206,7 @@ impl ThreadPanel {
         let self_uid = self.self_user_id.borrow().clone();
         let cid = self.channel_id.borrow().clone();
         let row = make_thread_message_row(
-            msg, users, client, rt, &rcb, &dcb, cid.as_deref(), &self_uid,
+            msg, users, client, rt, &rcb, &dcb, cid.as_deref(), &self_uid, &self.emoji_chooser_cells,
         );
         self.list_box.append(&row);
         self.scroll_to_bottom();
@@ -263,6 +272,7 @@ fn make_thread_message_row(
     delete_cb: &Option<crate::ui::message_view::DeleteCallback>,
     channel_id: Option<&str>,
     self_user_id: &str,
+    emoji_chooser_cells: &Rc<RefCell<Vec<Rc<RefCell<Option<gtk::EmojiChooser>>>>>>,
 ) -> ListBoxRow {
     let row = ListBoxRow::new();
 
@@ -450,8 +460,9 @@ fn make_thread_message_row(
             let rcb2 = rcb.clone();
             let cid2 = cid.to_string();
             let ts2 = msg.ts.clone();
-            let chooser_cell: std::rc::Rc<RefCell<Option<gtk::EmojiChooser>>> =
-                std::rc::Rc::new(RefCell::new(None));
+            let chooser_cell: Rc<RefCell<Option<gtk::EmojiChooser>>> =
+                Rc::new(RefCell::new(None));
+            emoji_chooser_cells.borrow_mut().push(chooser_cell.clone());
 
             let cell_click = chooser_cell.clone();
             let btn_weak = add_btn.downgrade();

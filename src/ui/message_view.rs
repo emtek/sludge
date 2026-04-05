@@ -42,6 +42,8 @@ pub struct MessageView {
     pub typing_label: Label,
     /// Generation counter; incremented on clear() so in-flight image loads detect staleness.
     image_generation: Rc<Cell<u64>>,
+    /// Emoji chooser cells — take + unparent on clear since tree walk can miss them.
+    emoji_chooser_cells: Rc<RefCell<Vec<Rc<RefCell<Option<gtk::EmojiChooser>>>>>>,
 }
 
 impl MessageView {
@@ -126,6 +128,7 @@ impl MessageView {
             reaction_boxes: Rc::new(RefCell::new(HashMap::new())),
             typing_label,
             image_generation: Rc::new(Cell::new(0)),
+            emoji_chooser_cells: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -220,8 +223,16 @@ impl MessageView {
         // Bump generation so in-flight image downloads from the previous channel bail out
         self.image_generation.set(self.image_generation.get() + 1);
 
-        // Walk the tree and unparent all popovers/emoji choosers BEFORE removing rows.
-        // ListBox.remove() does NOT emit `destroy`, so set_parent'd widgets leak.
+        // Explicitly unparent all tracked emoji choosers — the tree walk may miss
+        // popovers because GTK4 set_parent'd popovers don't always appear in
+        // first_child() traversal depending on the container nesting.
+        for cell in self.emoji_chooser_cells.borrow_mut().drain(..) {
+            if let Some(chooser) = cell.borrow_mut().take() {
+                chooser.unparent();
+            }
+        }
+
+        // Walk the tree and unparent remaining popovers (reaction who-reacted).
         let mut idx = 0;
         while let Some(row) = self.list_box.row_at_index(idx) {
             Self::unparent_floating_recursive(&row);
@@ -291,6 +302,7 @@ impl MessageView {
         let rb = self.reaction_boxes.clone();
 
         let img_gen = self.image_generation.clone();
+        let ecc = self.emoji_chooser_cells.clone();
 
         // Slack returns newest-first; display oldest-first
         for msg in messages.iter().rev() {
@@ -298,7 +310,7 @@ impl MessageView {
                 msg, users, client, rt,
                 &thread_cb, &mention_cb, &reaction_cb, &delete_cb,
                 channel_id.as_deref(), &tc.borrow(), &tl, &rb, &self_uid,
-                &img_gen,
+                &img_gen, &ecc,
             );
             self.list_box.append(&row);
         }
@@ -323,11 +335,12 @@ impl MessageView {
         let tl = self.thread_labels.clone();
         let rb = self.reaction_boxes.clone();
         let img_gen = self.image_generation.clone();
+        let ecc = self.emoji_chooser_cells.clone();
         let row = make_message_row(
             msg, users, client, rt,
             &thread_cb, &mention_cb, &reaction_cb, &delete_cb,
             channel_id.as_deref(), &tc.borrow(), &tl, &rb, &self_uid,
-            &img_gen,
+            &img_gen, &ecc,
         );
         self.list_box.append(&row);
         self.scroll_to_bottom();
@@ -394,6 +407,7 @@ fn make_message_row(
     reaction_boxes: &Rc<RefCell<HashMap<String, gtk::FlowBox>>>,
     self_user_id: &str,
     image_generation: &Rc<Cell<u64>>,
+    emoji_chooser_cells: &Rc<RefCell<Vec<Rc<RefCell<Option<gtk::EmojiChooser>>>>>>,
 ) -> ListBoxRow {
     let row = ListBoxRow::new();
 
@@ -701,6 +715,7 @@ fn make_message_row(
             let cid2 = cid.to_string();
             let ts2 = msg.ts.clone();
             let chooser_cell: Rc<RefCell<Option<gtk::EmojiChooser>>> = Rc::new(RefCell::new(None));
+            emoji_chooser_cells.borrow_mut().push(chooser_cell.clone());
 
             let cell_click = chooser_cell.clone();
             let btn_weak = add_btn.downgrade();
