@@ -42,6 +42,8 @@ pub struct MessageView {
     pub typing_label: Label,
     /// Generation counter; incremented on clear() so in-flight image loads detect staleness.
     image_generation: Rc<Cell<u64>>,
+    /// Floating widgets (popovers, emoji choosers) that need explicit unparent on clear.
+    pub floating_widgets: Rc<RefCell<Vec<gtk::Widget>>>,
 }
 
 impl MessageView {
@@ -126,6 +128,7 @@ impl MessageView {
             reaction_boxes: Rc::new(RefCell::new(HashMap::new())),
             typing_label,
             image_generation: Rc::new(Cell::new(0)),
+            floating_widgets: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -196,6 +199,7 @@ impl MessageView {
             let btn = make_reaction_button(
                 reaction, users, ts,
                 &reaction_cb, channel_id.as_deref(),
+                &self.floating_widgets,
             );
             let insert_pos = {
                 let mut n = 0;
@@ -218,7 +222,12 @@ impl MessageView {
         // Bump generation so in-flight image downloads from the previous channel bail out
         self.image_generation.set(self.image_generation.get() + 1);
 
-        // Clear all Picture paintables to release textures before removing rows
+        // Unparent popovers/emoji choosers and clear textures before removing rows.
+        // ListBox.remove() does NOT emit `destroy`, so connect_destroy cleanup never fires.
+        // We must explicitly unparent all child popovers here.
+        // Unparent floating widgets (popovers, emoji choosers) BEFORE removing rows
+        self.clear_floating_widgets();
+
         let mut idx = 0;
         while let Some(row) = self.list_box.row_at_index(idx) {
             Self::clear_pictures_recursive(&row);
@@ -230,6 +239,14 @@ impl MessageView {
         self.thread_counts.borrow_mut().clear();
         self.thread_labels.borrow_mut().clear();
         self.reaction_boxes.borrow_mut().clear();
+    }
+
+    /// Unparent all tracked floating widgets (popovers, emoji choosers) to prevent leaks.
+    /// GTK's `remove()` does not emit `destroy`, so connect_destroy cleanup never fires.
+    fn clear_floating_widgets(&self) {
+        for popover in self.floating_widgets.borrow_mut().drain(..) {
+            popover.unparent();
+        }
     }
 
     /// Recursively clear paintables from Picture widgets in a widget tree.
@@ -265,6 +282,7 @@ impl MessageView {
         let rb = self.reaction_boxes.clone();
 
         let img_gen = self.image_generation.clone();
+        let fw = self.floating_widgets.clone();
 
         // Slack returns newest-first; display oldest-first
         for msg in messages.iter().rev() {
@@ -272,7 +290,7 @@ impl MessageView {
                 msg, users, client, rt,
                 &thread_cb, &mention_cb, &reaction_cb, &delete_cb,
                 channel_id.as_deref(), &tc.borrow(), &tl, &rb, &self_uid,
-                &img_gen,
+                &img_gen, &fw,
             );
             self.list_box.append(&row);
         }
@@ -297,11 +315,12 @@ impl MessageView {
         let tl = self.thread_labels.clone();
         let rb = self.reaction_boxes.clone();
         let img_gen = self.image_generation.clone();
+        let fw = self.floating_widgets.clone();
         let row = make_message_row(
             msg, users, client, rt,
             &thread_cb, &mention_cb, &reaction_cb, &delete_cb,
             channel_id.as_deref(), &tc.borrow(), &tl, &rb, &self_uid,
-            &img_gen,
+            &img_gen, &fw,
         );
         self.list_box.append(&row);
         self.scroll_to_bottom();
@@ -368,6 +387,7 @@ fn make_message_row(
     reaction_boxes: &Rc<RefCell<HashMap<String, gtk::FlowBox>>>,
     self_user_id: &str,
     image_generation: &Rc<Cell<u64>>,
+    floating_widgets: &Rc<RefCell<Vec<gtk::Widget>>>,
 ) -> ListBoxRow {
     let row = ListBoxRow::new();
 
@@ -658,6 +678,7 @@ fn make_message_row(
                 let btn = make_reaction_button(
                     reaction, users, &msg.ts,
                     reaction_cb, channel_id,
+                    floating_widgets,
                 );
                 reactions_box.insert(&btn, -1);
             }
@@ -676,6 +697,7 @@ fn make_message_row(
 
             let cell_click = chooser_cell.clone();
             let btn_weak = add_btn.downgrade();
+            let fw = floating_widgets.clone();
             add_btn.connect_clicked(move |_| {
                 let Some(btn) = btn_weak.upgrade() else { return };
                 let mut cell = cell_click.borrow_mut();
@@ -693,17 +715,11 @@ fn make_message_row(
                         rcb3(&cid3, &ts3, &shortcode, &dummy);
                     });
                     chooser.set_parent(&btn);
+                    fw.borrow_mut().push(chooser.clone().upcast());
                     *cell = Some(chooser);
                 }
                 if let Some(chooser) = cell.as_ref() {
                     chooser.popup();
-                }
-            });
-
-            let cell_destroy = chooser_cell;
-            add_btn.connect_destroy(move |_| {
-                if let Some(c) = cell_destroy.borrow_mut().take() {
-                    c.unparent();
                 }
             });
 
@@ -741,6 +757,7 @@ pub fn make_reaction_button(
     msg_ts: &str,
     reaction_cb: &Option<ReactionCallback>,
     channel_id: Option<&str>,
+    floating_widgets: &Rc<RefCell<Vec<gtk::Widget>>>,
 ) -> gtk::Button {
     let emoji_unicode = emojis::get_by_shortcode(&reaction.name)
         .map(|e| e.as_str().to_string())
@@ -795,14 +812,7 @@ pub fn make_reaction_button(
         popover.set_child(Some(&list_box));
         popover.set_parent(&btn);
         popover.set_autohide(true);
-
-        // Unparent popover when button is destroyed to avoid leak
-        let popover_weak = popover.downgrade();
-        btn.connect_destroy(move |_| {
-            if let Some(p) = popover_weak.upgrade() {
-                p.unparent();
-            }
-        });
+        floating_widgets.borrow_mut().push(popover.clone().upcast());
 
         let gesture = gtk::GestureClick::new();
         gesture.set_button(3); // right-click
