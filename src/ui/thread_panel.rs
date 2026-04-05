@@ -306,9 +306,11 @@ fn make_thread_message_row(
             let dcb = dcb.clone();
             let cid = cid.to_string();
             let ts = msg.ts.clone();
-            let row_ref = row.clone();
+            let row_weak = row.downgrade();
             del_btn.connect_clicked(move |_| {
-                dcb(&cid, &ts, &row_ref);
+                if let Some(row) = row_weak.upgrade() {
+                    dcb(&cid, &ts, &row);
+                }
             });
 
             header.append(&del_btn);
