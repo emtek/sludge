@@ -1,4 +1,5 @@
 mod db;
+pub mod mem;
 mod slack;
 mod ui;
 
@@ -12,6 +13,7 @@ use slack::socket::SlackEvent;
 
 fn main() {
     tracing_subscriber::fmt::init();
+    mem::log_mem("startup");
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -33,6 +35,12 @@ fn main() {
         .application_id("dev.slackfrontend.app")
         .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
         .build();
+
+    // Periodic memory reporter — logs RSS every 10 seconds
+    gtk4::glib::timeout_add_seconds_local(10, || {
+        mem::log_mem("periodic");
+        gtk4::glib::ControlFlow::Continue
+    });
 
     let rt_handle = rt.handle().clone();
     let db = database.clone();

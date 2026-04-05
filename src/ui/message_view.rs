@@ -220,6 +220,8 @@ impl MessageView {
     }
 
     pub fn clear(&self) {
+        crate::mem::log_mem("MessageView::clear() START");
+
         // Bump generation so in-flight image downloads from the previous channel bail out
         self.image_generation.set(self.image_generation.get() + 1);
 
@@ -290,6 +292,7 @@ impl MessageView {
         rt: &tokio::runtime::Handle,
     ) {
         self.clear();
+        crate::mem::log_mem("MessageView::clear() DONE");
 
         let thread_cb = self.thread_callback.borrow().clone();
         let mention_cb = self.mention_callback.borrow().clone();
@@ -316,6 +319,7 @@ impl MessageView {
         }
 
         self.scroll_to_bottom();
+        crate::mem::log_mem("MessageView::set_messages() DONE");
     }
 
     pub fn append_message(
@@ -728,7 +732,9 @@ fn make_message_row(
                 if let Some(old) = cell_click.borrow_mut().take() {
                     old.unparent();
                 }
+                crate::mem::log_mem("EmojiChooser::new() BEFORE");
                 let chooser = gtk::EmojiChooser::new();
+                crate::mem::log_mem("EmojiChooser::new() AFTER");
                 let rcb3 = rcb2.clone();
                 let cid3 = cid2.clone();
                 let ts3 = ts2.clone();
@@ -744,12 +750,15 @@ fn make_message_row(
                 // Destroy the chooser when it closes to free memory
                 let cell_closed = cell_click.clone();
                 chooser.connect_closed(move |_| {
+                    crate::mem::log_mem("EmojiChooser CLOSED (before destroy)");
                     if let Some(old) = cell_closed.borrow_mut().take() {
                         old.unparent();
                     }
+                    crate::mem::log_mem("EmojiChooser CLOSED (after destroy)");
                 });
                 chooser.set_parent(&btn);
                 chooser.popup();
+                crate::mem::log_mem("EmojiChooser POPUP shown");
                 *cell_click.borrow_mut() = Some(chooser);
             });
 
