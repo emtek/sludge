@@ -724,26 +724,33 @@ fn make_message_row(
             let btn_weak = add_btn.downgrade();
             add_btn.connect_clicked(move |_| {
                 let Some(btn) = btn_weak.upgrade() else { return };
-                let mut cell = cell_click.borrow_mut();
-                if cell.is_none() {
-                    let chooser = gtk::EmojiChooser::new();
-                    let rcb3 = rcb2.clone();
-                    let cid3 = cid2.clone();
-                    let ts3 = ts2.clone();
-                    chooser.connect_emoji_picked(move |_, emoji| {
-                        let shortcode = emojis::get(emoji)
-                            .and_then(|e| e.shortcode())
-                            .unwrap_or(emoji)
-                            .to_string();
-                        let dummy = gtk::Button::new();
-                        rcb3(&cid3, &ts3, &shortcode, &dummy);
-                    });
-                    chooser.set_parent(&btn);
-                    *cell = Some(chooser);
+                // Destroy any previous chooser to release memory
+                if let Some(old) = cell_click.borrow_mut().take() {
+                    old.unparent();
                 }
-                if let Some(chooser) = cell.as_ref() {
-                    chooser.popup();
-                }
+                let chooser = gtk::EmojiChooser::new();
+                let rcb3 = rcb2.clone();
+                let cid3 = cid2.clone();
+                let ts3 = ts2.clone();
+                let cell_close = cell_click.clone();
+                chooser.connect_emoji_picked(move |_, emoji| {
+                    let shortcode = emojis::get(emoji)
+                        .and_then(|e| e.shortcode())
+                        .unwrap_or(emoji)
+                        .to_string();
+                    let dummy = gtk::Button::new();
+                    rcb3(&cid3, &ts3, &shortcode, &dummy);
+                });
+                // Destroy the chooser when it closes to free memory
+                let cell_closed = cell_click.clone();
+                chooser.connect_closed(move |_| {
+                    if let Some(old) = cell_closed.borrow_mut().take() {
+                        old.unparent();
+                    }
+                });
+                chooser.set_parent(&btn);
+                chooser.popup();
+                *cell_click.borrow_mut() = Some(chooser);
             });
 
             reactions_box.insert(&add_btn, -1);
