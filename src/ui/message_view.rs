@@ -628,6 +628,8 @@ fn make_message_row(
         let picture_weak = picture.downgrade();
         let img_gen = image_generation.clone();
         let gen_at_start = img_gen.get();
+        // Use Weak so the future doesn't keep the texture alive after the row is freed
+        let stored_texture_weak = Rc::downgrade(&stored_texture);
         // Fetch all candidate URLs on tokio, decode + display on main thread
         gtk4::glib::spawn_future_local(async move {
             let c = client.clone();
@@ -648,7 +650,8 @@ fn make_message_row(
             }).await;
 
             if img_gen.get() != gen_at_start { return; }
-            let Some(picture) = picture_weak.upgrade() else { return };
+            let Some(picture) = picture_weak.upgrade() else { return; };
+            let Some(stored_texture) = stored_texture_weak.upgrade() else { return; };
 
             match bytes_result {
                 Ok(Ok(bytes)) => {
