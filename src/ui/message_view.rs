@@ -667,11 +667,13 @@ fn make_message_row(
                         gtk4::gio::Cancellable::NONE,
                     ) {
                         Ok(pixbuf) => {
+                            let w = pixbuf.width();
+                            let h = pixbuf.height();
+                            let raw_size = w as usize * h as usize * 4;
+                            tracing::info!("[MEM] Image decoded: {w}x{h} = {:.1} MiB raw", raw_size as f64 / 1048576.0);
                             let texture = gtk4::gdk::Texture::for_pixbuf(&pixbuf);
                             picture.set_paintable(Some(&texture));
                             *stored_texture.borrow_mut() = Some(texture);
-                            let w = pixbuf.width();
-                            let h = pixbuf.height();
                             if w > 0 && h > 0 {
                                 let display_w = 400.min(w);
                                 let display_h =
