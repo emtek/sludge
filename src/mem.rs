@@ -12,6 +12,11 @@ pub fn rss_kib() -> u64 {
         .unwrap_or(0)
 }
 
+/// Ask glibc to return free heap pages to the OS so RSS reflects actual usage.
+pub fn trim_heap() {
+    unsafe { libc::malloc_trim(0); }
+}
+
 /// Log current memory usage with a label.
 pub fn log_mem(label: &str) {
     let rss = rss_kib();

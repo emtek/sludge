@@ -292,7 +292,8 @@ impl MessageView {
         rt: &tokio::runtime::Handle,
     ) {
         self.clear();
-        crate::mem::log_mem("MessageView::clear() DONE");
+        crate::mem::trim_heap();
+        crate::mem::log_mem("MessageView::clear() DONE (after trim)");
 
         let thread_cb = self.thread_callback.borrow().clone();
         let mention_cb = self.mention_callback.borrow().clone();
@@ -754,7 +755,8 @@ fn make_message_row(
                     if let Some(old) = cell_closed.borrow_mut().take() {
                         old.unparent();
                     }
-                    crate::mem::log_mem("EmojiChooser CLOSED (after destroy)");
+                    crate::mem::trim_heap();
+                    crate::mem::log_mem("EmojiChooser CLOSED (after destroy+trim)");
                 });
                 chooser.set_parent(&btn);
                 chooser.popup();

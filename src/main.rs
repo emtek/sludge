@@ -36,9 +36,10 @@ fn main() {
         .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
         .build();
 
-    // Periodic memory reporter — logs RSS every 10 seconds
+    // Periodic memory reporter — logs RSS every 10 seconds (with heap trim)
     gtk4::glib::timeout_add_seconds_local(10, || {
-        mem::log_mem("periodic");
+        mem::trim_heap();
+        mem::log_mem("periodic (trimmed)");
         gtk4::glib::ControlFlow::Continue
     });
 

@@ -4169,6 +4169,7 @@ dependencies = [
  "futures-util",
  "gtk4",
  "libadwaita",
+ "libc",
  "pulldown-cmark",
  "reqwest",
  "serde",
