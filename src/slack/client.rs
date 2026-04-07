@@ -32,6 +32,8 @@ struct RawConversationsList {
 #[derive(Debug, serde::Deserialize)]
 struct RawConversationHistory {
     messages: Vec<Message>,
+    #[serde(default)]
+    has_more: bool,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -116,7 +118,7 @@ impl Client {
     }
 
     /// Create a client using raw HTTP for stealth (xoxc/xoxd) auth.
-    pub fn new_stealth(xoxc_token: String, xoxd_cookie: String) -> Self {
+    pub fn new_stealth(xoxc_token: String, xoxd_cookie: String, workspace_url: Option<String>) -> Self {
         let http = reqwest::Client::new();
         Self {
             backend: Backend::Stealth {
@@ -124,7 +126,7 @@ impl Client {
                 creds: StealthCreds {
                     xoxc_token,
                     xoxd_cookie,
-                    workspace_url: None,
+                    workspace_url,
                 },
             },
             app_token_client: None,
@@ -152,14 +154,14 @@ impl Client {
     }
 
     /// Fetch image bytes with local disk caching.
-    /// Cached files are stored under `~/.local/share/slag/image_cache/`.
+    /// Cached files are stored under `~/.local/share/sludge/image_cache/`.
     pub async fn fetch_image_bytes(&self, url: &str) -> Result<Vec<u8>, String> {
         use std::hash::{Hash, Hasher};
 
         // Build a deterministic cache path from the URL
         let cache_dir = dirs::data_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join("slag")
+            .join("sludge")
             .join("image_cache");
 
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -256,10 +258,20 @@ impl Client {
             .map_err(|e| format!("HTTP error: {e}"))?;
 
         let status = resp.status();
-        let body: RawResponse<T> = resp
-            .json()
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            error!("Stealth {method} HTTP {status}: {text}");
+            return Err(format!("{method} HTTP {status}: {text}"));
+        }
+
+        let text = resp
+            .text()
             .await
-            .map_err(|e| format!("Parse error (status {status}): {e}"))?;
+            .map_err(|e| format!("Read error: {e}"))?;
+        debug!("Stealth {method} response: {}", &text[..text.len().min(500)]);
+
+        let body: RawResponse<T> =
+            serde_json::from_str(&text).map_err(|e| format!("Parse error (status {status}): {e}"))?;
 
         if !body.ok {
             let err = body.error.unwrap_or_else(|| "unknown".into());
@@ -421,6 +433,121 @@ impl Client {
                     Self::stealth_post(http, creds, "conversations.history", &fields).await?;
                 info!("conversations.history returned {} messages", data.messages.len());
                 Ok(data.messages)
+            }
+        }
+    }
+
+    /// Fetch messages older than `latest` (exclusive) from a channel.
+    pub async fn conversation_history_before(
+        &self,
+        channel: &str,
+        latest: &str,
+        limit: u32,
+    ) -> Result<Vec<Message>, String> {
+        info!("Calling conversations.history for channel={channel}, latest={latest}, limit={limit}");
+        match &self.backend {
+            Backend::Slacko(inner) => {
+                let req = ConversationHistoryRequest {
+                    channel: channel.to_string(),
+                    limit: Some(limit),
+                    cursor: None,
+                    oldest: None,
+                    latest: Some(latest.to_string()),
+                    inclusive: Some(false),
+                };
+                let data = inner
+                    .conversations()
+                    .history_with_options(req)
+                    .await
+                    .map_err(|e| format!("API error: {e}"))?;
+                Ok(data.messages)
+            }
+            Backend::Stealth { http, creds } => {
+                let limit_str = limit.to_string();
+                let fields = vec![
+                    ("channel", channel),
+                    ("latest", latest),
+                    ("limit", &limit_str),
+                    ("inclusive", "false"),
+                ];
+                let data: RawConversationHistory =
+                    Self::stealth_post(http, creds, "conversations.history", &fields).await?;
+                Ok(data.messages)
+            }
+        }
+    }
+
+    /// Fetch messages around a specific timestamp: up to `count` before and `count` after.
+    /// Returns messages sorted newest-first (Slack's default).
+    pub async fn conversation_history_around(
+        &self,
+        channel: &str,
+        ts: &str,
+        count: u32,
+    ) -> Result<Vec<Message>, String> {
+        // Fetch messages before (inclusive of ts) and after ts
+        let (before, _) = self
+            .conversation_history_page(channel, "0", Some(ts), count + 1)
+            .await?;
+        let (after, _) = self
+            .conversation_history_page(channel, ts, None, count + 1)
+            .await?;
+
+        // Merge and deduplicate by ts
+        let mut seen = std::collections::HashSet::new();
+        let mut combined = Vec::new();
+        for msg in before.into_iter().chain(after) {
+            if seen.insert(msg.ts.clone()) {
+                combined.push(msg);
+            }
+        }
+        // Sort newest first (Slack ts are lexicographically comparable)
+        combined.sort_by(|a, b| b.ts.cmp(&a.ts));
+        Ok(combined)
+    }
+
+    /// Fetch a page of messages older than `latest` with `oldest` lower bound.
+    /// Returns (messages, has_more).
+    pub async fn conversation_history_page(
+        &self,
+        channel: &str,
+        oldest: &str,
+        latest: Option<&str>,
+        limit: u32,
+    ) -> Result<(Vec<Message>, bool), String> {
+        match &self.backend {
+            Backend::Slacko(inner) => {
+                let req = ConversationHistoryRequest {
+                    channel: channel.to_string(),
+                    limit: Some(limit),
+                    cursor: None,
+                    oldest: Some(oldest.to_string()),
+                    latest: latest.map(|s| s.to_string()),
+                    inclusive: Some(false),
+                };
+                let data = inner
+                    .conversations()
+                    .history_with_options(req)
+                    .await
+                    .map_err(|e| format!("API error: {e}"))?;
+                // slacko doesn't expose has_more, assume done when < limit
+                let has_more = data.messages.len() as u32 >= limit;
+                Ok((data.messages, has_more))
+            }
+            Backend::Stealth { http, creds } => {
+                let limit_str = limit.to_string();
+                let mut fields = vec![
+                    ("channel", channel),
+                    ("oldest", oldest),
+                    ("limit", &limit_str),
+                    ("inclusive", "false"),
+                ];
+                if let Some(l) = latest {
+                    fields.push(("latest", l));
+                }
+                let data: RawConversationHistory =
+                    Self::stealth_post(http, creds, "conversations.history", &fields).await?;
+                Ok((data.messages, data.has_more))
             }
         }
     }
@@ -620,38 +747,6 @@ impl Client {
                 }
                 let _: RawPostMessage =
                     Self::stealth_post(http, creds, "chat.postMessage", &fields).await?;
-                Ok(())
-            }
-        }
-    }
-
-    /// Schedule a message for later delivery via `chat.scheduleMessage`.
-    /// `post_at` is a Unix timestamp (seconds).
-    pub async fn schedule_message(
-        &self,
-        channel: &str,
-        text: &str,
-        post_at: i64,
-        thread_ts: Option<&str>,
-    ) -> Result<(), String> {
-        info!("Calling chat.scheduleMessage to channel={channel} at {post_at}");
-        let post_at_str = post_at.to_string();
-        match &self.backend {
-            Backend::Slacko(_inner) => {
-                // slacko crate doesn't have scheduleMessage — fall through to stealth
-                Err("scheduleMessage not supported in bot mode".to_string())
-            }
-            Backend::Stealth { http, creds } => {
-                let mut fields = vec![
-                    ("channel", channel),
-                    ("text", text),
-                    ("post_at", &post_at_str),
-                ];
-                if let Some(ts) = thread_ts {
-                    fields.push(("thread_ts", ts));
-                }
-                let _: serde_json::Value =
-                    Self::stealth_post(http, creds, "chat.scheduleMessage", &fields).await?;
                 Ok(())
             }
         }

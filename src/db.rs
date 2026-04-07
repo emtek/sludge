@@ -3,13 +3,14 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use slacko::types::{Channel, Message, User};
 use surrealdb::engine::local::SurrealKv;
+use surrealdb::types::SurrealValue;
 use surrealdb::Surreal;
 use tracing::{error, info};
 
 type Db = Surreal<surrealdb::engine::local::Db>;
 
 /// Stored login credentials.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
 pub struct SavedCredentials {
     pub auth_mode: String, // "stealth" or "bot"
     pub xoxc_token: Option<String>,
@@ -20,14 +21,14 @@ pub struct SavedCredentials {
 }
 
 /// A recently used status (emoji + text).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SurrealValue)]
 pub struct RecentStatus {
     pub emoji: String,
     pub text: String,
 }
 
 /// Wrapper to store a list as a JSON blob, avoiding surrealdb `id` field conflicts.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, SurrealValue)]
 struct JsonCache {
     data: String,
 }
@@ -41,7 +42,7 @@ impl Database {
     pub async fn open(rt: &tokio::runtime::Handle) -> Result<Self, String> {
         let data_dir = dirs::data_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join("slag");
+            .join("sludge");
 
         std::fs::create_dir_all(&data_dir)
             .map_err(|e| format!("Failed to create data dir: {e}"))?;
@@ -64,6 +65,54 @@ impl Database {
             })
             .await
             .map_err(|e| format!("DB task error: {e}"))??;
+
+        // Define tables and full-text search indexes
+        let mut schema_response = db.query(
+            "DEFINE TABLE IF NOT EXISTS message SCHEMAFULL;
+             DEFINE FIELD IF NOT EXISTS channel ON message TYPE string;
+             DEFINE FIELD IF NOT EXISTS ts ON message TYPE string;
+             DEFINE FIELD IF NOT EXISTS thread_ts ON message TYPE option<string>;
+             DEFINE FIELD IF NOT EXISTS user ON message TYPE option<string>;
+             DEFINE FIELD IF NOT EXISTS text ON message TYPE string;
+             DEFINE FIELD IF NOT EXISTS data ON message TYPE string;
+             DEFINE INDEX IF NOT EXISTS message_channel_ts ON message FIELDS channel, ts UNIQUE;
+             DEFINE ANALYZER IF NOT EXISTS msg_analyzer TOKENIZERS blank, class FILTERS lowercase, snowball(english);
+             DEFINE INDEX IF NOT EXISTS message_text_ft ON message FIELDS text
+                 FULLTEXT ANALYZER msg_analyzer BM25 HIGHLIGHTS;
+
+             DEFINE TABLE IF NOT EXISTS credentials SCHEMALESS;
+             DEFINE TABLE IF NOT EXISTS cache SCHEMALESS;
+             DEFINE TABLE IF NOT EXISTS settings SCHEMALESS;
+
+             DEFINE TABLE IF NOT EXISTS channel_meta SCHEMAFULL;
+             DEFINE FIELD IF NOT EXISTS channel ON channel_meta TYPE string;
+             DEFINE FIELD IF NOT EXISTS oldest_ts ON channel_meta TYPE string;
+             DEFINE FIELD IF NOT EXISTS newest_ts ON channel_meta TYPE string;
+             DEFINE FIELD IF NOT EXISTS backfill_checked_at ON channel_meta TYPE option<string>;
+             DEFINE INDEX IF NOT EXISTS channel_meta_channel ON channel_meta FIELDS channel UNIQUE;
+            "
+        )
+            .await
+            .map_err(|e| format!("DB schema error: {e}"))?;
+
+        // Check each schema statement for errors
+        let statement_names = [
+            "DEFINE TABLE message", "DEFINE FIELD channel", "DEFINE FIELD ts",
+            "DEFINE FIELD thread_ts", "DEFINE FIELD user", "DEFINE FIELD text",
+            "DEFINE FIELD data", "DEFINE INDEX message_channel_ts",
+            "DEFINE ANALYZER msg_analyzer", "DEFINE INDEX message_text_ft",
+            "DEFINE TABLE credentials", "DEFINE TABLE cache", "DEFINE TABLE settings",
+            "DEFINE TABLE channel_meta", "DEFINE FIELD channel_meta.channel",
+            "DEFINE FIELD channel_meta.oldest_ts", "DEFINE FIELD channel_meta.newest_ts",
+            "DEFINE FIELD channel_meta.backfill_checked_at",
+            "DEFINE INDEX channel_meta_channel",
+        ];
+        for (i, name) in statement_names.iter().enumerate() {
+            let result: Result<Vec<serde_json::Value>, _> = schema_response.take(i);
+            if let Err(e) = result {
+                tracing::warn!("Schema statement {i} ({name}) error: {e}");
+            }
+        }
 
         Ok(Self { db })
     }
@@ -318,7 +367,7 @@ impl Database {
 
     // ── Messages ──
 
-    /// Save messages for a channel (replaces existing cache).
+    /// Save messages for a channel (replaces existing cache and updates FTS index).
     pub async fn save_messages(&self, channel_id: &str, messages: &[Message]) -> Result<(), String> {
         let json =
             serde_json::to_string(messages).map_err(|e| format!("JSON serialize error: {e}"))?;
@@ -331,6 +380,11 @@ impl Database {
             .content(cache)
             .await
             .map_err(|e| format!("DB save messages error: {e}"))?;
+
+        // Index each message for full-text search and update channel metadata
+        self.index_messages(channel_id, messages).await;
+        self.update_channel_meta(channel_id, messages).await;
+
         tracing::debug!("Saved {} messages for channel {channel_id}", messages.len());
         Ok(())
     }
@@ -414,6 +468,261 @@ impl Database {
         let updated = msg.reactions.clone();
         let _ = self.save_messages(channel_id, &messages).await;
         updated
+    }
+
+    // ── Channel metadata ──
+
+    /// Update channel metadata (oldest/newest message timestamps).
+    /// Only expands the range — oldest gets smaller, newest gets larger.
+    pub async fn update_channel_meta(&self, channel_id: &str, messages: &[Message]) {
+        if messages.is_empty() {
+            return;
+        }
+        let batch_oldest = messages.iter().map(|m| m.ts.as_str()).min().unwrap();
+        let batch_newest = messages.iter().map(|m| m.ts.as_str()).max().unwrap();
+
+        if let Err(e) = self
+            .db
+            .query(
+                "INSERT INTO channel_meta (channel, oldest_ts, newest_ts) VALUES ($channel, $oldest, $newest)
+                 ON DUPLICATE KEY UPDATE
+                     oldest_ts = IF $oldest < oldest_ts THEN $oldest ELSE oldest_ts END,
+                     newest_ts = IF $newest > newest_ts THEN $newest ELSE newest_ts END",
+            )
+            .bind(("channel", channel_id.to_string()))
+            .bind(("oldest", batch_oldest.to_string()))
+            .bind(("newest", batch_newest.to_string()))
+            .await
+        {
+            tracing::warn!("Failed to update channel meta for {channel_id}: {e}");
+        }
+    }
+
+    /// Remove all stored data for a channel (messages, cache, activity, metadata).
+    pub async fn delete_channel_data(&self, channel_id: &str) {
+        // Delete indexed messages
+        if let Err(e) = self.db
+            .query("DELETE FROM message WHERE channel = $channel")
+            .bind(("channel", channel_id.to_string()))
+            .await
+        {
+            tracing::warn!("Failed to delete messages for {channel_id}: {e}");
+        }
+
+        // Delete cached message list and activity
+        let cache_key = format!("messages_{channel_id}");
+        let activity_key = format!("activity_{channel_id}");
+        let _: Result<Option<serde_json::Value>, _> = self.db.delete(("cache", &*cache_key)).await;
+        let _: Result<Option<serde_json::Value>, _> = self.db.delete(("cache", &*activity_key)).await;
+
+        // Delete channel metadata
+        if let Err(e) = self.db
+            .query("DELETE FROM channel_meta WHERE channel = $channel")
+            .bind(("channel", channel_id.to_string()))
+            .await
+        {
+            tracing::warn!("Failed to delete channel meta for {channel_id}: {e}");
+        }
+
+        tracing::info!("Deleted all data for channel {channel_id}");
+    }
+
+    /// Mark a channel's backfill as fully checked (reached end of history).
+    pub async fn mark_backfill_checked(&self, channel_id: &str) {
+        let now = chrono::Utc::now().to_rfc3339();
+        if let Err(e) = self
+            .db
+            .query(
+                "UPDATE channel_meta SET backfill_checked_at = $checked WHERE channel = $channel",
+            )
+            .bind(("channel", channel_id.to_string()))
+            .bind(("checked", now))
+            .await
+        {
+            tracing::warn!("Failed to mark backfill checked for {channel_id}: {e}");
+        }
+    }
+
+    /// Load all channel metadata. Returns map of channel_id -> (oldest_ts, newest_ts, backfill_checked_at).
+    pub async fn load_all_channel_meta(&self) -> HashMap<String, (String, String, Option<String>)> {
+        let result: Result<Vec<serde_json::Value>, _> = self.db.select("channel_meta").await;
+        let mut map = HashMap::new();
+        if let Ok(records) = result {
+            for record in records {
+                let channel = record.get("channel").and_then(|v| v.as_str()).unwrap_or("");
+                let oldest = record.get("oldest_ts").and_then(|v| v.as_str()).unwrap_or("");
+                let newest = record.get("newest_ts").and_then(|v| v.as_str()).unwrap_or("");
+                let checked = record.get("backfill_checked_at").and_then(|v| v.as_str()).map(String::from);
+                if !channel.is_empty() {
+                    map.insert(channel.to_string(), (oldest.to_string(), newest.to_string(), checked));
+                }
+            }
+        }
+        map
+    }
+
+    /// Index messages into the full-text search table.
+    pub async fn index_messages(&self, channel_id: &str, messages: &[Message]) {
+        let mut indexed = 0u32;
+        let mut errors = 0u32;
+        for msg in messages {
+            let data = serde_json::to_string(msg).unwrap_or_default();
+            let res = self
+                .db
+                .query(
+                    "INSERT INTO message (channel, ts, thread_ts, user, text, data) VALUES ($channel, $ts, $thread_ts, $user, $text, $data)
+                     ON DUPLICATE KEY UPDATE text = $text, data = $data",
+                )
+                .bind(("channel", channel_id.to_string()))
+                .bind(("ts", msg.ts.clone()))
+                .bind(("thread_ts", msg.thread_ts.clone()))
+                .bind(("user", msg.user.clone()))
+                .bind(("text", msg.text.clone()))
+                .bind(("data", data))
+                .await;
+            match res {
+                Ok(mut response) => {
+                    // Check the actual statement result — the outer Ok just means the query was sent
+                    let inner: Result<Vec<serde_json::Value>, _> = response.take(0);
+                    match inner {
+                        Ok(rows) if !rows.is_empty() => indexed += 1,
+                        Ok(_) => {
+                            if errors == 0 {
+                                tracing::warn!(
+                                    "FTS index returned empty for message {} in {channel_id}",
+                                    msg.ts
+                                );
+                            }
+                            errors += 1;
+                        }
+                        Err(e) => {
+                            if errors == 0 {
+                                tracing::warn!(
+                                    "FTS index statement error for message {} in {channel_id}: {e}",
+                                    msg.ts
+                                );
+                            }
+                            errors += 1;
+                        }
+                    }
+                }
+                Err(e) => {
+                    if errors == 0 {
+                        tracing::warn!("FTS index query error for message {} in {channel_id}: {e}", msg.ts);
+                    }
+                    errors += 1;
+                }
+            }
+        }
+        if indexed > 0 || errors > 0 {
+            tracing::info!("FTS indexing {channel_id}: {indexed} ok, {errors} errors (of {} total)", messages.len());
+        }
+    }
+
+    /// Look up a single indexed message by channel and timestamp.
+    pub async fn get_indexed_message(&self, channel_id: &str, ts: &str) -> Option<Message> {
+        let result = self
+            .db
+            .query("SELECT data FROM message WHERE channel = $channel AND ts = $ts LIMIT 1")
+            .bind(("channel", channel_id.to_string()))
+            .bind(("ts", ts.to_string()))
+            .await;
+
+        match result {
+            Ok(mut response) => {
+                let rows: Result<Vec<serde_json::Value>, _> = response.take(0);
+                rows.ok()?
+                    .into_iter()
+                    .next()
+                    .and_then(|row| {
+                        let data = row.get("data")?.as_str()?;
+                        serde_json::from_str(data).ok()
+                    })
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// Get the oldest indexed message timestamp for a channel.
+    pub async fn oldest_indexed_ts(&self, channel_id: &str) -> Option<String> {
+        let result: Result<Vec<serde_json::Value>, _> = self
+            .db
+            .query("SELECT ts FROM message WHERE channel = $channel ORDER BY ts ASC LIMIT 1")
+            .bind(("channel", channel_id.to_string()))
+            .await
+            .map(|mut r| r.take(0).unwrap_or_default());
+
+        match result {
+            Ok(rows) => rows
+                .first()
+                .and_then(|row| row.get("ts")?.as_str().map(|s| s.to_string())),
+            Err(e) => {
+                tracing::warn!("Failed to get oldest indexed ts for {channel_id}: {e}");
+                None
+            }
+        }
+    }
+
+    /// Full-text search across all indexed messages.
+    /// Returns matching messages scored by relevance and recency.
+    pub async fn search_messages(&self, query: &str) -> Vec<(String, Message)> {
+        let now = chrono::Utc::now().timestamp() as f64;
+
+        let result = self
+            .db
+            .query(
+                "SELECT channel, ts, data, search::score(0) AS score
+                 FROM message
+                 WHERE text @0@ $query
+                 ORDER BY score DESC
+                 LIMIT 200",
+            )
+            .bind(("query", query.to_string()))
+            .await;
+
+        match result {
+            Ok(mut response) => {
+                let rows: Result<Vec<serde_json::Value>, _> = response.take(0);
+                match rows {
+                    Ok(rows) => {
+                        tracing::debug!("FTS returned {} rows for {query:?}", rows.len());
+                        let mut scored: Vec<(f64, String, Message)> = rows
+                            .into_iter()
+                            .filter_map(|row| {
+                                let channel = row.get("channel")?.as_str()?.to_string();
+                                let ts_str = row.get("ts")?.as_str()?;
+                                let data = row.get("data")?.as_str()?;
+                                let msg: Message = serde_json::from_str(data).ok()?;
+                                let relevance = row.get("score")?.as_f64().unwrap_or(0.0);
+
+                                // Recency: days since message, decayed exponentially
+                                // Half-life of ~7 days: a week-old message gets ~0.5 boost
+                                let msg_ts: f64 = ts_str.split('.').next()?.parse().ok()?;
+                                let age_days = (now - msg_ts) / 86400.0;
+                                let recency = (-age_days / 10.0).exp(); // 0..1
+
+                                // Combined: relevance dominant, recency as tiebreaker
+                                let combined = relevance + 0.3 * recency;
+
+                                Some((combined, channel, msg))
+                            })
+                            .collect();
+
+                        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                        scored.truncate(50);
+                        scored.into_iter().map(|(_, ch, msg)| (ch, msg)).collect()
+                    }
+                    Err(e) => {
+                        error!("FTS search statement error for {query:?}: {e}");
+                        Vec::new()
+                    }
+                }
+            }
+            Err(e) => {
+                error!("FTS search query error for {query:?}: {e}");
+                Vec::new()
+            }
+        }
     }
 
     // ── Presence watches ──

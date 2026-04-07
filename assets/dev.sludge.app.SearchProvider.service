@@ -1,0 +1,3 @@
+[D-BUS Service]
+Name=dev.sludge.app.SearchProvider
+Exec=/home/emlyn/Dev/SlackFrontend/target/debug/sludge --search-provider

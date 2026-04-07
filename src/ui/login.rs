@@ -13,7 +13,7 @@ use crate::ui::app::build_app;
 pub fn show_login(app: &Application, rt: tokio::runtime::Handle, db: Arc<Database>) {
     let window = ApplicationWindow::builder()
         .application(app)
-        .title("Slag — Sign In")
+        .title("Sludge — Sign In")
         .default_width(400)
         .default_height(340)
         .resizable(false)
@@ -27,7 +27,7 @@ pub fn show_login(app: &Application, rt: tokio::runtime::Handle, db: Arc<Databas
     outer.set_valign(gtk::Align::Center);
     outer.set_vexpand(true);
 
-    let title = Label::new(Some("Sign in to Slag"));
+    let title = Label::new(Some("Sign in to Sludge"));
     title.add_css_class("title-1");
     outer.append(&title);
 
@@ -55,6 +55,12 @@ pub fn show_login(app: &Application, rt: tokio::runtime::Handle, db: Arc<Databas
     xoxd_entry.set_show_peek_icon(true);
     xoxd_entry.set_placeholder_text(Some("xoxd-..."));
     stealth_box.append(&xoxd_entry);
+    let ws_label = Label::new(Some("Workspace"));
+    ws_label.set_halign(gtk::Align::Start);
+    stealth_box.append(&ws_label);
+    let ws_entry = gtk::Entry::new();
+    ws_entry.set_placeholder_text(Some("myteam.slack.com"));
+    stealth_box.append(&ws_entry);
     stack.add_named(&stealth_box, Some("stealth"));
 
     // Bot page
@@ -121,15 +127,22 @@ pub fn show_login(app: &Application, rt: tokio::runtime::Handle, db: Arc<Databas
                 error_label.set_visible(true);
                 return;
             }
+            let ws = ws_entry.text().to_string();
+            let ws_url = if ws.is_empty() {
+                None
+            } else {
+                let ws = ws.trim_start_matches("https://").trim_end_matches('/');
+                Some(format!("https://{ws}"))
+            };
             let creds = SavedCredentials {
                 auth_mode: "stealth".into(),
                 xoxc_token: Some(xoxc.clone()),
                 xoxd_cookie: Some(xoxd.clone()),
                 bot_token: None,
                 app_token: None,
-                workspace_url: None,
+                workspace_url: ws_url.clone(),
             };
-            (creds, Client::new_stealth(xoxc, xoxd))
+            (creds, Client::new_stealth(xoxc, xoxd, ws_url))
         } else {
             let bot = bot_entry.text().to_string();
             if bot.is_empty() {
@@ -178,7 +191,11 @@ pub fn show_login(app: &Application, rt: tokio::runtime::Handle, db: Arc<Databas
             let result = rt2
                 .spawn(async move {
                     let mut test_client = client.clone();
-                    let info = test_client.auth_test().await?;
+                    tracing::info!("Attempting auth.test...");
+                    let info = test_client.auth_test().await.map_err(|e| {
+                        tracing::error!("auth.test failed: {e}");
+                        e
+                    })?;
 
                     // Save credentials to database
                     let mut creds_to_save = saved_creds_clone;
@@ -218,7 +235,7 @@ pub fn show_login(app: &Application, rt: tokio::runtime::Handle, db: Arc<Databas
                         ));
                     }
 
-                    build_app(&app_ref, client, rt, event_rx, db, info.user_id, presence_tx);
+                    build_app(&app_ref, client, rt, event_rx, db, info.user_id, presence_tx, None);
                     window_ref.close();
                 }
                 Err(e) => {

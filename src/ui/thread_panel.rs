@@ -3,11 +3,13 @@ use gtk4::{self as gtk, Button, Label, ListBox, ListBoxRow, Picture, ScrolledWin
 use slacko::types::Message;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use crate::slack::client::Client;
 use crate::slack::helpers::format_message_markup;
 use crate::ui::autocomplete::Autocomplete;
+use crate::ui::message_input::{attach_image_paste, rebuild_file_preview};
 use crate::ui::message_view::ReactionCallback;
 use crate::ui::send_button::SendButton;
 
@@ -28,6 +30,9 @@ pub struct ThreadPanel {
     pub pending_scroll: RefCell<Option<String>>,
     picker_cells: Rc<RefCell<Vec<Rc<RefCell<Option<gtk::Popover>>>>>>,
     autocomplete: Autocomplete,
+    files: Rc<RefCell<Vec<PathBuf>>>,
+    file_preview_box: gtk::Box,
+    reaction_boxes: Rc<RefCell<HashMap<String, gtk::FlowBox>>>,
 }
 
 impl ThreadPanel {
@@ -78,11 +83,24 @@ impl ThreadPanel {
         let input_sep = gtk::Separator::new(gtk::Orientation::Horizontal);
         container.append(&input_sep);
 
+        // File preview area (hidden when empty)
+        let file_preview_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        file_preview_box.set_margin_start(8);
+        file_preview_box.set_margin_end(8);
+        file_preview_box.set_margin_top(4);
+        file_preview_box.set_visible(false);
+        container.append(&file_preview_box);
+
         let input_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         input_box.set_margin_top(8);
         input_box.set_margin_bottom(8);
         input_box.set_margin_start(8);
         input_box.set_margin_end(8);
+
+        let attach_button = Button::from_icon_name("mail-attachment-symbolic");
+        attach_button.add_css_class("flat");
+        attach_button.set_valign(gtk::Align::End);
+        attach_button.set_tooltip_text(Some("Attach file"));
 
         let text_view = TextView::new();
         text_view.set_hexpand(true);
@@ -100,10 +118,50 @@ impl ThreadPanel {
 
         let send_button = SendButton::new();
 
+        let files: Rc<RefCell<Vec<PathBuf>>> = Rc::new(RefCell::new(Vec::new()));
+
+        input_box.append(&attach_button);
         input_box.append(&frame);
         input_box.append(&send_button.widget);
 
         container.append(&input_box);
+
+        // Paste images from clipboard
+        attach_image_paste(&text_view, &files, &file_preview_box);
+
+        // Wire up attach button to open file chooser
+        {
+            let files = files.clone();
+            let preview = file_preview_box.clone();
+            let widget_weak = container.downgrade();
+            attach_button.connect_clicked(move |_| {
+                let Some(widget) = widget_weak.upgrade() else { return };
+                let files = files.clone();
+                let preview = preview.clone();
+                let dialog = gtk::FileDialog::new();
+                dialog.set_title("Attach files");
+                if let Some(root) = widget.root() {
+                    if let Some(win) = root.downcast_ref::<gtk::Window>() {
+                        let files2 = files.clone();
+                        let preview2 = preview.clone();
+                        dialog.open_multiple(Some(win), gtk::gio::Cancellable::NONE, move |result| {
+                            if let Ok(file_list) = result {
+                                for i in 0..file_list.n_items() {
+                                    if let Some(obj) = file_list.item(i) {
+                                        if let Ok(file) = obj.downcast::<gtk::gio::File>() {
+                                            if let Some(path) = file.path() {
+                                                files2.borrow_mut().push(path);
+                                            }
+                                        }
+                                    }
+                                }
+                                rebuild_file_preview(&preview2, &files2);
+                            }
+                        });
+                    }
+                }
+            });
+        }
 
         // Attach shared autocomplete (handles both @mentions and :emoji:)
         let autocomplete = Autocomplete::attach(&text_view);
@@ -128,6 +186,9 @@ impl ThreadPanel {
             pending_scroll: RefCell::new(None),
             picker_cells: Rc::new(RefCell::new(Vec::new())),
             autocomplete,
+            files,
+            file_preview_box,
+            reaction_boxes: Rc::new(RefCell::new(HashMap::new())),
         }
     }
 
@@ -199,9 +260,10 @@ impl ThreadPanel {
         let dcb = self.delete_callback.borrow().clone();
         let self_uid = self.self_user_id.borrow().clone();
         let cid = self.channel_id.borrow().clone();
+        self.reaction_boxes.borrow_mut().clear();
         for msg in messages {
             let row = make_thread_message_row(
-                msg, users, client, rt, &rcb, &dcb, cid.as_deref(), &self_uid, &self.picker_cells,
+                msg, users, client, rt, &rcb, &dcb, cid.as_deref(), &self_uid, &self.picker_cells, &self.reaction_boxes,
             );
             self.list_box.append(&row);
         }
@@ -221,10 +283,50 @@ impl ThreadPanel {
         let self_uid = self.self_user_id.borrow().clone();
         let cid = self.channel_id.borrow().clone();
         let row = make_thread_message_row(
-            msg, users, client, rt, &rcb, &dcb, cid.as_deref(), &self_uid, &self.picker_cells,
+            msg, users, client, rt, &rcb, &dcb, cid.as_deref(), &self_uid, &self.picker_cells, &self.reaction_boxes,
         );
         self.list_box.append(&row);
         self.scroll_to_bottom();
+    }
+
+    pub fn update_reactions(
+        &self,
+        ts: &str,
+        reactions: &[slacko::types::Reaction],
+        users: &HashMap<String, String>,
+    ) {
+        let boxes = self.reaction_boxes.borrow();
+        let Some(flow_box) = boxes.get(ts) else { return };
+
+        // Remove all children except the last one (the add-reaction button)
+        while flow_box.child_at_index(0).is_some() {
+            let count = {
+                let mut n = 0;
+                while flow_box.child_at_index(n).is_some() { n += 1; }
+                n
+            };
+            if count <= 1 { break; }
+            if let Some(child) = flow_box.child_at_index(0) {
+                crate::ui::message_view::MessageView::unparent_floating_recursive(&child);
+                flow_box.remove(&child);
+            }
+        }
+
+        let reaction_cb = self.reaction_callback.borrow().clone();
+        let channel_id = self.channel_id.borrow().clone();
+
+        for reaction in reactions {
+            let btn = crate::ui::message_view::make_reaction_button(
+                reaction, users, ts,
+                &reaction_cb, channel_id.as_deref(),
+            );
+            let insert_pos = {
+                let mut n = 0;
+                while flow_box.child_at_index(n).is_some() { n += 1; }
+                if n > 0 { n as i32 - 1 } else { 0 }
+            };
+            flow_box.insert(&btn, insert_pos);
+        }
     }
 
     pub fn get_reply_text(&self) -> String {
@@ -235,6 +337,15 @@ impl ThreadPanel {
 
     pub fn clear_reply(&self) {
         self.text_view.buffer().set_text("");
+        self.files.borrow_mut().clear();
+        rebuild_file_preview(&self.file_preview_box, &self.files);
+    }
+
+    pub fn take_files(&self) -> Vec<PathBuf> {
+        let files = self.files.borrow().clone();
+        self.files.borrow_mut().clear();
+        rebuild_file_preview(&self.file_preview_box, &self.files);
+        files
     }
 
     fn scroll_to_bottom(&self) {
@@ -288,6 +399,7 @@ fn make_thread_message_row(
     channel_id: Option<&str>,
     self_user_id: &str,
     picker_cells: &Rc<RefCell<Vec<Rc<RefCell<Option<gtk::Popover>>>>>>,
+    reaction_boxes: &Rc<RefCell<HashMap<String, gtk::FlowBox>>>,
 ) -> ListBoxRow {
     let row = ListBoxRow::new();
 
@@ -604,7 +716,8 @@ fn make_thread_message_row(
             let btn_weak = add_btn.downgrade();
             add_btn.connect_clicked(move |_| {
                 let Some(btn) = btn_weak.upgrade() else { return };
-                if cell_click.borrow().is_none() {
+                let first_show = cell_click.borrow().is_none();
+                if first_show {
                     let rcb3 = rcb2.clone();
                     let cid3 = cid2.clone();
                     let ts3 = ts2.clone();
@@ -616,13 +729,19 @@ fn make_thread_message_row(
                     *cell_click.borrow_mut() = Some(picker);
                 }
                 if let Some(picker) = cell_click.borrow().as_ref() {
-                    picker.popup();
+                    if first_show {
+                        let p = picker.clone();
+                        gtk4::glib::idle_add_local_once(move || p.popup());
+                    } else {
+                        picker.popup();
+                    }
                 }
             });
 
             reactions_box.insert(&add_btn, -1);
         }
 
+        reaction_boxes.borrow_mut().insert(msg.ts.clone(), reactions_box.clone());
         outer.append(&reactions_box);
     }
 
@@ -637,7 +756,7 @@ fn format_timestamp(ts: &str) -> String {
         if let Some(dt) = chrono::DateTime::from_timestamp(epoch, 0) {
             return dt
                 .with_timezone(&chrono::Local)
-                .format("%H:%M")
+                .format("%d %b %Y %H:%M")
                 .to_string();
         }
     }

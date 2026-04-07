@@ -23,11 +23,43 @@ pub fn record_emoji_used(shortcode: &str) {
     }
 }
 
+/// Abstraction over how the autocomplete list is displayed.
+/// `Popover` uses a gtk::Popover (creates its own Wayland popup surface).
+/// `Inline` embeds the list as a regular widget — safe inside another popover.
+#[derive(Clone)]
+enum ListHost {
+    Popover(gtk::Popover),
+    Inline(gtk::Frame),
+}
+
+impl ListHost {
+    fn show(&self) {
+        match self {
+            Self::Popover(p) => p.popup(),
+            Self::Inline(f) => f.set_visible(true),
+        }
+    }
+
+    fn hide(&self) {
+        match self {
+            Self::Popover(p) => p.popdown(),
+            Self::Inline(f) => f.set_visible(false),
+        }
+    }
+
+    fn is_visible(&self) -> bool {
+        match self {
+            Self::Popover(p) => p.is_visible(),
+            Self::Inline(f) => f.is_visible(),
+        }
+    }
+}
+
 /// Shared autocomplete state attached to a `TextView`.
 /// Supports `@mention` (user names) and `:emoji:` (shortcode) completion.
 pub struct Autocomplete {
     users: Rc<RefCell<HashMap<String, String>>>,
-    popover: gtk::Popover,
+    host: ListHost,
     list: ListBox,
     on_emoji_picked: Rc<RefCell<Option<Rc<dyn Fn(&str)>>>>,
 }
@@ -168,34 +200,48 @@ impl Autocomplete {
     /// Attach autocomplete to the given `TextView`.  Returns a handle to update
     /// the user list later via `set_users`.
     pub fn attach(text_view: &TextView) -> Self {
-        let users: Rc<RefCell<HashMap<String, String>>> =
-            Rc::new(RefCell::new(HashMap::new()));
-        let on_emoji_picked: Rc<RefCell<Option<Rc<dyn Fn(&str)>>>> =
-            Rc::new(RefCell::new(None));
-
+        let popover = gtk::Popover::new();
         let list = ListBox::new();
         list.set_selection_mode(gtk::SelectionMode::Single);
         list.add_css_class("boxed-list");
-
-        let scroll = gtk::ScrolledWindow::new();
-        scroll.set_child(Some(&list));
-        scroll.set_max_content_height(200);
-        scroll.set_propagate_natural_height(true);
-        scroll.set_min_content_width(200);
-
-        let popover = gtk::Popover::new();
-        popover.set_child(Some(&scroll));
+        list.set_width_request(200);
+        popover.set_child(Some(&list));
         popover.set_autohide(false);
         popover.set_has_arrow(false);
         popover.set_parent(text_view);
         popover.set_position(gtk::PositionType::Top);
+        let host = ListHost::Popover(popover);
+        Self::attach_with_host(text_view, host, list)
+    }
+
+    /// Attach autocomplete using an inline widget instead of a Popover.
+    /// Returns `(Autocomplete, gtk::Frame)` — the caller must place the frame
+    /// in the widget tree (e.g. above the text entry inside an existing popover).
+    /// This avoids nested Wayland popup surfaces.
+    pub fn attach_inline(text_view: &TextView) -> (Self, gtk::Frame) {
+        let list = ListBox::new();
+        list.set_selection_mode(gtk::SelectionMode::Single);
+        list.add_css_class("boxed-list");
+        list.set_width_request(200);
+        let frame = gtk::Frame::new(None);
+        frame.set_child(Some(&list));
+        frame.set_visible(false);
+        let host = ListHost::Inline(frame.clone());
+        (Self::attach_with_host(text_view, host, list), frame)
+    }
+
+    fn attach_with_host(text_view: &TextView, host: ListHost, list: ListBox) -> Self {
+        let users: Rc<RefCell<HashMap<String, String>>> =
+            Rc::new(RefCell::new(HashMap::new()));
+        let on_emoji_picked: Rc<RefCell<Option<Rc<dyn Fn(&str)>>>> =
+            Rc::new(RefCell::new(None));
 
         let mode: Rc<RefCell<Mode>> = Rc::new(RefCell::new(Mode::Mention));
 
         // Monitor text changes
         {
             let users = users.clone();
-            let popover = popover.clone();
+            let host = host.clone();
             let list = list.clone();
             let tv = text_view.clone();
             let mode = mode.clone();
@@ -221,7 +267,7 @@ impl Autocomplete {
                 }
 
                 let Some(current_mode) = trigger else {
-                    popover.popdown();
+                    host.hide();
                     return;
                 };
 
@@ -234,7 +280,7 @@ impl Autocomplete {
                     .to_lowercase();
 
                 if query.is_empty() && current_mode == Mode::Mention {
-                    popover.popdown();
+                    host.hide();
                     return;
                 }
 
@@ -256,7 +302,7 @@ impl Autocomplete {
                 };
 
                 if matches.is_empty() {
-                    popover.popdown();
+                    host.hide();
                     return;
                 }
 
@@ -264,14 +310,14 @@ impl Autocomplete {
                 if let Some(first) = list.row_at_index(0) {
                     list.select_row(Some(&first));
                 }
-                popover.popup();
+                host.show();
                 tv.grab_focus();
             });
         }
 
         // Handle selection from the list
         {
-            let popover = popover.clone();
+            let host = host.clone();
             let tv = text_view.clone();
             let mode = mode.clone();
             let cb = on_emoji_picked.clone();
@@ -289,20 +335,20 @@ impl Autocomplete {
                         }
                     }
                 }
-                popover.popdown();
+                host.hide();
             });
         }
 
         // Keyboard navigation
         {
-            let popover = popover.clone();
+            let host = host.clone();
             let list = list.clone();
             let tv = text_view.clone();
             let cb = on_emoji_picked.clone();
             let key_controller = gtk::EventControllerKey::new();
             key_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
             key_controller.connect_key_pressed(move |_, key, _, _| {
-                if !popover.is_visible() {
+                if !host.is_visible() {
                     return gtk4::glib::Propagation::Proceed;
                 }
 
@@ -342,15 +388,15 @@ impl Autocomplete {
                                         }
                                     }
                                 }
-                                popover.popdown();
+                                host.hide();
                                 return gtk4::glib::Propagation::Stop;
                             }
                         }
-                        popover.popdown();
+                        host.hide();
                         gtk4::glib::Propagation::Proceed
                     }
                     gtk4::gdk::Key::Escape => {
-                        popover.popdown();
+                        host.hide();
                         gtk4::glib::Propagation::Stop
                     }
                     _ => gtk4::glib::Propagation::Proceed,
@@ -359,20 +405,33 @@ impl Autocomplete {
             text_view.add_controller(key_controller);
         }
 
-        // Dismiss popover when the text view is unmapped (parent hidden/removed)
+        // Dismiss when the text view loses focus or is unmapped
         {
-            let popover = popover.clone();
+            let h = host.clone();
+            let focus_ctl = gtk::EventControllerFocus::new();
+            focus_ctl.connect_leave(move |_| {
+                h.hide();
+            });
+            text_view.add_controller(focus_ctl);
+        }
+        {
+            let h = host.clone();
             text_view.connect_unmap(move |_| {
-                popover.popdown();
+                h.hide();
             });
         }
 
         Self {
             users,
-            popover,
+            host,
             list,
             on_emoji_picked,
         }
+    }
+
+    /// Dismiss the autocomplete immediately.
+    pub fn dismiss(&self) {
+        self.host.hide();
     }
 
     pub fn set_users(&self, users: &HashMap<String, String>) {

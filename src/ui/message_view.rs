@@ -20,6 +20,12 @@ pub type ReactionCallback = Rc<dyn Fn(&str, &str, &str, &gtk::Button)>;
 /// Callback type for deleting a message: (channel_id, message_ts, row)
 pub type DeleteCallback = Rc<dyn Fn(&str, &str, &ListBoxRow)>;
 
+/// Callback for loading older messages: called with channel_id and oldest message ts.
+pub type LoadMoreCallback = Rc<dyn Fn(&str, &str)>;
+
+/// Callback for clicking a search result: (channel_id, message_ts)
+pub type SearchResultCallback = Rc<dyn Fn(&str, &str)>;
+
 pub struct MessageView {
     pub widget: gtk::Box,
     pub list_box: ListBox,
@@ -31,7 +37,7 @@ pub struct MessageView {
     reaction_callback: RefCell<Option<ReactionCallback>>,
     delete_callback: RefCell<Option<DeleteCallback>>,
     self_user_id: RefCell<String>,
-    channel_id: RefCell<Option<String>>,
+    channel_id: Rc<RefCell<Option<String>>>,
     /// Known thread reply counts: thread_ts -> reply count (excluding parent).
     pub thread_counts: Rc<RefCell<HashMap<String, usize>>>,
     /// Thread button labels keyed by message ts, for updating counts after loading.
@@ -44,6 +50,12 @@ pub struct MessageView {
     image_generation: Rc<Cell<u64>>,
     /// Reaction picker cells — take + unparent on clear.
     picker_cells: Rc<RefCell<Vec<Rc<RefCell<Option<gtk::Popover>>>>>>,
+    /// Whether a load-more request is in flight (prevents duplicate fetches).
+    loading_more: Rc<Cell<bool>>,
+    /// Set to false when the server returns fewer messages than requested (no more history).
+    has_more: Rc<Cell<bool>>,
+    load_more_callback: RefCell<Option<LoadMoreCallback>>,
+    search_result_callback: RefCell<Option<SearchResultCallback>>,
 }
 
 impl MessageView {
@@ -111,6 +123,10 @@ impl MessageView {
             }
         });
 
+        let loading_more = Rc::new(Cell::new(false));
+        let has_more = Rc::new(Cell::new(true));
+        let load_more_callback: RefCell<Option<LoadMoreCallback>> = RefCell::new(None);
+
         Self {
             widget: container,
             list_box,
@@ -122,13 +138,17 @@ impl MessageView {
             reaction_callback: RefCell::new(None),
             delete_callback: RefCell::new(None),
             self_user_id: RefCell::new(String::new()),
-            channel_id: RefCell::new(None),
+            channel_id: Rc::new(RefCell::new(None)),
             thread_counts: Rc::new(RefCell::new(HashMap::new())),
             thread_labels: Rc::new(RefCell::new(HashMap::new())),
             reaction_boxes: Rc::new(RefCell::new(HashMap::new())),
             typing_label,
             image_generation: Rc::new(Cell::new(0)),
             picker_cells: Rc::new(RefCell::new(Vec::new())),
+            loading_more,
+            has_more,
+            load_more_callback,
+            search_result_callback: RefCell::new(None),
         }
     }
 
@@ -157,6 +177,117 @@ impl MessageView {
 
     pub fn set_self_user_id(&self, uid: &str) {
         *self.self_user_id.borrow_mut() = uid.to_string();
+    }
+
+    pub fn set_search_result_callback(&self, cb: SearchResultCallback) {
+        *self.search_result_callback.borrow_mut() = Some(cb);
+    }
+
+    /// Set the callback for loading older messages.
+    /// Called with (channel_id, oldest_message_ts).
+    pub fn set_load_more_callback(&self, cb: LoadMoreCallback) {
+        *self.load_more_callback.borrow_mut() = Some(cb.clone());
+
+        // Detect scroll to top via edge-reached signal
+        let loading_more = self.loading_more.clone();
+        let has_more = self.has_more.clone();
+        let channel_id = self.channel_id.clone();
+        let list_box = self.list_box.clone();
+        self.scrolled.connect_edge_reached(move |_, pos| {
+            if pos != gtk::PositionType::Top {
+                return;
+            }
+            if loading_more.get() || !has_more.get() {
+                return;
+            }
+            let Some(cid) = channel_id.borrow().clone() else { return };
+            let oldest_ts = list_box
+                .row_at_index(0)
+                .map(|r| r.widget_name().to_string())
+                .filter(|ts| !ts.is_empty());
+            let Some(ts) = oldest_ts else { return };
+            loading_more.set(true);
+            cb(&cid, &ts);
+        });
+    }
+
+    /// Prepend older messages at the top, preserving scroll position.
+    /// `fetched_count` is the number requested — if fewer arrived, there's no more history.
+    pub fn prepend_messages(
+        &self,
+        messages: &[Message],
+        users: &HashMap<String, String>,
+        client: &Client,
+        rt: &tokio::runtime::Handle,
+        fetched_count: usize,
+    ) {
+        if messages.is_empty() {
+            self.has_more.set(false);
+            self.loading_more.set(false);
+            return;
+        }
+        if messages.len() < fetched_count {
+            self.has_more.set(false);
+        }
+
+        let thread_cb = self.thread_callback.borrow().clone();
+        let mention_cb = self.mention_callback.borrow().clone();
+        let reaction_cb = self.reaction_callback.borrow().clone();
+        let delete_cb = self.delete_callback.borrow().clone();
+        let self_uid = self.self_user_id.borrow().clone();
+        let channel_id = self.channel_id.borrow().clone();
+        let tc = self.thread_counts.clone();
+        let tl = self.thread_labels.clone();
+        let rb = self.reaction_boxes.clone();
+        let img_gen = self.image_generation.clone();
+        let ecc = self.picker_cells.clone();
+
+        // Record current scroll height so we can restore position after prepend
+        let adj = self.scrolled.vadjustment();
+        let old_upper = adj.upper();
+
+        // Messages from the API are newest-first; prepend oldest-first (i.e. iterate forward)
+        for msg in messages.iter().rev() {
+            let row = make_message_row(
+                msg, users, client, rt,
+                &thread_cb, &mention_cb, &reaction_cb, &delete_cb,
+                channel_id.as_deref(), &tc.borrow(), &tl, &rb, &self_uid,
+                &img_gen, &ecc,
+            );
+            self.list_box.prepend(&row);
+        }
+
+        // After layout, adjust scroll so the previously visible content stays in place
+        let adj2 = self.scrolled.vadjustment();
+        let loading_more = self.loading_more.clone();
+        let signal_id: Rc<RefCell<Option<gtk4::glib::SignalHandlerId>>> =
+            Rc::new(RefCell::new(None));
+        let signal_id2 = signal_id.clone();
+        let id = adj2.connect_changed(move |adj| {
+            let new_upper = adj.upper();
+            let delta = new_upper - old_upper;
+            if delta > 0.0 {
+                adj.set_value(adj.value() + delta);
+            }
+            loading_more.set(false);
+            if let Some(id) = signal_id2.borrow_mut().take() {
+                adj.disconnect(id);
+            }
+        });
+        *signal_id.borrow_mut() = Some(id);
+    }
+
+    /// Reset the loading_more flag (e.g. on error).
+    pub fn reset_loading_more(&self) {
+        self.loading_more.set(false);
+    }
+
+    /// Get the ts of the oldest (topmost) message, if any.
+    pub fn oldest_message_ts(&self) -> Option<String> {
+        self.list_box
+            .row_at_index(0)
+            .map(|row| row.widget_name().to_string())
+            .filter(|ts| !ts.is_empty())
     }
 
     /// Update the thread button label for a message after loading its replies.
@@ -292,6 +423,8 @@ impl MessageView {
         rt: &tokio::runtime::Handle,
     ) {
         self.clear();
+        self.has_more.set(true);
+        self.loading_more.set(false);
         crate::mem::trim_heap();
         crate::mem::log_mem("MessageView::clear() DONE (after trim)");
 
@@ -321,6 +454,86 @@ impl MessageView {
 
         self.scroll_to_bottom();
         crate::mem::log_mem("MessageView::set_messages() DONE");
+    }
+
+    /// Display full-text search results. Each row is clickable and navigates
+    /// to the source channel/message via the search_result_callback.
+    pub fn set_search_results(
+        &self,
+        results: &[(String, Message)],
+        users: &HashMap<String, String>,
+        channels: &[slacko::types::Channel],
+        client: &Client,
+        rt: &tokio::runtime::Handle,
+    ) {
+        self.clear();
+        self.set_channel_name("Search Results");
+        self.set_channel_id("");
+
+        let thread_cb = self.thread_callback.borrow().clone();
+        let mention_cb = self.mention_callback.borrow().clone();
+        let reaction_cb = self.reaction_callback.borrow().clone();
+        let delete_cb = self.delete_callback.borrow().clone();
+        let self_uid = self.self_user_id.borrow().clone();
+        let tc = self.thread_counts.clone();
+        let tl = self.thread_labels.clone();
+        let rb = self.reaction_boxes.clone();
+        let img_gen = self.image_generation.clone();
+        let ecc = self.picker_cells.clone();
+        let search_cb = self.search_result_callback.borrow().clone();
+
+        for (channel_id, msg) in results {
+            // Build channel label
+            let ch_name = channels
+                .iter()
+                .find(|c| c.id == *channel_id)
+                .map(|c| {
+                    if c.is_im == Some(true) {
+                        users
+                            .get(c.user.as_deref().unwrap_or(""))
+                            .cloned()
+                            .unwrap_or_else(|| c.name.clone().unwrap_or_default())
+                    } else {
+                        format!("#{}", c.name.clone().unwrap_or_default())
+                    }
+                })
+                .unwrap_or_default();
+
+            let row = make_message_row(
+                msg, users, client, rt,
+                &thread_cb, &mention_cb, &reaction_cb, &delete_cb,
+                Some(channel_id), &tc.borrow(), &tl, &rb, &self_uid,
+                &img_gen, &ecc,
+            );
+
+            // Prepend a channel name label to the row
+            if let Some(child) = row.child() {
+                if let Some(outer) = child.downcast_ref::<gtk::Box>() {
+                    let ch_label = Label::new(Some(&ch_name));
+                    ch_label.add_css_class("dim-label");
+                    ch_label.add_css_class("caption");
+                    ch_label.set_halign(gtk::Align::Start);
+                    ch_label.set_margin_start(52); // align with message text
+                    outer.prepend(&ch_label);
+                }
+            }
+
+            // Make the row clickable for navigation
+            if let Some(ref cb) = search_cb {
+                let cb = cb.clone();
+                let cid = channel_id.clone();
+                let ts = msg.ts.clone();
+                let gesture = gtk::GestureClick::new();
+                gesture.connect_released(move |_, _, _, _| {
+                    cb(&cid, &ts);
+                });
+                row.add_controller(gesture);
+            }
+
+            self.list_box.append(&row);
+        }
+
+        self.scroll_to_bottom();
     }
 
     pub fn append_message(
@@ -353,17 +566,13 @@ impl MessageView {
 
     fn scroll_to_bottom(&self) {
         let adj = self.scrolled.vadjustment();
-        // Wait for GTK to finish layout so `upper` reflects the new content
-        let signal_id: Rc<RefCell<Option<gtk4::glib::SignalHandlerId>>> =
-            Rc::new(RefCell::new(None));
-        let signal_id2 = signal_id.clone();
-        let id = adj.connect_changed(move |adj| {
-            adj.set_value(adj.upper() - adj.page_size());
-            if let Some(id) = signal_id2.borrow_mut().take() {
-                adj.disconnect(id);
-            }
+        // Try immediately (works if layout is already done)
+        adj.set_value(adj.upper() - adj.page_size());
+        // Also defer to catch layout that hasn't completed yet
+        let adj2 = adj.clone();
+        gtk4::glib::idle_add_local_once(move || {
+            adj2.set_value(adj2.upper() - adj2.page_size());
         });
-        *signal_id.borrow_mut() = Some(id);
     }
 
     /// Scroll to a specific message by its ts and briefly highlight it.
@@ -382,8 +591,10 @@ impl MessageView {
                     let adj = scrolled.vadjustment();
                     if let Some(bounds) = row.compute_bounds(&list_box) {
                         let y = bounds.y() as f64;
+                        let row_h = bounds.height() as f64;
                         let page = adj.page_size();
-                        let target = (y - page / 2.0).max(0.0);
+                        // Position the message at the bottom of the visible area
+                        let target = (y + row_h - page).max(0.0);
                         adj.set_value(target);
                     }
 
@@ -824,7 +1035,8 @@ fn make_message_row(
             let btn_weak = add_btn.downgrade();
             add_btn.connect_clicked(move |_| {
                 let Some(btn) = btn_weak.upgrade() else { return };
-                if cell_click.borrow().is_none() {
+                let first_show = cell_click.borrow().is_none();
+                if first_show {
                     let rcb3 = rcb2.clone();
                     let cid3 = cid2.clone();
                     let ts3 = ts2.clone();
@@ -836,7 +1048,13 @@ fn make_message_row(
                     *cell_click.borrow_mut() = Some(picker);
                 }
                 if let Some(picker) = cell_click.borrow().as_ref() {
-                    picker.popup();
+                    if first_show {
+                        // Defer popup so the popover widget tree is realized first
+                        let p = picker.clone();
+                        gtk4::glib::idle_add_local_once(move || p.popup());
+                    } else {
+                        picker.popup();
+                    }
                 }
             });
 
@@ -860,7 +1078,7 @@ fn format_timestamp(ts: &str) -> String {
         if let Some(dt) = dt {
             return dt
                 .with_timezone(&chrono::Local)
-                .format("%H:%M")
+                .format("%d %b %Y %H:%M")
                 .to_string();
         }
     }

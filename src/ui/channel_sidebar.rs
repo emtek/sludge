@@ -65,8 +65,7 @@ impl ChannelSidebar {
         container.add_css_class("sidebar");
 
         let search_entry = SearchEntry::new();
-        search_entry.set_placeholder_text(Some("Search..."));
-        search_entry.set_placeholder_text(Some("Search..."));
+        search_entry.set_placeholder_text(Some("Channel"));
 
         let scrolled = ScrolledWindow::new();
         scrolled.set_vexpand(true);
@@ -175,6 +174,7 @@ impl ChannelSidebar {
         let dn_filter = display_names.clone();
         let presence_state_filter = presence_state.clone();
         let show_online_filter = show_online_only.clone();
+        let activity_filter = activity.clone();
         let scrolled_filter = scrolled.clone();
         search_entry.connect_search_changed(move |entry| {
             let query = entry.text().to_string().to_lowercase();
@@ -182,19 +182,37 @@ impl ChannelSidebar {
             let dms = dms_clone.borrow();
             let grs = groups_clone.borrow();
             let names = user_names_clone.borrow();
-            Self::filter_list(&ch_list_clone, &chs, &query, &names);
-            // DM filtering: when searching, show all matches; when not searching, respect online-only
+            let act = activity_filter.borrow();
+            Self::filter_list(&ch_list_clone, &chs, &query, &names, &act);
             Self::filter_dm_list(
                 &dm_list_clone, &dms, &query, &names,
                 &presence_state_filter.borrow(),
-                *show_online_filter.borrow() && query.is_empty(),
+                *show_online_filter.borrow(),
+                &act,
             );
-            Self::filter_list(&gr_list_clone, &grs, &query, &names);
+            Self::filter_list(&gr_list_clone, &grs, &query, &names, &act);
 
             if query.is_empty() {
-                ch_list_clone.set_sort_func(|_, _| gtk::Ordering::Equal);
-                dm_list_clone.set_sort_func(|_, _| gtk::Ordering::Equal);
-                gr_list_clone.set_sort_func(|_, _| gtk::Ordering::Equal);
+                // Restore activity-based sort (most recent first, then alphabetical)
+                for list in [&ch_list_clone, &dm_list_clone, &gr_list_clone] {
+                    let act2 = activity_filter.clone();
+                    let dn2 = dn_filter.clone();
+                    list.set_sort_func(move |a, b| {
+                        let act = act2.borrow();
+                        let dn = dn2.borrow();
+                        let a_id = a.widget_name().to_string();
+                        let b_id = b.widget_name().to_string();
+                        let a_ts = act.get(&a_id).map(|s| s.as_str()).unwrap_or("0");
+                        let b_ts = act.get(&b_id).map(|s| s.as_str()).unwrap_or("0");
+                        let a_name = dn.get(&a_id).cloned().unwrap_or_default();
+                        let b_name = dn.get(&b_id).cloned().unwrap_or_default();
+                        match b_ts.cmp(a_ts).then_with(|| a_name.cmp(&b_name)) {
+                            std::cmp::Ordering::Less => gtk::Ordering::Smaller,
+                            std::cmp::Ordering::Equal => gtk::Ordering::Equal,
+                            std::cmp::Ordering::Greater => gtk::Ordering::Larger,
+                        }
+                    });
+                }
             } else {
                 for list in [&ch_list_clone, &dm_list_clone, &gr_list_clone] {
                     let dn = dn_filter.clone();
@@ -288,6 +306,24 @@ impl ChannelSidebar {
         *self.activity.borrow_mut() = activity;
     }
 
+    /// Update activity for a single channel (e.g. from a socket message).
+    /// Makes the channel row visible if it was previously hidden due to inactivity.
+    pub fn update_activity(&self, channel_id: &str, ts: &str) {
+        self.activity.borrow_mut().insert(channel_id.to_string(), ts.to_string());
+
+        // Make the row visible in case it was hidden as inactive
+        for list in [&self.channels_list, &self.dm_list, &self.group_list] {
+            let mut idx = 0;
+            while let Some(row) = list.row_at_index(idx) {
+                if row.widget_name() == channel_id {
+                    row.set_visible(true);
+                    return;
+                }
+                idx += 1;
+            }
+        }
+    }
+
     pub fn set_user_names(&self, names: &HashMap<String, String>) {
         *self.user_names.borrow_mut() = names.clone();
     }
@@ -336,34 +372,35 @@ impl ChannelSidebar {
         channel_display_name(channel)
     }
 
-    pub fn set_channels(&self, all: &[Channel]) {
-        let names = self.user_names.borrow();
-
-        let act = self.activity.borrow();
-
-        // Only show channels with activity in the last 2 weeks
+    /// Returns the 2-week activity cutoff as a Slack-style timestamp string.
+    fn activity_cutoff() -> String {
         let two_weeks_ago = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0)
             .saturating_sub(14 * 24 * 60 * 60);
-        let cutoff = format!("{two_weeks_ago}");
+        format!("{two_weeks_ago}")
+    }
 
-        let is_recent = |id: &str| -> bool {
-            match act.get(id) {
-                Some(ts) => ts.as_str() >= cutoff.as_str(),
-                None => true, // no activity data yet — show by default
-            }
-        };
+    /// Whether a channel has recent activity (within 2 weeks).
+    fn is_recent(activity: &HashMap<String, String>, id: &str, cutoff: &str) -> bool {
+        match activity.get(id) {
+            Some(ts) => ts.as_str() >= cutoff,
+            None => false,
+        }
+    }
+
+    pub fn set_channels(&self, all: &[Channel]) {
+        let names = self.user_names.borrow();
+
+        let act = self.activity.borrow();
+        let cutoff = Self::activity_cutoff();
 
         let mut ch_list: Vec<Channel> = Vec::new();
         let mut dm_list: Vec<Channel> = Vec::new();
         let mut gr_list: Vec<Channel> = Vec::new();
 
         for ch in all {
-            if !is_recent(&ch.id) {
-                continue;
-            }
             if Self::is_mpdm(ch) {
                 gr_list.push(ch.clone());
             } else if ch.is_im == Some(true) {
@@ -416,6 +453,7 @@ impl ChannelSidebar {
         let watched = &self.watched_users;
         for ch in &ch_list {
             let (row, badge) = Self::make_channel_row(ch);
+            row.set_visible(Self::is_recent(&act, &ch.id, &cutoff));
             Self::attach_context_menu(&row, &ch.id, false, None, &acb, watched, &self.watch_labels, &self.status_emoji, &self.status_text);
             self.channels_list.append(&row);
             new_badges.insert(ch.id.clone(), badge);
@@ -437,8 +475,10 @@ impl ChannelSidebar {
                 .is_some_and(|uid| watched_set.contains(uid));
             let (row, badge, presence_lbl, status_box, watch_label) = Self::make_dm_row(ch, &names, user_watched);
             Self::attach_context_menu(&row, &ch.id, true, ch.user.as_deref(), &acb, watched, &self.watch_labels, &self.status_emoji, &self.status_text);
-            // Show/hide based on known presence state
-            if online_only {
+            // Show/hide based on activity recency and presence state
+            if !Self::is_recent(&act, &ch.id, &cutoff) {
+                row.set_visible(false);
+            } else if online_only {
                 let is_active = ch.user.as_ref()
                     .and_then(|uid| presence.get(uid))
                     .copied()
@@ -463,6 +503,7 @@ impl ChannelSidebar {
         }
         for ch in &gr_list {
             let (row, badge) = Self::make_group_row(ch, &names);
+            row.set_visible(Self::is_recent(&act, &ch.id, &cutoff));
             Self::attach_context_menu(&row, &ch.id, true, None, &acb, watched, &self.watch_labels, &self.status_emoji, &self.status_text);
             self.group_list.append(&row);
             new_badges.insert(ch.id.clone(), badge);
@@ -816,10 +857,13 @@ impl ChannelSidebar {
         self.presence_state.borrow_mut().insert(user_id.to_string(), active);
         self.update_presence_icon(user_id, active);
 
-        // Show/hide DM row based on online-only filter
+        // Show/hide DM row based on online-only filter + activity recency
         if *self.show_online_only.borrow() {
             if let Some(row) = self.dm_rows.borrow().get(user_id) {
-                row.set_visible(active);
+                let cutoff = Self::activity_cutoff();
+                let cid = row.widget_name().to_string();
+                let recent = Self::is_recent(&self.activity.borrow(), &cid, &cutoff);
+                row.set_visible(active && recent);
             }
         }
     }
@@ -914,15 +958,25 @@ impl ChannelSidebar {
         false
     }
 
+    /// Return the first visible row in visual (sorted) order.
     fn first_visible_row(list: &ListBox) -> Option<ListBoxRow> {
+        // Collect visible rows and sort them by their on-screen position
+        // to respect the active sort function.
+        let mut visible = Vec::new();
         let mut idx = 0;
         while let Some(row) = list.row_at_index(idx) {
             if row.is_visible() {
-                return Some(row);
+                visible.push(row);
             }
             idx += 1;
         }
-        None
+        // Sort by the allocation y-position to match visual order
+        visible.sort_by_key(|row| {
+            row.compute_bounds(list)
+                .map(|b| b.y() as i32)
+                .unwrap_or(0)
+        });
+        visible.into_iter().next()
     }
 
     fn filter_list(
@@ -930,6 +984,7 @@ impl ChannelSidebar {
         channels: &[Channel],
         query: &str,
         user_names: &HashMap<String, String>,
+        activity: &HashMap<String, String>,
     ) {
         let name_map: HashMap<String, String> = channels
             .iter()
@@ -945,12 +1000,15 @@ impl ChannelSidebar {
             })
             .collect();
 
+        let cutoff = Self::activity_cutoff();
         let mut idx = 0;
         while let Some(row) = list_box.row_at_index(idx) {
+            let cid = row.widget_name().to_string();
             if query.is_empty() {
-                row.set_visible(true);
+                // When not searching, only show recent channels
+                row.set_visible(Self::is_recent(activity, &cid, &cutoff));
             } else {
-                let cid = row.widget_name().to_string();
+                // When searching, show all channels that match (regardless of activity)
                 let visible = name_map
                     .get(&cid)
                     .is_some_and(|name| name.contains(query));
@@ -967,6 +1025,7 @@ impl ChannelSidebar {
         user_names: &HashMap<String, String>,
         presence_state: &HashMap<String, bool>,
         online_only: bool,
+        activity: &HashMap<String, String>,
     ) {
         let name_map: HashMap<String, String> = channels
             .iter()
@@ -982,21 +1041,35 @@ impl ChannelSidebar {
             .filter_map(|ch| Some((ch.id.clone(), ch.user.clone()?)))
             .collect();
 
+        // Never hide the currently selected row (prevents losing selection
+        // when clearing search re-applies the online-only filter).
+        let selected_name = list_box
+            .selected_row()
+            .map(|r| r.widget_name().to_string());
+
+        let cutoff = Self::activity_cutoff();
         let mut idx = 0;
         while let Some(row) = list_box.row_at_index(idx) {
             let cid = row.widget_name().to_string();
-            let matches_query = query.is_empty()
-                || name_map.get(&cid).is_some_and(|name| name.contains(query));
-            let is_active = if online_only {
-                user_map
-                    .get(&cid)
-                    .and_then(|uid| presence_state.get(uid))
-                    .copied()
-                    .unwrap_or(false)
+            let is_selected = selected_name.as_deref() == Some(&cid);
+            if query.is_empty() {
+                // When not searching, apply both activity and presence filters
+                let recent = Self::is_recent(activity, &cid, &cutoff);
+                let is_active = if online_only && !is_selected {
+                    user_map
+                        .get(&cid)
+                        .and_then(|uid| presence_state.get(uid))
+                        .copied()
+                        .unwrap_or(false)
+                } else {
+                    true
+                };
+                row.set_visible(recent && is_active);
             } else {
-                true
-            };
-            row.set_visible(matches_query && is_active);
+                // When searching, show all DMs that match (regardless of activity/presence)
+                let matches = name_map.get(&cid).is_some_and(|name| name.contains(query));
+                row.set_visible(matches);
+            }
             idx += 1;
         }
     }

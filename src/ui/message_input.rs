@@ -8,6 +8,52 @@ use std::rc::Rc;
 use crate::ui::autocomplete::Autocomplete;
 use crate::ui::send_button::SendButton;
 
+/// Attach a paste controller to a `TextView` that intercepts image content from
+/// the clipboard and saves it to a temp file, adding the path to `files`.
+/// Calls `rebuild` afterwards to refresh any preview UI.
+pub fn attach_image_paste(
+    text_view: &TextView,
+    files: &Rc<RefCell<Vec<PathBuf>>>,
+    preview_box: &gtk::Box,
+) {
+    let files = files.clone();
+    let preview = preview_box.clone();
+
+    let paste_controller = gtk::EventControllerKey::new();
+    let tv = text_view.downgrade();
+    paste_controller.connect_key_pressed(move |_, key, _, modifiers| {
+        if key == gtk4::gdk::Key::v
+            && modifiers.contains(gtk4::gdk::ModifierType::CONTROL_MASK)
+        {
+            let Some(text_view) = tv.upgrade() else {
+                return gtk4::glib::Propagation::Proceed;
+            };
+            let clipboard = text_view.clipboard();
+            let files = files.clone();
+            let preview = preview.clone();
+            clipboard.read_texture_async(gtk::gio::Cancellable::NONE, move |result| {
+                if let Ok(Some(texture)) = result {
+                    // Save the texture as a PNG temp file
+                    let dir = std::env::temp_dir().join("sludge-paste");
+                    let _ = std::fs::create_dir_all(&dir);
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis();
+                    let path = dir.join(format!("paste-{ts}.png"));
+                    if texture.save_to_png(&path).is_ok() {
+                        files.borrow_mut().push(path);
+                        rebuild_file_preview(&preview, &files);
+                    }
+                }
+            });
+        }
+        // Always proceed so text paste still works for non-image content
+        gtk4::glib::Propagation::Proceed
+    });
+    text_view.add_controller(paste_controller);
+}
+
 pub struct MessageInput {
     pub widget: gtk::Box,
     pub text_view: TextView,
@@ -37,7 +83,7 @@ impl MessageInput {
 
         let attach_button = Button::from_icon_name("mail-attachment-symbolic");
         attach_button.add_css_class("flat");
-        attach_button.set_valign(gtk::Align::End);
+        attach_button.set_valign(gtk::Align::Center);
         attach_button.set_tooltip_text(Some("Attach file"));
 
         let text_view = TextView::new();
@@ -68,6 +114,9 @@ impl MessageInput {
 
         // Attach shared autocomplete (handles both @mentions and :emoji:)
         let autocomplete = Autocomplete::attach(&text_view);
+
+        // Paste images from clipboard
+        attach_image_paste(&text_view, &files, &file_preview_box);
 
         // Wire up attach button to open file chooser
         let files_click = files.clone();
@@ -148,7 +197,7 @@ impl MessageInput {
     }
 }
 
-fn rebuild_file_preview(preview_box: &gtk::Box, files: &Rc<RefCell<Vec<PathBuf>>>) {
+pub fn rebuild_file_preview(preview_box: &gtk::Box, files: &Rc<RefCell<Vec<PathBuf>>>) {
     // Clear existing children
     while let Some(child) = preview_box.first_child() {
         preview_box.remove(&child);

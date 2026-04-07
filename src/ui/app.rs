@@ -2,7 +2,7 @@ use gtk4::prelude::*;
 use gtk4::{self as gtk, Application, ApplicationWindow, Label};
 use gtk4::gio;
 use slacko::types::{Channel, Message};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -17,6 +17,31 @@ use crate::ui::channel_sidebar::ChannelSidebar;
 use crate::ui::message_input::MessageInput;
 use crate::ui::message_view::MessageView;
 use crate::ui::thread_panel::ThreadPanel;
+
+/// Returns true if the error string indicates an authentication/authorization
+/// failure that means the current token is unusable.
+fn is_fatal_auth_error(err: &str) -> bool {
+    const FATAL_ERRORS: &[&str] = &[
+        "missing_scope",
+        "invalid_auth",
+        "not_authed",
+        "token_revoked",
+        "token_expired",
+        "account_inactive",
+    ];
+    FATAL_ERRORS.iter().any(|e| err.contains(e))
+}
+
+/// Action to perform on startup, from CLI flags.
+#[derive(Clone, Debug)]
+pub enum StartupAction {
+    /// Open a channel: `--open ch:CHANNEL_ID`
+    OpenChannel(String),
+    /// Open a message: `--open msg:CHANNEL_ID:TS`
+    OpenMessage { channel_id: String, message_ts: String },
+    /// Run a search: `--search QUERY`
+    Search(String),
+}
 
 /// Shared application state accessible from GTK callbacks.
 struct AppState {
@@ -45,10 +70,11 @@ pub fn build_app(
     db: Arc<Database>,
     user_id: String,
     presence_tx: mpsc::UnboundedSender<Vec<String>>,
+    startup_action: Option<StartupAction>,
 ) {
     let window = ApplicationWindow::builder()
         .application(app)
-        .title("Slag")
+        .title("Sludge")
         .default_width(1200)
         .default_height(800)
         .build();
@@ -60,6 +86,23 @@ pub fn build_app(
 
     // ── Header bar with profile button ──
     let header_bar = gtk::HeaderBar::new();
+
+    // Title widget: logo + app name
+    {
+        let title_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        title_box.set_halign(gtk::Align::Center);
+        let logo_bytes: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/hicolor/64x64/apps/sludge.png"));
+        let logo_texture = gtk4::gdk::Texture::from_bytes(&gtk4::glib::Bytes::from_static(logo_bytes)).ok();
+        if let Some(texture) = logo_texture {
+            let logo_img = gtk::Image::from_paintable(Some(&texture));
+            logo_img.set_pixel_size(20);
+            title_box.append(&logo_img);
+        }
+        let title_label = gtk::Label::new(Some("Sludge"));
+        title_label.add_css_class("title");
+        title_box.append(&title_label);
+        header_bar.set_title_widget(Some(&title_box));
+    }
 
     let avatar_size = 32;
     let avatar_texture: Rc<RefCell<Option<gtk4::gdk::Texture>>> = Rc::new(RefCell::new(None));
@@ -186,13 +229,15 @@ pub fn build_app(
     emoji_frame.set_child(Some(&emoji_entry));
     emoji_row.append(&emoji_frame);
 
-    // Attach emoji autocomplete (type : to search)
-    let _emoji_autocomplete = crate::ui::autocomplete::Autocomplete::attach(&emoji_entry);
+    // Attach emoji autocomplete (inline to avoid nested Wayland popups)
+    let (_emoji_autocomplete, emoji_ac_widget) =
+        crate::ui::autocomplete::Autocomplete::attach_inline(&emoji_entry);
 
-    // Pre-fill ":" when the popover opens if the emoji field is empty
+    // Pre-fill ":" when the emoji field gains focus (if empty)
     {
+        let focus_ctl = gtk::EventControllerFocus::new();
         let ee = emoji_entry.clone();
-        popover.connect_show(move |_| {
+        focus_ctl.connect_enter(move |_| {
             let buf = ee.buffer();
             let (s, e) = buf.bounds();
             if buf.text(&s, &e, false).is_empty() {
@@ -204,12 +249,14 @@ pub fn build_app(
                 });
             }
         });
+        emoji_entry.add_controller(focus_ctl);
     }
 
     let status_entry = gtk::Entry::new();
     status_entry.set_placeholder_text(Some("What's your status?"));
     status_entry.set_hexpand(true);
     emoji_row.append(&status_entry);
+    popover_box.append(&emoji_ac_widget);
     popover_box.append(&emoji_row);
 
     // ── Recent statuses ──
@@ -239,6 +286,17 @@ pub fn build_app(
     popover_box.append(&status_buttons);
 
     popover.set_child(Some(&popover_box));
+
+    // Focus the status text entry (not the emoji field) when the popover opens
+    {
+        let se = status_entry.clone();
+        popover.connect_show(move |_| {
+            let se = se.clone();
+            gtk4::glib::idle_add_local_once(move || {
+                se.grab_focus();
+            });
+        });
+    }
 
     // Shared function to rebuild the recent statuses list
     let rebuild_recent: Rc<dyn Fn(Vec<RecentStatus>)> = {
@@ -306,11 +364,7 @@ pub fn build_app(
 
     let sidebar = Rc::new(ChannelSidebar::new());
 
-    // Search button in the header bar
-    let search_btn = gtk::Button::from_icon_name("system-search-symbolic");
-    search_btn.add_css_class("flat");
-    header_bar.pack_start(&search_btn);
-
+    // Search entries packed into the start of the header bar
     window.set_titlebar(Some(&header_bar));
     let message_view = Rc::new(MessageView::new());
     let message_input = Rc::new(MessageInput::new());
@@ -333,52 +387,18 @@ pub fn build_app(
     main_box.append(&thread_panel.separator);
     main_box.append(&thread_panel.widget);
 
-    // Floating search popover centered near the top of the window
-    let search_overlay = gtk::Overlay::new();
-    search_overlay.set_child(Some(&main_box));
+    // ── Search entries in the header bar ──
+    sidebar.search_entry.set_hexpand(false);
+    sidebar.search_entry.set_width_request(240);
+    header_bar.pack_start(&sidebar.search_entry);
 
-    let search_anchor = gtk::Label::new(None);
-    search_anchor.set_halign(gtk::Align::Center);
-    search_anchor.set_valign(gtk::Align::Start);
-    search_anchor.set_margin_top(0);
-    search_anchor.set_opacity(0.0);
-    search_overlay.add_overlay(&search_anchor);
+    let msg_search_entry = gtk::SearchEntry::new();
+    msg_search_entry.set_placeholder_text(Some("Search messages..."));
+    msg_search_entry.set_hexpand(false);
+    msg_search_entry.set_width_chars(30);
+    header_bar.pack_start(&msg_search_entry);
 
-    let search_popover = gtk::Popover::new();
-    search_popover.set_autohide(true);
-    search_popover.set_position(gtk::PositionType::Bottom);
-    search_popover.set_has_arrow(false);
-    sidebar.search_entry.set_hexpand(true);
-    sidebar.search_entry.set_width_chars(40);
-    search_popover.set_child(Some(&sidebar.search_entry));
-    search_popover.set_parent(&search_anchor);
-
-    // Focus the search entry when popover opens (deferred so it's mapped)
-    {
-        let entry = sidebar.search_entry.clone();
-        search_popover.connect_show(move |_| {
-            let e = entry.clone();
-            gtk4::glib::idle_add_local_once(move || {
-                e.grab_focus();
-            });
-        });
-    }
-    // Clear search text when popover closes
-    {
-        let entry = sidebar.search_entry.clone();
-        search_popover.connect_closed(move |_| {
-            entry.set_text("");
-        });
-    }
-    // Wire up the search button
-    {
-        let popover = search_popover.clone();
-        search_btn.connect_clicked(move |_| {
-            popover.popup();
-        });
-    }
-
-    window.set_child(Some(&search_overlay));
+    window.set_child(Some(&main_box));
 
     let state = Rc::new(RefCell::new(AppState {
         channels: Vec::new(),
@@ -630,6 +650,7 @@ pub fn build_app(
         let state = state.clone();
         let client = client.clone();
         let rt = rt.clone();
+        let db = db.clone();
         let message_view_tc = message_view.clone();
         let cb: crate::ui::message_view::ThreadOpenCallback =
             Rc::new(move |thread_ts: &str, channel_id: &str| {
@@ -637,6 +658,7 @@ pub fn build_app(
                 let state = state.clone();
                 let client = client.clone();
                 let rt = rt.clone();
+                let db = db.clone();
                 let message_view = message_view_tc.clone();
                 let thread_ts = thread_ts.to_string();
                 let channel_id = channel_id.to_string();
@@ -650,13 +672,21 @@ pub fn build_app(
                 tp.text_view.grab_focus();
 
                 let mv = message_view.clone();
+                let db = db.clone();
                 gtk4::glib::spawn_future_local(async move {
                     let c = client.clone();
                     let cid = channel_id.clone();
                     let tts = thread_ts.clone();
                     let tts2 = tts.clone();
+                    let db2 = db.clone();
                     let result = rt
-                        .spawn(async move { c.conversation_replies(&cid, &tts).await })
+                        .spawn(async move {
+                            let replies = c.conversation_replies(&cid, &tts).await;
+                            if let Ok(ref messages) = replies {
+                                db2.index_messages(&cid, messages).await;
+                            }
+                            replies
+                        })
                         .await
                         .unwrap();
 
@@ -942,10 +972,12 @@ pub fn build_app(
                             }
                         });
 
-                        // Update cached channels
+                        // Delete channel data and update cached channels
                         let db2 = db2.clone();
+                        let cid3 = cid.clone();
                         let channels = state2.borrow().channels.clone();
                         rt2.spawn(async move {
+                            db2.delete_channel_data(&cid3).await;
                             let _ = db2.save_channels(&channels).await;
                         });
                     },
@@ -1013,6 +1045,44 @@ pub fn build_app(
         thread_panel.set_self_user_id(&user_id);
     }
 
+    // ── Infinite scroll: load older messages when scrolling to top ──
+    {
+        let mv = message_view.clone();
+        let state = state.clone();
+        let client = client.clone();
+        let rt = rt.clone();
+        message_view.set_load_more_callback(Rc::new(move |channel_id: &str, oldest_ts: &str| {
+            let mv = mv.clone();
+            let state = state.clone();
+            let client = client.clone();
+            let rt = rt.clone();
+            let cid = channel_id.to_string();
+            let ts = oldest_ts.to_string();
+            gtk4::glib::spawn_future_local(async move {
+                let c = client.clone();
+                let ch = cid.clone();
+                let t = ts.clone();
+                let result = rt
+                    .spawn(async move { c.conversation_history_before(&ch, &t, 25).await })
+                    .await;
+                match result {
+                    Ok(Ok(messages)) => {
+                        let users = state.borrow().user_names.clone();
+                        mv.prepend_messages(&messages, &users, &client, &rt, 25);
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!("Failed to load older messages: {e}");
+                        mv.reset_loading_more();
+                    }
+                    Err(e) => {
+                        tracing::error!("Load more task error: {e}");
+                        mv.reset_loading_more();
+                    }
+                }
+            });
+        }));
+    }
+
     // ── Emoji pick persistence: record to DB when emoji is selected via autocomplete ──
     {
         let db_ep = db.clone();
@@ -1047,15 +1117,10 @@ pub fn build_app(
         let client = client.clone();
         let rt = rt.clone();
 
-        // Clone for schedule callback before do_reply consumes them
-        let sched_state = state.clone();
-        let sched_client = client.clone();
-        let sched_rt = rt.clone();
-        let sched_tp = thread_panel.clone();
-
         let do_reply = move || {
             let text = tp_reply.get_reply_text();
-            if text.trim().is_empty() {
+            let files = tp_reply.take_files();
+            if text.trim().is_empty() && files.is_empty() {
                 return;
             }
 
@@ -1079,7 +1144,34 @@ pub fn build_app(
                 let txt = text.clone();
                 let result = rt2
                     .spawn(async move {
-                        c.post_message(&cid, &txt, Some(&tts)).await
+                        // Upload files first
+                        for path in &files {
+                            let filename = path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| "file".into());
+                            match tokio::fs::read(path).await {
+                                Ok(bytes) => {
+                                    let comment = if path == files.first().unwrap() && !txt.trim().is_empty() {
+                                        Some(txt.as_str())
+                                    } else {
+                                        None
+                                    };
+                                    if let Err(e) = c.upload_file(&cid, bytes, &filename, comment, Some(&tts)).await {
+                                        tracing::error!("Failed to upload file {filename}: {e}");
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!("Failed to read file {}: {e}", path.display());
+                                }
+                            }
+                        }
+                        // If no files, just send a text message
+                        if files.is_empty() && !txt.trim().is_empty() {
+                            c.post_message(&cid, &txt, Some(&tts)).await
+                        } else {
+                            Ok(())
+                        }
                     })
                     .await
                     .unwrap();
@@ -1113,42 +1205,6 @@ pub fn build_app(
             do_reply_btn();
         });
 
-        // Thread schedule callback
-        {
-            let state = sched_state;
-            let tp = sched_tp;
-            let rt = sched_rt;
-            let client = sched_client;
-            thread_panel.send_button.set_schedule_callback(Rc::new(move |ts: Option<i64>| {
-                let Some(ts) = ts else { return };
-                let text = tp.get_reply_text();
-                if text.trim().is_empty() {
-                    return;
-                }
-                let (thread_ts, channel_id) = match state.borrow().current_thread.clone() {
-                    Some(t) => t,
-                    None => return,
-                };
-                tp.clear_reply();
-                let client = client.clone();
-                let rt2 = rt.clone();
-                gtk4::glib::spawn_future_local(async move {
-                    let c = client.clone();
-                    let cid = channel_id.clone();
-                    let tts = thread_ts.clone();
-                    let txt = text.clone();
-                    let result = rt2
-                        .spawn(async move { c.schedule_message(&cid, &txt, ts, Some(&tts)).await })
-                        .await;
-                    match result {
-                        Ok(Ok(())) => tracing::info!("Thread reply scheduled"),
-                        Ok(Err(e)) => tracing::error!("Failed to schedule reply: {e}"),
-                        Err(e) => tracing::error!("Schedule task error: {e}"),
-                    }
-                });
-            }));
-        }
-
         let key_controller = gtk::EventControllerKey::new();
         let do_reply_key = do_reply.clone();
         key_controller.connect_key_pressed(move |_, key, _, modifier| {
@@ -1174,6 +1230,8 @@ pub fn build_app(
         let message_input = message_input.clone();
         let thread_panel = thread_panel.clone();
         let presence_tx = presence_tx.clone();
+        let app_logout = app.clone();
+        let window_logout = window.clone();
         gtk4::glib::spawn_future_local(async move {
             // Load cached data in parallel: channels, users, last channel, activity, watched, emoji
             let (cached_channels, cached_users, last_channel, activity, watched_users, cached_emoji, recent_emoji) = {
@@ -1184,19 +1242,39 @@ pub fn build_app(
                 let db_pw = db.clone();
                 let db_em = db.clone();
                 let db_re = db.clone();
+                let db_meta = db.clone();
                 let rt2 = rt.clone();
                 rt2.spawn(async move {
                     let ch = db_ch.load_channels().await;
                     let us = db_us.load_users().await;
                     let lc = db_lc.load_last_channel().await;
-                    let act = db_act.load_all_channel_activity().await;
+                    let mut act = db_act.load_all_channel_activity().await;
                     let pw = db_pw.load_presence_watches().await;
                     let em = db_em.load_custom_emoji().await;
                     let re = db_re.load_recent_emoji().await;
+                    // Merge channel meta newest_ts into activity (use whichever is newer)
+                    let meta = db_meta.load_all_channel_meta().await;
+                    for (cid, (_oldest, newest, _checked)) in &meta {
+                        let entry = act.entry(cid.clone()).or_default();
+                        if newest.as_str() > entry.as_str() {
+                            *entry = newest.clone();
+                        }
+                    }
                     (ch, us, lc, act, pw, em, re)
                 })
                 .await
                 .unwrap()
+            };
+
+            // Override last_channel / set pending state from CLI startup action
+            let (last_channel, startup_search) = match startup_action {
+                Some(StartupAction::OpenChannel(cid)) => (Some(cid), None),
+                Some(StartupAction::OpenMessage { channel_id, message_ts }) => {
+                    state.borrow_mut().pending_scroll = Some(message_ts);
+                    (Some(channel_id), None)
+                }
+                Some(StartupAction::Search(query)) => (last_channel, Some(query)),
+                None => (last_channel, None),
             };
 
             // Apply cached custom emoji BEFORE rendering any messages
@@ -1325,6 +1403,15 @@ pub fn build_app(
                     tracing::error!("Failed to load channels: {e}");
                     message_view.spinner.stop();
                     message_view.spinner.set_visible(false);
+                    if is_fatal_auth_error(&e) {
+                        tracing::warn!("Fatal auth error, logging out");
+                        let db2 = db.clone();
+                        let rt2 = rt.clone();
+                        rt2.spawn(async move { db2.clear_credentials().await });
+                        window_logout.close();
+                        crate::ui::login::show_login(&app_logout, rt, db);
+                        return;
+                    }
                 }
 
                 if let Some(Ok(users)) = usr_result {
@@ -1371,6 +1458,15 @@ pub fn build_app(
                     }
                 } else if let Some(Err(e)) = usr_result {
                     tracing::error!("Failed to load users: {e}");
+                    if is_fatal_auth_error(&e) {
+                        tracing::warn!("Fatal auth error, logging out");
+                        let db2 = db.clone();
+                        let rt2 = rt.clone();
+                        rt2.spawn(async move { db2.clear_credentials().await });
+                        window_logout.close();
+                        crate::ui::login::show_login(&app_logout, rt, db);
+                        return;
+                    }
                 }
             }
 
@@ -1394,6 +1490,36 @@ pub fn build_app(
                     }
                 });
             }
+
+            // ── Execute startup search if requested via --search CLI flag ──
+            if let Some(query) = startup_search {
+                let db = db.clone();
+                let rt = rt.clone();
+                let state = state.clone();
+                let mv = message_view.clone();
+                let client = client.clone();
+                let q = query.clone();
+                let results = rt
+                    .spawn(async move { db.search_messages(&q).await })
+                    .await
+                    .unwrap();
+                let st = state.borrow();
+                let users = st.user_names.clone();
+                let channels = st.channels.clone();
+                drop(st);
+                mv.set_search_results(&results, &users, &channels, &client, &rt);
+            }
+
+            // ── Background backfill: fetch up to 1 year of history for all channels ──
+            {
+                let channel_ids: Vec<String> = state.borrow().channels.iter().map(|c| c.id.clone()).collect();
+                let client = client.clone();
+                let db = db.clone();
+                let rt = rt.clone();
+                rt.spawn(async move {
+                    backfill_history(client, db, channel_ids).await;
+                });
+            }
         });
     }
 
@@ -1408,15 +1534,15 @@ pub fn build_app(
             let client = client.clone();
             let db = db.clone();
             let message_input = message_input.clone();
-            let search_popover = search_popover.clone();
+            let search_entry = sidebar.search_entry.clone();
             Rc::new(move |row: &gtk::ListBoxRow| {
                 let channel_id = row.widget_name().to_string();
                 if channel_id.is_empty() {
                     return;
                 }
 
-                // Dismiss search popover and focus the message input box
-                search_popover.popdown();
+                // Clear search and focus the message input box
+                search_entry.set_text("");
                 let input_focus = message_input.text_view.clone();
                 gtk4::glib::idle_add_local_once(move || {
                     input_focus.grab_focus();
@@ -1464,6 +1590,7 @@ pub fn build_app(
                 let rt2 = rt.clone();
                 let rt3 = rt.clone();
                 let db2 = db.clone();
+                let sidebar2 = sidebar.clone();
 
                 mv.spinner.set_visible(true);
                 mv.spinner.start();
@@ -1513,6 +1640,9 @@ pub fn build_app(
 
                         // Cache the fresh messages and update activity
                         let last_ts = messages.first().map(|m| m.ts.clone());
+                        if let Some(ref ts) = last_ts {
+                            sidebar2.update_activity(&cid, ts);
+                        }
                         let db_save = db2.clone();
                         let to_save = messages.clone();
                         let cid_save = cid.clone();
@@ -1562,36 +1692,68 @@ pub fn build_app(
         let window = window.clone();
         action.connect_activate(move |_, param| {
             let Some(param) = param.and_then(|p| p.get::<String>()) else { return };
-            let parts: Vec<&str> = param.splitn(3, ':').collect();
-            if parts.is_empty() { return; }
-            let channel_id = parts[0];
-            let message_ts = parts.get(1).copied();
-            // Third part is thread_ts if the message is a thread reply
-            let thread_ts = parts.get(2).copied();
+
+            // Parse the navigation parameter:
+            //   "user:U123"           → open DM with user U123
+            //   "ch:C123"             → open channel C123  (from search provider)
+            //   "msg:C123:1234.5678"  → open channel C123 and scroll to message
+            //   "C123"                → open channel (legacy / notification format)
+            //   "C123:1234.5678"      → open channel + scroll (legacy)
+            //   "C123:1234.5678:5678" → open channel + thread (legacy)
+            let (channel_id, message_ts, thread_ts) = if let Some(user_id) = param.strip_prefix("user:") {
+                // Find the DM channel for this user
+                let st = state.borrow();
+                let dm_channel = st.channels.iter().find(|c| {
+                    c.user.as_deref() == Some(user_id)
+                });
+                if let Some(ch) = dm_channel {
+                    (ch.id.clone(), None, None)
+                } else {
+                    tracing::warn!("No DM channel found for user {user_id}");
+                    return;
+                }
+            } else if let Some(channel_id) = param.strip_prefix("ch:") {
+                (channel_id.to_string(), None, None)
+            } else if let Some(rest) = param.strip_prefix("msg:") {
+                let parts: Vec<&str> = rest.splitn(3, ':').collect();
+                (
+                    parts[0].to_string(),
+                    parts.get(1).map(|s| s.to_string()),
+                    parts.get(2).map(|s| s.to_string()),
+                )
+            } else {
+                // Legacy format: channel_id[:message_ts[:thread_ts]]
+                let parts: Vec<&str> = param.splitn(3, ':').collect();
+                (
+                    parts[0].to_string(),
+                    parts.get(1).map(|s| s.to_string()),
+                    parts.get(2).map(|s| s.to_string()),
+                )
+            };
 
             // Raise the window
             window.present();
 
             let current = state.borrow().current_channel.clone();
-            let needs_channel_switch = current.as_deref() != Some(channel_id);
+            let needs_channel_switch = current.as_deref() != Some(&channel_id);
 
             if needs_channel_switch {
                 // Set pending state, then switch channel
-                if let Some(tts) = thread_ts {
-                    if let Some(mts) = message_ts {
-                        state.borrow_mut().pending_thread = Some((tts.to_string(), mts.to_string()));
+                if let Some(ref tts) = thread_ts {
+                    if let Some(ref mts) = message_ts {
+                        state.borrow_mut().pending_thread = Some((tts.clone(), mts.clone()));
                     }
-                } else if let Some(mts) = message_ts {
-                    state.borrow_mut().pending_scroll = Some(mts.to_string());
+                } else if let Some(ref mts) = message_ts {
+                    state.borrow_mut().pending_scroll = Some(mts.clone());
                 }
-                sidebar.select_channel_by_id(channel_id);
-            } else if let Some(tts) = thread_ts {
+                sidebar.select_channel_by_id(&channel_id);
+            } else if let Some(ref tts) = thread_ts {
                 // Already on the channel — open thread and scroll to the reply
-                if let Some(mts) = message_ts {
-                    message_view.open_thread(tts, channel_id);
+                if let Some(ref mts) = message_ts {
+                    message_view.open_thread(tts, &channel_id);
                     thread_panel.scroll_to_message(mts);
                 }
-            } else if let Some(mts) = message_ts {
+            } else if let Some(ref mts) = message_ts {
                 message_view.scroll_to_message(mts);
             }
         });
@@ -1613,21 +1775,133 @@ pub fn build_app(
         sidebar.widget.add_controller(key_controller);
     }
 
-    // ── Ctrl+P opens the search popover ──
+    // ── Ctrl+P focuses the channel search, Ctrl+F focuses message search ──
     {
-        let popover = search_popover.clone();
+        let ch_entry = sidebar.search_entry.clone();
+        let msg_entry = msg_search_entry.clone();
         let key_controller = gtk::EventControllerKey::new();
         key_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
         key_controller.connect_key_pressed(move |_, key, _, modifier| {
-            if key == gtk4::gdk::Key::p
-                && modifier.contains(gtk4::gdk::ModifierType::CONTROL_MASK)
-            {
-                popover.popup();
-                return gtk4::glib::Propagation::Stop;
+            if modifier.contains(gtk4::gdk::ModifierType::CONTROL_MASK) {
+                if key == gtk4::gdk::Key::p {
+                    ch_entry.grab_focus();
+                    return gtk4::glib::Propagation::Stop;
+                } else if key == gtk4::gdk::Key::f {
+                    msg_entry.grab_focus();
+                    return gtk4::glib::Propagation::Stop;
+                }
             }
             gtk4::glib::Propagation::Proceed
         });
         window.add_controller(key_controller);
+    }
+
+    // ── Message search: navigate to channel + scroll to message on click ──
+    {
+        let state_nav = state.clone();
+        let sidebar_nav = sidebar.clone();
+        let message_view_nav = message_view.clone();
+        let client_nav = client.clone();
+        let rt_nav = rt.clone();
+        message_view.set_search_result_callback(Rc::new(move |channel_id: &str, ts: &str| {
+            let current = state_nav.borrow().current_channel.clone();
+            let needs_switch = current.as_deref() != Some(channel_id);
+
+            let mv = message_view_nav.clone();
+            let c = client_nav.clone();
+            let c_img = client_nav.clone();
+            let rt2 = rt_nav.clone();
+            let rt3 = rt_nav.clone();
+            let cid = channel_id.to_string();
+            let target_ts = ts.to_string();
+            let state2 = state_nav.clone();
+            let sidebar2 = sidebar_nav.clone();
+
+            // Set current channel immediately so the sidebar switch doesn't
+            // trigger a second load
+            state_nav.borrow_mut().current_channel = Some(cid.clone());
+
+            if needs_switch {
+                sidebar2.select_channel_by_id(&cid);
+            }
+
+            // Load 25 messages either side of the target message
+            mv.spinner.set_visible(true);
+            mv.spinner.start();
+
+            gtk4::glib::spawn_future_local(async move {
+                let ch = cid.clone();
+                let t = target_ts.clone();
+                let result = rt2
+                    .spawn(async move { c.conversation_history_around(&ch, &t, 25).await })
+                    .await
+                    .unwrap();
+
+                mv.spinner.stop();
+                mv.spinner.set_visible(false);
+
+                if let Ok(messages) = result {
+                    let users = state2.borrow().user_names.clone();
+                    mv.set_messages(&messages, &users, &c_img, &rt3);
+                    mv.scroll_to_message(&target_ts);
+                }
+            });
+        }));
+    }
+
+    // ── Message search: query on Enter ──
+    {
+        let db_search = db.clone();
+        let rt_search = rt.clone();
+        let state_search = state.clone();
+        let mv_search = message_view.clone();
+        let client_search = client.clone();
+        let channel_filter_entry = sidebar.search_entry.clone();
+        msg_search_entry.connect_activate(move |entry| {
+            let query = entry.text().to_string();
+            if query.trim().is_empty() {
+                return;
+            }
+
+            let channel_filter = channel_filter_entry.text().to_string();
+            let db = db_search.clone();
+            let rt = rt_search.clone();
+            let state = state_search.clone();
+            let mv = mv_search.clone();
+            let client = client_search.clone();
+            gtk4::glib::spawn_future_local(async move {
+                let q = query.clone();
+                let results = rt
+                    .spawn(async move { db.search_messages(&q).await })
+                    .await
+                    .unwrap();
+
+                let st = state.borrow();
+                let users = st.user_names.clone();
+                let channels = st.channels.clone();
+                drop(st);
+
+                // Filter to channels matching the channel search box text
+                let results = if channel_filter.trim().is_empty() {
+                    results
+                } else {
+                    let filter_lower = channel_filter.to_lowercase();
+                    results
+                        .into_iter()
+                        .filter(|(cid, _)| {
+                            channels
+                                .iter()
+                                .find(|c| c.id == *cid)
+                                .and_then(|c| c.name.as_deref())
+                                .map(|name| name.to_lowercase().contains(&filter_lower))
+                                .unwrap_or(false)
+                        })
+                        .collect()
+                };
+
+                mv.set_search_results(&results, &users, &channels, &client, &rt);
+            });
+        });
     }
 
     // ── Send message ──
@@ -1636,12 +1910,6 @@ pub fn build_app(
         let input = message_input.clone();
         let rt_send = rt.clone();
         let client_send = client.clone();
-
-        // Clone for schedule callback before do_send consumes them
-        let sched_state = state_send.clone();
-        let sched_input = message_input.clone();
-        let sched_rt = rt_send.clone();
-        let sched_client = client_send.clone();
 
         let do_send = move || {
             let text = input.get_text();
@@ -1702,41 +1970,6 @@ pub fn build_app(
         message_input.send_button.send.connect_clicked(move |_| {
             do_send_clone();
         });
-
-        // Schedule callback
-        {
-            let state = sched_state;
-            let input = sched_input;
-            let rt = sched_rt;
-            let client = sched_client;
-            message_input.send_button.set_schedule_callback(Rc::new(move |ts: Option<i64>| {
-                let Some(ts) = ts else { return };
-                let text = input.get_text();
-                if text.trim().is_empty() {
-                    return;
-                }
-                let channel = match state.borrow().current_channel.clone() {
-                    Some(c) => c,
-                    None => return,
-                };
-                input.clear();
-                let client = client.clone();
-                let rt2 = rt.clone();
-                gtk4::glib::spawn_future_local(async move {
-                    let c = client.clone();
-                    let ch = channel.clone();
-                    let txt = text.clone();
-                    let result = rt2
-                        .spawn(async move { c.schedule_message(&ch, &txt, ts, None).await })
-                        .await;
-                    match result {
-                        Ok(Ok(())) => tracing::info!("Message scheduled"),
-                        Ok(Err(e)) => tracing::error!("Failed to schedule message: {e}"),
-                        Err(e) => tracing::error!("Schedule task error: {e}"),
-                    }
-                });
-            }));
-        }
 
         // Ctrl+Enter to send
         let key_controller = gtk::EventControllerKey::new();
@@ -1864,14 +2097,16 @@ pub fn build_app(
                             sidebar.set_unread(&channel, count);
                         }
 
-                        // Cache the incoming message and update activity
+                        // Cache the incoming message, index for search, and update activity
                         {
+                            sidebar.update_activity(&channel, &msg.ts);
                             let db2 = db.clone();
                             let msg2 = msg.clone();
                             let cid = channel.clone();
                             let ts = msg.ts.clone();
                             rt_rt.spawn(async move {
                                 db2.append_message(&cid, &msg2).await;
+                                db2.index_messages(&cid, &[msg2]).await;
                                 db2.update_channel_activity(&cid, &ts).await;
                             });
                         }
@@ -2132,6 +2367,7 @@ pub fn build_app(
                         let reaction2 = reaction.clone();
                         let user2 = user.clone();
                         let message_view2 = message_view.clone();
+                        let thread_panel2 = thread_panel.clone();
                         let state2 = state.clone();
 
                         // Update DB and refresh UI
@@ -2144,6 +2380,7 @@ pub fn build_app(
                             if is_current {
                                 let users = state2.borrow().user_names.clone();
                                 message_view2.update_reactions(&message_ts, &reactions, &users);
+                                thread_panel2.update_reactions(&message_ts, &reactions, &users);
                             }
                         }
                     }
@@ -2217,7 +2454,7 @@ fn build_emoji_path_map(emoji: &HashMap<String, String>) -> HashMap<String, Stri
 
     let cache_dir = dirs::data_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("slag")
+        .join("sludge")
         .join("emoji_cache");
 
     let mut paths = HashMap::new();
@@ -2246,7 +2483,7 @@ async fn download_custom_emoji(
 
     let cache_dir = dirs::data_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("slag")
+        .join("sludge")
         .join("emoji_cache");
 
     let _ = tokio::fs::create_dir_all(&cache_dir).await;
@@ -2447,5 +2684,135 @@ fn load_css() {
         &provider,
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
+}
+
+/// Background task: fetch up to 1 year of message history for all channels
+/// and index them for full-text search. Backs off exponentially on rate limits.
+async fn backfill_history(client: Client, db: Arc<Database>, channel_ids: Vec<String>) {
+    use std::time::Duration;
+
+    let cutoff = (chrono::Utc::now() - chrono::Duration::days(30)).timestamp();
+    let oldest = format!("{cutoff}.000000");
+    let page_size = 200u32;
+    let mut backoff = Duration::from_secs(1);
+    let max_backoff = Duration::from_secs(300);
+    let recheck_days = 3;
+
+    // Check which channels already have indexed history reaching the 30-day cutoff
+    let channel_meta = db.load_all_channel_meta().await;
+    let now = chrono::Utc::now();
+    let channels_to_backfill: Vec<&String> = channel_ids
+        .iter()
+        .filter(|id| {
+            match channel_meta.get(*id) {
+                Some((meta_oldest, _, checked_at)) => {
+                    // If we've reached the end of history and checked recently, skip
+                    if meta_oldest <= &oldest {
+                        if let Some(checked) = checked_at {
+                            if let Ok(checked_time) = chrono::DateTime::parse_from_rfc3339(checked) {
+                                let age = now.signed_duration_since(checked_time);
+                                if age < chrono::Duration::days(recheck_days) {
+                                    return false;
+                                }
+                            }
+                        }
+                    }
+                    meta_oldest > &oldest
+                }
+                None => true, // No metadata → needs backfill
+            }
+        })
+        .collect();
+
+    if channels_to_backfill.is_empty() {
+        tracing::info!(
+            "Backfill: all {} channels already have 30 days of history indexed",
+            channel_ids.len()
+        );
+        return;
+    }
+
+    tracing::info!(
+        "Starting background backfill for {}/{} channels (oldest={})",
+        channels_to_backfill.len(),
+        channel_ids.len(),
+        oldest
+    );
+
+    for (i, channel_id) in channels_to_backfill.iter().enumerate() {
+        // Start from the oldest already-indexed message so we don't re-fetch
+        let mut latest: Option<String> = db.oldest_indexed_ts(channel_id).await;
+        let mut total = 0u32;
+
+        loop {
+            let result = client
+                .conversation_history_page(
+                    channel_id,
+                    &oldest,
+                    latest.as_deref(),
+                    page_size,
+                )
+                .await;
+
+            match result {
+                Ok((messages, has_more)) => {
+                    // Reset backoff on success
+                    backoff = Duration::from_secs(1);
+
+                    if messages.is_empty() {
+                        db.mark_backfill_checked(channel_id).await;
+                        break;
+                    }
+
+                    total += messages.len() as u32;
+
+                    // The oldest message in this batch becomes the next page's `latest`
+                    if let Some(oldest_msg) = messages.last() {
+                        latest = Some(oldest_msg.ts.clone());
+                    }
+
+                    db.index_messages(channel_id, &messages).await;
+                    db.update_channel_meta(channel_id, &messages).await;
+
+                    if !has_more {
+                        db.mark_backfill_checked(channel_id).await;
+                        break;
+                    }
+
+                    // Small delay between pages to be polite
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Err(e) if e.contains("ratelimited") || e.contains("rate_limited") => {
+                    tracing::warn!(
+                        "Backfill rate limited on channel {} — backing off {:?}",
+                        channel_id,
+                        backoff
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(max_backoff);
+                    continue; // Retry same page
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Backfill error for channel {}: {e} — skipping",
+                        channel_id
+                    );
+                    break;
+                }
+            }
+        }
+
+        if total > 0 {
+            tracing::debug!(
+                "Backfill [{}/{}] channel {}: indexed {} messages",
+                i + 1,
+                channels_to_backfill.len(),
+                channel_id,
+                total
+            );
+        }
+    }
+
+    tracing::info!("Background backfill complete");
 }
 
