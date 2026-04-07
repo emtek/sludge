@@ -3,8 +3,17 @@ use gtk4::{self as gtk, gdk, glib};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+use crate::slack::client::Client;
+
 /// Show a fullscreen image viewer with pan and zoom.
-pub fn show(texture: &gdk::Texture, parent: &impl IsA<gtk::Window>) {
+/// Displays the thumbnail immediately, then loads full resolution in the background.
+pub fn show(
+    texture: &gdk::Texture,
+    parent: &impl IsA<gtk::Window>,
+    urls: Option<Vec<String>>,
+    client: Option<Client>,
+    rt: Option<tokio::runtime::Handle>,
+) {
     let window = gtk::Window::builder()
         .title("Image")
         .transient_for(parent)
@@ -12,8 +21,8 @@ pub fn show(texture: &gdk::Texture, parent: &impl IsA<gtk::Window>) {
         .fullscreened(true)
         .build();
 
-    let img_w = texture.width() as f64;
-    let img_h = texture.height() as f64;
+    let img_w = Rc::new(Cell::new(texture.width() as f64));
+    let img_h = Rc::new(Cell::new(texture.height() as f64));
 
     // Shared texture ref — cleared on close to release memory
     let texture_ref: Rc<RefCell<Option<gdk::Texture>>> = Rc::new(RefCell::new(Some(texture.clone())));
@@ -33,6 +42,8 @@ pub fn show(texture: &gdk::Texture, parent: &impl IsA<gtk::Window>) {
         let zoom = zoom.clone();
         let ox = offset_x.clone();
         let oy = offset_y.clone();
+        let img_w = img_w.clone();
+        let img_h = img_h.clone();
         area.set_draw_func(move |_area, cr, width, height| {
             cr.set_source_rgb(0.0, 0.0, 0.0);
             cr.paint().ok();
@@ -40,16 +51,19 @@ pub fn show(texture: &gdk::Texture, parent: &impl IsA<gtk::Window>) {
             let tex_borrow = tex.borrow();
             let Some(texture) = tex_borrow.as_ref() else { return };
 
+            let iw = img_w.get();
+            let ih = img_h.get();
+
             // Compute initial zoom to fit image to screen on first draw
             let mut z = zoom.get();
-            if z == 0.0 && width > 0 && height > 0 && img_w > 0.0 && img_h > 0.0 {
-                let fit_w = width as f64 / img_w;
-                let fit_h = height as f64 / img_h;
+            if z == 0.0 && width > 0 && height > 0 && iw > 0.0 && ih > 0.0 {
+                let fit_w = width as f64 / iw;
+                let fit_h = height as f64 / ih;
                 z = fit_w.min(fit_h);
                 zoom.set(z);
             }
-            let scaled_w = img_w * z;
-            let scaled_h = img_h * z;
+            let scaled_w = iw * z;
+            let scaled_h = ih * z;
 
             let cx = (width as f64 - scaled_w) / 2.0 + ox.get();
             let cy = (height as f64 - scaled_h) / 2.0 + oy.get();
@@ -58,7 +72,7 @@ pub fn show(texture: &gdk::Texture, parent: &impl IsA<gtk::Window>) {
             cr.scale(z, z);
 
             let snapshot = gtk::Snapshot::new();
-            texture.snapshot(snapshot.upcast_ref::<gdk::Snapshot>(), img_w, img_h);
+            texture.snapshot(snapshot.upcast_ref::<gdk::Snapshot>(), iw, ih);
             if let Some(node) = snapshot.to_node() {
                 node.draw(cr);
             }
@@ -162,9 +176,94 @@ pub fn show(texture: &gdk::Texture, parent: &impl IsA<gtk::Window>) {
         area.add_controller(click);
     }
 
+    // Loading spinner overlay (shown while full-res loads)
+    let spinner = gtk::Spinner::new();
+    spinner.set_size_request(32, 32);
+    spinner.add_css_class("osd");
+    spinner.set_halign(gtk::Align::Start);
+    spinner.set_valign(gtk::Align::End);
+    spinner.set_margin_bottom(16);
+    spinner.set_margin_start(16);
+
+    // Kick off full-resolution fetch in the background
+    let closed = Rc::new(Cell::new(false));
+    if let (Some(urls), Some(client), Some(rt)) = (urls, client, rt) {
+        spinner.set_visible(true);
+        spinner.set_spinning(true);
+        overlay.add_overlay(&spinner);
+
+        let tex_ref = texture_ref.clone();
+        let img_w = img_w.clone();
+        let img_h = img_h.clone();
+        let zoom = zoom.clone();
+        let offset_x = offset_x.clone();
+        let offset_y = offset_y.clone();
+        let area_weak = area.downgrade();
+        let spinner_weak = spinner.downgrade();
+        let closed = closed.clone();
+
+        glib::spawn_future_local(async move {
+            let c = client.clone();
+            let bytes_result = rt.spawn(async move {
+                for url in &urls {
+                    match c.fetch_image_bytes(url).await {
+                        Ok(b) => return Ok(b),
+                        Err(e) => {
+                            tracing::debug!("Full-res image URL failed ({url}): {e}");
+                        }
+                    }
+                }
+                Err("all URLs failed".to_string())
+            }).await;
+
+            if closed.get() { return; }
+
+            // Hide spinner
+            if let Some(sp) = spinner_weak.upgrade() {
+                sp.set_spinning(false);
+                sp.set_visible(false);
+            }
+
+            if let Ok(Ok(bytes)) = bytes_result {
+                let gbytes = glib::Bytes::from(&bytes);
+                let stream = gtk4::gio::MemoryInputStream::from_bytes(&gbytes);
+                // Decode at full resolution
+                match gtk4::gdk_pixbuf::Pixbuf::from_stream(
+                    &stream,
+                    gtk4::gio::Cancellable::NONE,
+                ) {
+                    Ok(pixbuf) => {
+                        if closed.get() { return; }
+                        let w = pixbuf.width() as f64;
+                        let h = pixbuf.height() as f64;
+                        tracing::info!(
+                            "[MEM] Full-res image decoded: {w}x{h} = {:.2} MiB",
+                            (w * h * 4.0) / 1048576.0
+                        );
+                        let texture = gdk::Texture::for_pixbuf(&pixbuf);
+                        img_w.set(w);
+                        img_h.set(h);
+                        // Reset zoom so it recomputes fit-to-screen for new dimensions
+                        zoom.set(0.0);
+                        offset_x.set(0.0);
+                        offset_y.set(0.0);
+                        *tex_ref.borrow_mut() = Some(texture);
+                        if let Some(area) = area_weak.upgrade() {
+                            area.queue_draw();
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!("Failed to decode full-res image: {e}");
+                    }
+                }
+            }
+        });
+    }
+
     // On close, drop the texture and tear down widget tree
     let tex_close = texture_ref;
     window.connect_close_request(move |win| {
+        closed.set(true);
         // Release the texture immediately
         *tex_close.borrow_mut() = None;
         win.set_child(None::<&gtk::Widget>);

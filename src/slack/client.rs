@@ -53,6 +53,17 @@ struct RawPresenceResponse {
     presence: Option<String>,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct RawEmojiList {
+    emoji: std::collections::HashMap<String, String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RawGetUploadUrl {
+    upload_url: String,
+    file_id: String,
+}
+
 /// Credentials for stealth (cookie) auth, kept around for raw HTTP calls.
 #[derive(Clone)]
 struct StealthCreds {
@@ -141,14 +152,14 @@ impl Client {
     }
 
     /// Fetch image bytes with local disk caching.
-    /// Cached files are stored under `~/.local/share/slack-frontend/image_cache/`.
+    /// Cached files are stored under `~/.local/share/slag/image_cache/`.
     pub async fn fetch_image_bytes(&self, url: &str) -> Result<Vec<u8>, String> {
         use std::hash::{Hash, Hasher};
 
         // Build a deterministic cache path from the URL
         let cache_dir = dirs::data_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join("slack-frontend")
+            .join("slag")
             .join("image_cache");
 
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -614,6 +625,132 @@ impl Client {
         }
     }
 
+    /// Schedule a message for later delivery via `chat.scheduleMessage`.
+    /// `post_at` is a Unix timestamp (seconds).
+    pub async fn schedule_message(
+        &self,
+        channel: &str,
+        text: &str,
+        post_at: i64,
+        thread_ts: Option<&str>,
+    ) -> Result<(), String> {
+        info!("Calling chat.scheduleMessage to channel={channel} at {post_at}");
+        let post_at_str = post_at.to_string();
+        match &self.backend {
+            Backend::Slacko(_inner) => {
+                // slacko crate doesn't have scheduleMessage — fall through to stealth
+                Err("scheduleMessage not supported in bot mode".to_string())
+            }
+            Backend::Stealth { http, creds } => {
+                let mut fields = vec![
+                    ("channel", channel),
+                    ("text", text),
+                    ("post_at", &post_at_str),
+                ];
+                if let Some(ts) = thread_ts {
+                    fields.push(("thread_ts", ts));
+                }
+                let _: serde_json::Value =
+                    Self::stealth_post(http, creds, "chat.scheduleMessage", &fields).await?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Upload a file to a channel using the v2 upload flow:
+    /// 1. files.getUploadURLExternal → get upload URL + file_id
+    /// 2. PUT file content to the upload URL
+    /// 3. files.completeUploadExternal → share to channel
+    pub async fn upload_file(
+        &self,
+        channel: &str,
+        content: Vec<u8>,
+        filename: &str,
+        initial_comment: Option<&str>,
+        thread_ts: Option<&str>,
+    ) -> Result<(), String> {
+        let len = content.len() as u64;
+        info!("Uploading file '{filename}' ({len} bytes) to channel={channel} (v2 flow)");
+
+        match &self.backend {
+            Backend::Slacko(inner) => {
+                // Step 1: Get upload URL
+                let upload_info = inner
+                    .files()
+                    .get_upload_url_external(filename, len, None, None)
+                    .await
+                    .map_err(|e| format!("getUploadURLExternal: {e}"))?;
+
+                // Step 2: PUT content to the upload URL
+                let http = reqwest::Client::new();
+                let resp = http
+                    .post(&upload_info.upload_url)
+                    .header("Content-Type", "application/octet-stream")
+                    .body(content)
+                    .send()
+                    .await
+                    .map_err(|e| format!("File PUT error: {e}"))?;
+                if !resp.status().is_success() {
+                    return Err(format!("File PUT failed: {}", resp.status()));
+                }
+
+                // Step 3: Complete upload
+                let file_info = slacko::api::files::UploadedFileInfo::new(&upload_info.file_id);
+                inner
+                    .files()
+                    .complete_upload_external(
+                        &[file_info],
+                        Some(channel),
+                        initial_comment,
+                        thread_ts,
+                    )
+                    .await
+                    .map_err(|e| format!("completeUploadExternal: {e}"))?;
+                Ok(())
+            }
+            Backend::Stealth { http, creds } => {
+                // Step 1: Get upload URL
+                let len_str = len.to_string();
+                let get_url_resp: RawGetUploadUrl = Self::stealth_post(
+                    http, creds,
+                    "files.getUploadURLExternal",
+                    &[("filename", filename), ("length", &len_str)],
+                ).await?;
+
+                // Step 2: PUT content to the upload URL
+                let put_resp = http
+                    .post(&get_url_resp.upload_url)
+                    .header("Content-Type", "application/octet-stream")
+                    .body(content)
+                    .send()
+                    .await
+                    .map_err(|e| format!("File PUT error: {e}"))?;
+                if !put_resp.status().is_success() {
+                    return Err(format!("File PUT failed: {}", put_resp.status()));
+                }
+
+                // Step 3: Complete upload
+                let files_json = serde_json::json!([{"id": get_url_resp.file_id}]).to_string();
+                let mut fields = vec![
+                    ("files", files_json.as_str()),
+                    ("channel_id", channel),
+                ];
+                if let Some(comment) = initial_comment {
+                    fields.push(("initial_comment", comment));
+                }
+                if let Some(ts) = thread_ts {
+                    fields.push(("thread_ts", ts));
+                }
+                let _: serde_json::Value = Self::stealth_post(
+                    http, creds,
+                    "files.completeUploadExternal",
+                    &fields,
+                ).await?;
+                Ok(())
+            }
+        }
+    }
+
     pub async fn delete_message(&self, channel: &str, ts: &str) -> Result<(), String> {
         info!("Calling chat.delete on channel={channel} ts={ts}");
         match &self.backend {
@@ -767,6 +904,28 @@ impl Client {
     }
 
     // ── Users ──
+
+    /// Fetch all custom emoji for the workspace.
+    /// Returns a map of emoji name -> URL (or "alias:other_name" for aliases).
+    pub async fn emoji_list(&self) -> Result<std::collections::HashMap<String, String>, String> {
+        info!("Calling emoji.list...");
+        match &self.backend {
+            Backend::Slacko(inner) => {
+                let resp = inner.emoji().list().await.map_err(|e| {
+                    error!("emoji.list failed: {e}");
+                    format!("API error: {e}")
+                })?;
+                info!("emoji.list returned {} emoji", resp.emoji.len());
+                Ok(resp.emoji)
+            }
+            Backend::Stealth { http, creds } => {
+                let data: RawEmojiList =
+                    Self::stealth_post(http, creds, "emoji.list", &[]).await?;
+                info!("emoji.list returned {} emoji", data.emoji.len());
+                Ok(data.emoji)
+            }
+        }
+    }
 
     pub async fn users_list_all(&self) -> Result<Vec<User>, String> {
         info!("Calling users.list (paginated)...");

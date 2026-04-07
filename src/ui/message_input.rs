@@ -1,19 +1,44 @@
 use gtk4::prelude::*;
 use gtk4::{self as gtk, Button, TextView};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::rc::Rc;
+
+use crate::ui::autocomplete::Autocomplete;
+use crate::ui::send_button::SendButton;
 
 pub struct MessageInput {
     pub widget: gtk::Box,
     pub text_view: TextView,
-    pub send_button: Button,
+    pub send_button: SendButton,
+    pub attach_button: Button,
+    files: Rc<RefCell<Vec<PathBuf>>>,
+    file_preview_box: gtk::Box,
+    autocomplete: Autocomplete,
 }
 
 impl MessageInput {
     pub fn new() -> Self {
-        let container = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
         container.set_margin_top(8);
         container.set_margin_bottom(8);
         container.set_margin_start(8);
         container.set_margin_end(8);
+
+        // File preview area (hidden when empty)
+        let file_preview_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        file_preview_box.set_margin_bottom(4);
+        file_preview_box.set_visible(false);
+        container.append(&file_preview_box);
+
+        // Input row
+        let input_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+
+        let attach_button = Button::from_icon_name("mail-attachment-symbolic");
+        attach_button.add_css_class("flat");
+        attach_button.set_valign(gtk::Align::End);
+        attach_button.set_tooltip_text(Some("Attach file"));
 
         let text_view = TextView::new();
         text_view.set_hexpand(true);
@@ -31,18 +56,72 @@ impl MessageInput {
         frame.set_hexpand(true);
         frame.set_child(Some(&text_view));
 
-        let send_button = Button::with_label("Send");
-        send_button.add_css_class("suggested-action");
-        send_button.set_valign(gtk::Align::End);
+        let send_button = SendButton::new();
 
-        container.append(&frame);
-        container.append(&send_button);
+        input_row.append(&attach_button);
+        input_row.append(&frame);
+        input_row.append(&send_button.widget);
+
+        container.append(&input_row);
+
+        let files: Rc<RefCell<Vec<PathBuf>>> = Rc::new(RefCell::new(Vec::new()));
+
+        // Attach shared autocomplete (handles both @mentions and :emoji:)
+        let autocomplete = Autocomplete::attach(&text_view);
+
+        // Wire up attach button to open file chooser
+        let files_click = files.clone();
+        let preview_click = file_preview_box.clone();
+        let widget_weak = container.downgrade();
+        attach_button.connect_clicked(move |_| {
+            let Some(widget) = widget_weak.upgrade() else { return };
+            let files = files_click.clone();
+            let preview = preview_click.clone();
+
+            let dialog = gtk::FileDialog::new();
+            dialog.set_title("Attach files");
+
+            if let Some(root) = widget.root() {
+                if let Some(win) = root.downcast_ref::<gtk::Window>() {
+                    let files2 = files.clone();
+                    let preview2 = preview.clone();
+                    dialog.open_multiple(Some(win), gtk::gio::Cancellable::NONE, move |result| {
+                        if let Ok(file_list) = result {
+                            for i in 0..file_list.n_items() {
+                                if let Some(obj) = file_list.item(i) {
+                                    if let Ok(file) = obj.downcast::<gtk::gio::File>() {
+                                        if let Some(path) = file.path() {
+                                            files2.borrow_mut().push(path);
+                                        }
+                                    }
+                                }
+                            }
+                            rebuild_file_preview(&preview2, &files2);
+                        }
+                    });
+                }
+            }
+        });
 
         Self {
             widget: container,
             text_view,
             send_button,
+            attach_button,
+            files,
+            file_preview_box,
+            autocomplete,
         }
+    }
+
+    /// Set the user list for @mention autocomplete.
+    pub fn set_mention_users(&self, users: &HashMap<String, String>) {
+        self.autocomplete.set_users(users);
+    }
+
+    /// Set a callback invoked when an emoji is picked via autocomplete.
+    pub fn set_on_emoji_picked(&self, f: Rc<dyn Fn(&str)>) {
+        self.autocomplete.set_on_emoji_picked(f);
     }
 
     pub fn get_text(&self) -> String {
@@ -53,5 +132,66 @@ impl MessageInput {
 
     pub fn clear(&self) {
         self.text_view.buffer().set_text("");
+        self.files.borrow_mut().clear();
+        rebuild_file_preview(&self.file_preview_box, &self.files);
+    }
+
+    pub fn take_files(&self) -> Vec<PathBuf> {
+        let files = self.files.borrow().clone();
+        self.files.borrow_mut().clear();
+        rebuild_file_preview(&self.file_preview_box, &self.files);
+        files
+    }
+
+    pub fn has_files(&self) -> bool {
+        !self.files.borrow().is_empty()
+    }
+}
+
+fn rebuild_file_preview(preview_box: &gtk::Box, files: &Rc<RefCell<Vec<PathBuf>>>) {
+    // Clear existing children
+    while let Some(child) = preview_box.first_child() {
+        preview_box.remove(&child);
+    }
+
+    let file_list = files.borrow();
+    preview_box.set_visible(!file_list.is_empty());
+
+    for (idx, path) in file_list.iter().enumerate() {
+        let chip = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        chip.add_css_class("card");
+        chip.set_margin_top(2);
+        chip.set_margin_bottom(2);
+        chip.set_margin_start(2);
+        chip.set_margin_end(2);
+
+        let icon = gtk::Image::from_icon_name("mail-attachment-symbolic");
+        icon.set_margin_start(6);
+        chip.append(&icon);
+
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "file".into());
+        let label = gtk::Label::new(Some(&name));
+        label.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
+        label.set_max_width_chars(20);
+        chip.append(&label);
+
+        let remove_btn = Button::from_icon_name("window-close-symbolic");
+        remove_btn.add_css_class("flat");
+        remove_btn.add_css_class("circular");
+        remove_btn.set_margin_start(2);
+        remove_btn.set_margin_end(2);
+
+        let files_rm = files.clone();
+        let preview_rm = preview_box.clone();
+        remove_btn.connect_clicked(move |_| {
+            files_rm.borrow_mut().remove(idx);
+            rebuild_file_preview(&preview_rm, &files_rm);
+        });
+        chip.append(&remove_btn);
+
+        preview_box.append(&chip);
     }
 }

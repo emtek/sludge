@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Slag
+Comment=A Slack client for the Linux desktop
+Exec=slag
+Icon=slag
+Terminal=false
+Type=Application
+Categories=Network;InstantMessaging;GTK;
+Keywords=slack;chat;messaging;
+StartupWMClass=dev.slag.app

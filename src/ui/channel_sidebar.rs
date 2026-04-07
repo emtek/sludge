@@ -8,11 +8,15 @@ use std::rc::Rc;
 use crate::slack::helpers::channel_display_name;
 
 /// Channel actions triggered from context menus.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum ChannelAction {
     Leave,
     Archive,
     Close,
+    /// Start watching a user's presence (user_id).
+    WatchPresence(String),
+    /// Stop watching a user's presence (user_id).
+    UnwatchPresence(String),
 }
 
 /// Callback type for channel actions: (action, channel_id)
@@ -32,8 +36,10 @@ pub struct ChannelSidebar {
     user_names: Rc<RefCell<HashMap<String, String>>>,
     /// Last activity timestamp per channel ID (for sorting by recency).
     activity: Rc<RefCell<HashMap<String, String>>>,
-    /// Presence indicator labels keyed by user ID (for DM rows).
+    /// Presence indicator labels keyed by user ID (green/hollow circle).
     presence_icons: Rc<RefCell<HashMap<String, Label>>>,
+    /// Status emoji containers keyed by user ID (holds Label or Image).
+    status_icons: Rc<RefCell<HashMap<String, gtk::Box>>>,
     /// Presence state keyed by user ID.
     presence_state: Rc<RefCell<HashMap<String, bool>>>,
     /// DM rows keyed by user ID (for showing/hiding based on presence).
@@ -42,6 +48,14 @@ pub struct ChannelSidebar {
     show_online_only: Rc<RefCell<bool>>,
     /// Callback for channel context menu actions.
     action_callback: Rc<RefCell<Option<ChannelActionCallback>>>,
+    /// User IDs being watched for presence notifications.
+    watched_users: Rc<RefCell<std::collections::HashSet<String>>>,
+    /// Watch indicator labels keyed by user ID (for toggling eyes emoji).
+    watch_labels: Rc<RefCell<HashMap<String, Label>>>,
+    /// User status emoji keyed by user ID (Slack shortcode, e.g. ":coffee:").
+    status_emoji: Rc<RefCell<HashMap<String, String>>>,
+    /// User status text keyed by user ID.
+    status_text: Rc<RefCell<HashMap<String, String>>>,
 }
 
 impl ChannelSidebar {
@@ -59,27 +73,12 @@ impl ChannelSidebar {
 
         let inner = gtk::Box::new(gtk::Orientation::Vertical, 0);
 
-        // Channels section
-        let channels_header = Label::new(Some("Channels"));
-        channels_header.add_css_class("heading");
-        channels_header.add_css_class("dim-label");
-        channels_header.set_halign(gtk::Align::Start);
-        channels_header.set_margin_top(8);
-        channels_header.set_margin_start(12);
-        channels_header.set_margin_bottom(4);
-        inner.append(&channels_header);
-
-        let channels_list = ListBox::new();
-        channels_list.set_selection_mode(gtk::SelectionMode::Single);
-        channels_list.add_css_class("navigation-sidebar");
-        inner.append(&channels_list);
-
         // DM section
         let dm_header = Label::new(Some("Direct Messages"));
         dm_header.add_css_class("heading");
         dm_header.add_css_class("dim-label");
         dm_header.set_halign(gtk::Align::Start);
-        dm_header.set_margin_top(12);
+        dm_header.set_margin_top(8);
         dm_header.set_margin_start(12);
         dm_header.set_margin_bottom(4);
         inner.append(&dm_header);
@@ -88,6 +87,21 @@ impl ChannelSidebar {
         dm_list.set_selection_mode(gtk::SelectionMode::Single);
         dm_list.add_css_class("navigation-sidebar");
         inner.append(&dm_list);
+
+        // Channels section
+        let channels_header = Label::new(Some("Channels"));
+        channels_header.add_css_class("heading");
+        channels_header.add_css_class("dim-label");
+        channels_header.set_halign(gtk::Align::Start);
+        channels_header.set_margin_top(12);
+        channels_header.set_margin_start(12);
+        channels_header.set_margin_bottom(4);
+        inner.append(&channels_header);
+
+        let channels_list = ListBox::new();
+        channels_list.set_selection_mode(gtk::SelectionMode::Single);
+        channels_list.add_css_class("navigation-sidebar");
+        inner.append(&channels_list);
 
         // Groups section
         let group_header = Label::new(Some("Groups"));
@@ -119,6 +133,8 @@ impl ChannelSidebar {
         let activity: Rc<RefCell<HashMap<String, String>>> =
             Rc::new(RefCell::new(HashMap::new()));
         let presence_icons: Rc<RefCell<HashMap<String, Label>>> =
+            Rc::new(RefCell::new(HashMap::new()));
+        let status_icons: Rc<RefCell<HashMap<String, gtk::Box>>> =
             Rc::new(RefCell::new(HashMap::new()));
         let presence_state: Rc<RefCell<HashMap<String, bool>>> =
             Rc::new(RefCell::new(HashMap::new()));
@@ -159,6 +175,7 @@ impl ChannelSidebar {
         let dn_filter = display_names.clone();
         let presence_state_filter = presence_state.clone();
         let show_online_filter = show_online_only.clone();
+        let scrolled_filter = scrolled.clone();
         search_entry.connect_search_changed(move |entry| {
             let query = entry.text().to_string().to_lowercase();
             let chs = channels_clone.borrow();
@@ -190,6 +207,9 @@ impl ChannelSidebar {
             ch_list_clone.invalidate_sort();
             dm_list_clone.invalidate_sort();
             gr_list_clone.invalidate_sort();
+
+            // Scroll to top so first results are visible
+            scrolled_filter.vadjustment().set_value(0.0);
         });
 
         // Down arrow moves focus into the first visible row across all lists
@@ -237,15 +257,30 @@ impl ChannelSidebar {
             user_names,
             activity,
             presence_icons,
+            status_icons,
             presence_state,
             dm_rows,
             show_online_only,
             action_callback,
+            watched_users: Rc::new(RefCell::new(std::collections::HashSet::new())),
+            watch_labels: Rc::new(RefCell::new(HashMap::new())),
+            status_emoji: Rc::new(RefCell::new(HashMap::new())),
+            status_text: Rc::new(RefCell::new(HashMap::new())),
         }
     }
 
     pub fn set_action_callback(&self, cb: ChannelActionCallback) {
         *self.action_callback.borrow_mut() = Some(cb);
+    }
+
+    /// Set the list of user IDs being watched for presence notifications.
+    pub fn set_watched_users(&self, users: std::collections::HashSet<String>) {
+        *self.watched_users.borrow_mut() = users;
+    }
+
+    /// Check if a user is being watched for presence notifications.
+    pub fn is_watched(&self, user_id: &str) -> bool {
+        self.watched_users.borrow().contains(user_id)
     }
 
     /// Set channel activity timestamps (channel_id -> Slack ts).
@@ -304,11 +339,31 @@ impl ChannelSidebar {
     pub fn set_channels(&self, all: &[Channel]) {
         let names = self.user_names.borrow();
 
+        let act = self.activity.borrow();
+
+        // Only show channels with activity in the last 2 weeks
+        let two_weeks_ago = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+            .saturating_sub(14 * 24 * 60 * 60);
+        let cutoff = format!("{two_weeks_ago}");
+
+        let is_recent = |id: &str| -> bool {
+            match act.get(id) {
+                Some(ts) => ts.as_str() >= cutoff.as_str(),
+                None => true, // no activity data yet — show by default
+            }
+        };
+
         let mut ch_list: Vec<Channel> = Vec::new();
         let mut dm_list: Vec<Channel> = Vec::new();
         let mut gr_list: Vec<Channel> = Vec::new();
 
         for ch in all {
+            if !is_recent(&ch.id) {
+                continue;
+            }
             if Self::is_mpdm(ch) {
                 gr_list.push(ch.clone());
             } else if ch.is_im == Some(true) {
@@ -320,8 +375,6 @@ impl ChannelSidebar {
                 ch_list.push(ch.clone());
             }
         }
-
-        let act = self.activity.borrow();
 
         // Sort by last activity (most recent first), then alphabetical as tiebreaker
         let activity_sort = |a_id: &str, b_id: &str, a_name: &str, b_name: &str| -> std::cmp::Ordering {
@@ -360,9 +413,10 @@ impl ChannelSidebar {
         }
         let mut new_badges = HashMap::new();
         let acb = self.action_callback.borrow().clone();
+        let watched = &self.watched_users;
         for ch in &ch_list {
             let (row, badge) = Self::make_channel_row(ch);
-            Self::attach_context_menu(&row, &ch.id, false, &acb);
+            Self::attach_context_menu(&row, &ch.id, false, None, &acb, watched, &self.watch_labels, &self.status_emoji, &self.status_text);
             self.channels_list.append(&row);
             new_badges.insert(ch.id.clone(), badge);
         }
@@ -372,12 +426,17 @@ impl ChannelSidebar {
             self.dm_list.remove(&child);
         }
         let mut new_presence_icons = HashMap::new();
+        let mut new_status_icons = HashMap::new();
         let mut new_dm_rows = HashMap::new();
+        let mut new_watch_labels = HashMap::new();
         let online_only = *self.show_online_only.borrow();
         let presence = self.presence_state.borrow();
+        let watched_set = self.watched_users.borrow();
         for ch in &dm_list {
-            let (row, badge, icon) = Self::make_dm_row(ch, &names);
-            Self::attach_context_menu(&row, &ch.id, true, &acb);
+            let user_watched = ch.user.as_ref()
+                .is_some_and(|uid| watched_set.contains(uid));
+            let (row, badge, presence_lbl, status_box, watch_label) = Self::make_dm_row(ch, &names, user_watched);
+            Self::attach_context_menu(&row, &ch.id, true, ch.user.as_deref(), &acb, watched, &self.watch_labels, &self.status_emoji, &self.status_text);
             // Show/hide based on known presence state
             if online_only {
                 let is_active = ch.user.as_ref()
@@ -389,10 +448,13 @@ impl ChannelSidebar {
             self.dm_list.append(&row);
             new_badges.insert(ch.id.clone(), badge);
             if let Some(uid) = &ch.user {
-                new_presence_icons.insert(uid.clone(), icon);
+                new_presence_icons.insert(uid.clone(), presence_lbl);
+                new_status_icons.insert(uid.clone(), status_box);
                 new_dm_rows.insert(uid.clone(), row);
+                new_watch_labels.insert(uid.clone(), watch_label);
             }
         }
+        drop(watched_set);
         drop(presence);
 
         // Rebuild group list
@@ -401,7 +463,7 @@ impl ChannelSidebar {
         }
         for ch in &gr_list {
             let (row, badge) = Self::make_group_row(ch, &names);
-            Self::attach_context_menu(&row, &ch.id, true, &acb);
+            Self::attach_context_menu(&row, &ch.id, true, None, &acb, watched, &self.watch_labels, &self.status_emoji, &self.status_text);
             self.group_list.append(&row);
             new_badges.insert(ch.id.clone(), badge);
         }
@@ -427,7 +489,9 @@ impl ChannelSidebar {
         *self.display_names.borrow_mut() = dn;
         *self.badges.borrow_mut() = new_badges;
         *self.presence_icons.borrow_mut() = new_presence_icons;
+        *self.status_icons.borrow_mut() = new_status_icons;
         *self.dm_rows.borrow_mut() = new_dm_rows;
+        *self.watch_labels.borrow_mut() = new_watch_labels;
         *self.channels.borrow_mut() = ch_list;
         *self.dms.borrow_mut() = dm_list;
         *self.groups.borrow_mut() = gr_list;
@@ -438,49 +502,16 @@ impl ChannelSidebar {
         row: &ListBoxRow,
         channel_id: &str,
         is_dm: bool,
+        user_id: Option<&str>,
         action_cb: &Option<ChannelActionCallback>,
+        watched_users: &Rc<RefCell<std::collections::HashSet<String>>>,
+        watch_labels: &Rc<RefCell<HashMap<String, Label>>>,
+        status_emoji: &Rc<RefCell<HashMap<String, String>>>,
+        status_text: &Rc<RefCell<HashMap<String, String>>>,
     ) {
         let Some(acb) = action_cb.clone() else { return };
 
         let popover = gtk::Popover::new();
-        let menu_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
-
-        if is_dm {
-            let close_btn = gtk::Button::with_label("Close conversation");
-            close_btn.add_css_class("flat");
-            let cid = channel_id.to_string();
-            let acb2 = acb.clone();
-            let pop = popover.clone();
-            close_btn.connect_clicked(move |_| {
-                acb2(ChannelAction::Close, &cid);
-                pop.popdown();
-            });
-            menu_box.append(&close_btn);
-        } else {
-            let leave_btn = gtk::Button::with_label("Leave channel");
-            leave_btn.add_css_class("flat");
-            let cid = channel_id.to_string();
-            let acb2 = acb.clone();
-            let pop = popover.clone();
-            leave_btn.connect_clicked(move |_| {
-                acb2(ChannelAction::Leave, &cid);
-                pop.popdown();
-            });
-            menu_box.append(&leave_btn);
-
-            let archive_btn = gtk::Button::with_label("Archive channel");
-            archive_btn.add_css_class("flat");
-            let cid = channel_id.to_string();
-            let acb2 = acb.clone();
-            let pop = popover.clone();
-            archive_btn.connect_clicked(move |_| {
-                acb2(ChannelAction::Archive, &cid);
-                pop.popdown();
-            });
-            menu_box.append(&archive_btn);
-        }
-
-        popover.set_child(Some(&menu_box));
         popover.set_parent(row);
         popover.set_autohide(true);
 
@@ -494,11 +525,128 @@ impl ChannelSidebar {
 
         let gesture = gtk::GestureClick::new();
         gesture.set_button(3);
+        let cid = channel_id.to_string();
+        let uid = user_id.map(|s| s.to_string());
+        let watched = watched_users.clone();
+        let wl = watch_labels.clone();
+        let se = status_emoji.clone();
+        let st = status_text.clone();
         let popover_weak = popover.downgrade();
         gesture.connect_released(move |_, _, _, _| {
-            if let Some(p) = popover_weak.upgrade() {
-                p.popup();
+            let Some(popover) = popover_weak.upgrade() else { return };
+
+            // Rebuild menu content each time so labels reflect current state
+            let menu_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+
+            // Show user status as the first row for DM context menus
+            if is_dm {
+                if let Some(uid) = &uid {
+                    let emoji = se.borrow().get(uid.as_str()).cloned().unwrap_or_default();
+                    let text = st.borrow().get(uid.as_str()).cloned().unwrap_or_default();
+                    if !emoji.is_empty() || !text.is_empty() {
+                        let emoji_display = if !emoji.is_empty() {
+                            Self::shortcode_to_display(&emoji)
+                        } else {
+                            String::new()
+                        };
+                        let status_str = format!("{emoji_display} {text}").trim().to_string();
+                        let status_label = Label::new(Some(&status_str));
+                        status_label.set_halign(gtk::Align::Start);
+                        status_label.set_margin_start(8);
+                        status_label.set_margin_end(8);
+                        status_label.set_margin_top(4);
+                        status_label.set_margin_bottom(4);
+                        status_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+                        status_label.set_max_width_chars(30);
+                        status_label.add_css_class("dim-label");
+                        menu_box.append(&status_label);
+
+                        let sep = gtk::Separator::new(gtk::Orientation::Horizontal);
+                        sep.set_margin_top(2);
+                        sep.set_margin_bottom(2);
+                        menu_box.append(&sep);
+                    }
+                }
             }
+
+            if is_dm {
+                {
+                    let close_btn = gtk::Button::with_label("Close conversation");
+                    close_btn.add_css_class("flat");
+                    let cid = cid.clone();
+                    let acb2 = acb.clone();
+                    let pop = popover.clone();
+                    close_btn.connect_clicked(move |_| {
+                        acb2(ChannelAction::Close, &cid);
+                        pop.popdown();
+                    });
+                    menu_box.append(&close_btn);
+                }
+
+                // Watch/unwatch presence
+                if let Some(uid) = &uid {
+                    let is_watched = watched.borrow().contains(uid);
+                    let watch_btn = if is_watched {
+                        gtk::Button::with_label("Stop watching presence")
+                    } else {
+                        gtk::Button::with_label("Notify when online")
+                    };
+                    watch_btn.add_css_class("flat");
+                    let cid = cid.clone();
+                    let uid = uid.clone();
+                    let acb2 = acb.clone();
+                    let pop = popover.clone();
+                    let watched = watched.clone();
+                    let wl = wl.clone();
+                    watch_btn.connect_clicked(move |_| {
+                        let currently_watched = watched.borrow().contains(&uid);
+                        if currently_watched {
+                            watched.borrow_mut().remove(&uid);
+                            if let Some(lbl) = wl.borrow().get(&uid) {
+                                lbl.set_visible(false);
+                            }
+                            acb2(ChannelAction::UnwatchPresence(uid.clone()), &cid);
+                        } else {
+                            watched.borrow_mut().insert(uid.clone());
+                            if let Some(lbl) = wl.borrow().get(&uid) {
+                                lbl.set_visible(true);
+                            }
+                            acb2(ChannelAction::WatchPresence(uid.clone()), &cid);
+                        }
+                        pop.popdown();
+                    });
+                    menu_box.append(&watch_btn);
+                }
+            } else {
+                {
+                    let leave_btn = gtk::Button::with_label("Leave channel");
+                    leave_btn.add_css_class("flat");
+                    let cid = cid.clone();
+                    let acb2 = acb.clone();
+                    let pop = popover.clone();
+                    leave_btn.connect_clicked(move |_| {
+                        acb2(ChannelAction::Leave, &cid);
+                        pop.popdown();
+                    });
+                    menu_box.append(&leave_btn);
+                }
+
+                {
+                    let archive_btn = gtk::Button::with_label("Archive channel");
+                    archive_btn.add_css_class("flat");
+                    let cid = cid.clone();
+                    let acb2 = acb.clone();
+                    let pop = popover.clone();
+                    archive_btn.connect_clicked(move |_| {
+                        acb2(ChannelAction::Archive, &cid);
+                        pop.popdown();
+                    });
+                    menu_box.append(&archive_btn);
+                }
+            }
+
+            popover.set_child(Some(&menu_box));
+            popover.popup();
         });
         row.add_controller(gesture);
     }
@@ -544,7 +692,8 @@ impl ChannelSidebar {
     fn make_dm_row(
         channel: &Channel,
         user_names: &HashMap<String, String>,
-    ) -> (ListBoxRow, Label, Label) {
+        is_watched: bool,
+    ) -> (ListBoxRow, Label, Label, gtk::Box, Label) {
         let row = ListBoxRow::new();
 
         let label_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -553,9 +702,10 @@ impl ChannelSidebar {
         label_box.set_margin_start(12);
         label_box.set_margin_end(8);
 
-        let icon_label = Label::new(Some("\u{25cb}"));
-        icon_label.add_css_class("dim-label");
-        label_box.append(&icon_label);
+        // Presence indicator (green/hollow circle)
+        let presence_label = Label::new(Some("\u{25cb}"));
+        presence_label.add_css_class("dim-label");
+        label_box.append(&presence_label);
 
         let name = Self::dm_display_name(channel, user_names);
         let name_label = Label::new(Some(&name));
@@ -563,6 +713,15 @@ impl ChannelSidebar {
         name_label.set_hexpand(true);
         name_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         label_box.append(&name_label);
+
+        // Status emoji (after the name)
+        let status_container = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        label_box.append(&status_container);
+
+        // Eyes emoji for watched users
+        let watch_label = Label::new(Some("\u{1f440}"));
+        watch_label.set_visible(is_watched);
+        label_box.append(&watch_label);
 
         let badge = Label::new(None);
         badge.add_css_class("unread-badge");
@@ -573,7 +732,7 @@ impl ChannelSidebar {
         row.set_child(Some(&label_box));
         row.set_widget_name(&channel.id);
 
-        (row, badge, icon_label)
+        (row, badge, presence_label, status_container, watch_label)
     }
 
     fn make_group_row(
@@ -622,10 +781,54 @@ impl ChannelSidebar {
         channel_display_name(channel)
     }
 
+    /// Set a user's status emoji (Slack shortcode like ":coffee:").
+    /// Updates the presence icon to show the emoji if the user is online.
+    pub fn set_status_emoji(&self, user_id: &str, emoji: Option<&str>) {
+        let emoji = emoji.filter(|e| !e.is_empty());
+        if let Some(e) = emoji {
+            self.status_emoji.borrow_mut().insert(user_id.to_string(), e.to_string());
+        } else {
+            self.status_emoji.borrow_mut().remove(user_id);
+        }
+        // Refresh the icon display
+        let active = self.presence_state.borrow().get(user_id).copied().unwrap_or(false);
+        self.update_presence_icon(user_id, active);
+    }
+
+    /// Set status emoji and text for multiple users at once (from initial user list load).
+    pub fn set_all_status(&self, emoji_map: HashMap<String, String>, text_map: HashMap<String, String>) {
+        *self.status_emoji.borrow_mut() = emoji_map;
+        *self.status_text.borrow_mut() = text_map;
+    }
+
+    /// Set a user's status text.
+    pub fn set_status_text(&self, user_id: &str, text: Option<&str>) {
+        let text = text.filter(|t| !t.is_empty());
+        if let Some(t) = text {
+            self.status_text.borrow_mut().insert(user_id.to_string(), t.to_string());
+        } else {
+            self.status_text.borrow_mut().remove(user_id);
+        }
+    }
+
     /// Update the presence indicator for a user's DM row.
     pub fn set_presence(&self, user_id: &str, active: bool) {
         self.presence_state.borrow_mut().insert(user_id.to_string(), active);
+        self.update_presence_icon(user_id, active);
 
+        // Show/hide DM row based on online-only filter
+        if *self.show_online_only.borrow() {
+            if let Some(row) = self.dm_rows.borrow().get(user_id) {
+                row.set_visible(active);
+            }
+        }
+    }
+
+    /// Update the presence dot and status emoji for a user's DM row.
+    fn update_presence_icon(&self, user_id: &str, active: bool) {
+        use crate::slack::helpers::get_custom_emoji_path;
+
+        // Update presence dot (green circle / hollow circle)
         if let Some(icon) = self.presence_icons.borrow().get(user_id) {
             if active {
                 icon.set_text("\u{25cf}"); // ● filled circle
@@ -638,11 +841,49 @@ impl ChannelSidebar {
             }
         }
 
-        // Show/hide DM row based on online-only filter
-        if *self.show_online_only.borrow() {
-            if let Some(row) = self.dm_rows.borrow().get(user_id) {
-                row.set_visible(active);
+        // Update status emoji container (only shown when active)
+        if let Some(container) = self.status_icons.borrow().get(user_id) {
+            while let Some(child) = container.first_child() {
+                container.remove(&child);
             }
+
+            if !active {
+                return;
+            }
+
+            let status = self.status_emoji.borrow();
+            if let Some(emoji_code) = status.get(user_id) {
+                let trimmed = emoji_code.trim_matches(':');
+                // Try custom emoji image
+                if let Some(path) = get_custom_emoji_path(trimmed) {
+                    if let Ok(pixbuf) = gtk4::gdk_pixbuf::Pixbuf::from_file_at_scale(
+                        &path, 16, 16, true,
+                    ) {
+                        let texture = gtk4::gdk::Texture::for_pixbuf(&pixbuf);
+                        let image = gtk::Image::from_paintable(Some(&texture));
+                        image.set_pixel_size(16);
+                        container.append(&image);
+                        return;
+                    }
+                }
+                // Standard emoji as text
+                let display = Self::shortcode_to_display(emoji_code);
+                if display != *emoji_code {
+                    let label = Label::new(Some(&display));
+                    container.append(&label);
+                }
+            }
+        }
+    }
+
+    /// Convert a Slack emoji shortcode (e.g. ":coffee:") to a display string.
+    fn shortcode_to_display(code: &str) -> String {
+        let trimmed = code.trim_matches(':');
+        if let Some(emoji_str) = crate::slack::helpers::resolve_slack_shortcode(trimmed) {
+            emoji_str.to_string()
+        } else {
+            // Custom emoji — show as :name: (images not supported in Labels)
+            code.to_string()
         }
     }
 

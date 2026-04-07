@@ -287,9 +287,9 @@ fn dispatch_event(evt: &serde_json::Value, tx: &mpsc::UnboundedSender<SlackEvent
                 return;
             }
 
-            // Skip other subtypes (except thread_broadcast)
+            // Skip subtypes we can't handle (allow thread_broadcast and bot_message)
             if let Some(st) = subtype {
-                if st != "thread_broadcast" {
+                if st != "thread_broadcast" && st != "bot_message" {
                     debug!("Skipping message subtype: {st}");
                     return;
                 }
@@ -301,11 +301,17 @@ fn dispatch_event(evt: &serde_json::Value, tx: &mpsc::UnboundedSender<SlackEvent
                 .unwrap_or("")
                 .to_string();
             let user = evt.get("user").and_then(|v| v.as_str()).map(String::from);
-            let text = evt
+            let mut text = evt
                 .get("text")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+
+            // For bot messages with empty text, extract content from blocks/attachments
+            if text.is_empty() {
+                text = extract_text_from_blocks_and_attachments(evt);
+            }
+
             let ts = evt
                 .get("ts")
                 .and_then(|v| v.as_str())
@@ -407,6 +413,136 @@ fn dispatch_event(evt: &serde_json::Value, tx: &mpsc::UnboundedSender<SlackEvent
         "thread_subscribed" | "update_global_thread_state" | "activity" => {}
         _ => {
             debug!("Unhandled RTM event type: {evt_type}");
+        }
+    }
+}
+
+/// Extract readable text from Slack blocks and attachments when the top-level text is empty.
+/// This handles bot/integration messages (e.g. GitHub) that put all content in blocks.
+fn extract_text_from_blocks_and_attachments(evt: &serde_json::Value) -> String {
+    let mut parts: Vec<String> = Vec::new();
+
+    // Extract text from blocks
+    if let Some(blocks) = evt.get("blocks").and_then(|v| v.as_array()) {
+        for block in blocks {
+            let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            match block_type {
+                "section" => {
+                    if let Some(text) = block.get("text").and_then(|v| v.get("text")).and_then(|v| v.as_str()) {
+                        parts.push(text.to_string());
+                    }
+                    if let Some(fields) = block.get("fields").and_then(|v| v.as_array()) {
+                        for field in fields {
+                            if let Some(t) = field.get("text").and_then(|v| v.as_str()) {
+                                parts.push(t.to_string());
+                            }
+                        }
+                    }
+                }
+                "header" => {
+                    if let Some(text) = block.get("text").and_then(|v| v.get("text")).and_then(|v| v.as_str()) {
+                        parts.push(format!("*{text}*"));
+                    }
+                }
+                "rich_text" => {
+                    extract_rich_text_block(block, &mut parts);
+                }
+                "context" => {
+                    if let Some(elements) = block.get("elements").and_then(|v| v.as_array()) {
+                        let ctx: Vec<&str> = elements.iter()
+                            .filter_map(|e| e.get("text").and_then(|v| v.as_str()))
+                            .collect();
+                        if !ctx.is_empty() {
+                            parts.push(ctx.join(" "));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Extract text from attachments
+    if let Some(attachments) = evt.get("attachments").and_then(|v| v.as_array()) {
+        for att in attachments {
+            if let Some(pretext) = att.get("pretext").and_then(|v| v.as_str()) {
+                if !pretext.is_empty() {
+                    parts.push(pretext.to_string());
+                }
+            }
+            if let Some(title) = att.get("title").and_then(|v| v.as_str()) {
+                if !title.is_empty() {
+                    parts.push(format!("*{title}*"));
+                }
+            }
+            if let Some(text) = att.get("text").and_then(|v| v.as_str()) {
+                if !text.is_empty() {
+                    parts.push(text.to_string());
+                }
+            }
+            if parts.is_empty() {
+                if let Some(fallback) = att.get("fallback").and_then(|v| v.as_str()) {
+                    if !fallback.is_empty() {
+                        parts.push(fallback.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    parts.join("\n")
+}
+
+/// Extract text from a rich_text block (used by many integrations).
+fn extract_rich_text_block(block: &serde_json::Value, parts: &mut Vec<String>) {
+    if let Some(elements) = block.get("elements").and_then(|v| v.as_array()) {
+        for element in elements {
+            let el_type = element.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            match el_type {
+                "rich_text_section" | "rich_text_preformatted" | "rich_text_quote" => {
+                    if let Some(inner) = element.get("elements").and_then(|v| v.as_array()) {
+                        let line: String = inner.iter()
+                            .filter_map(|e| {
+                                match e.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+                                    "text" => e.get("text").and_then(|v| v.as_str()).map(String::from),
+                                    "link" => {
+                                        let url = e.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                                        let text = e.get("text").and_then(|v| v.as_str()).unwrap_or(url);
+                                        Some(text.to_string())
+                                    }
+                                    "user" => e.get("user_id").and_then(|v| v.as_str()).map(|id| format!("<@{id}>")),
+                                    "emoji" => e.get("name").and_then(|v| v.as_str()).map(|n| format!(":{n}:")),
+                                    _ => None,
+                                }
+                            })
+                            .collect();
+                        if !line.is_empty() {
+                            parts.push(line);
+                        }
+                    }
+                }
+                "rich_text_list" => {
+                    if let Some(items) = element.get("elements").and_then(|v| v.as_array()) {
+                        for (i, item) in items.iter().enumerate() {
+                            if let Some(inner) = item.get("elements").and_then(|v| v.as_array()) {
+                                let line: String = inner.iter()
+                                    .filter_map(|e| e.get("text").and_then(|v| v.as_str()))
+                                    .collect();
+                                if !line.is_empty() {
+                                    let style = element.get("style").and_then(|v| v.as_str()).unwrap_or("bullet");
+                                    let prefix = if style == "ordered" {
+                                        format!("{}. ", i + 1)
+                                    } else {
+                                        "• ".to_string()
+                                    };
+                                    parts.push(format!("{prefix}{line}"));
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
     }
 }

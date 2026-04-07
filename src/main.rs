@@ -32,7 +32,7 @@ fn main() {
     });
 
     let app = Application::builder()
-        .application_id("dev.slackfrontend.app")
+        .application_id("dev.slag.app")
         .flags(gtk4::gio::ApplicationFlags::NON_UNIQUE)
         .build();
 
@@ -47,6 +47,49 @@ fn main() {
     let db = database.clone();
     app.connect_activate(move |app| {
         libadwaita::init().expect("Failed to init libadwaita");
+
+        // Install embedded app icon (PNG) into user icon theme and set as default
+        {
+            let base = dirs::data_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                .join("icons/hicolor");
+            let sizes = ["256x256", "128x128", "64x64", "48x48"];
+            let icon_data: &[(&str, &[u8])] = &[
+                ("256x256", &include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/hicolor/256x256/apps/slag.png"))[..]),
+                ("128x128", &include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/hicolor/128x128/apps/slag.png"))[..]),
+                ("64x64", &include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/hicolor/64x64/apps/slag.png"))[..]),
+                ("48x48", &include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/hicolor/48x48/apps/slag.png"))[..]),
+            ];
+            for (size, bytes) in icon_data {
+                let icon_dir = base.join(format!("{size}/apps"));
+                std::fs::create_dir_all(&icon_dir).ok();
+                std::fs::write(icon_dir.join("slag.png"), bytes).ok();
+            }
+
+            // Ensure index.theme lists all our icon directories so gtk4-update-icon-cache works
+            let index_path = base.join("index.theme");
+            let needs_update = match std::fs::read_to_string(&index_path) {
+                Ok(content) => sizes.iter().any(|s| !content.contains(&format!("{s}/apps"))),
+                Err(_) => true,
+            };
+            if needs_update {
+                let dirs_list = sizes.iter().map(|s| format!("{s}/apps")).collect::<Vec<_>>().join(",");
+                let index_content = format!(
+                    "[Icon Theme]\nName=hicolor\nDirectories={dirs_list}\n\n{}\n",
+                    sizes.iter().map(|s| {
+                        let num: u32 = s.split('x').next().unwrap().parse().unwrap();
+                        format!("[{s}/apps]\nSize={num}\nType=Fixed\n")
+                    }).collect::<Vec<_>>().join("\n")
+                );
+                std::fs::write(&index_path, index_content).ok();
+            }
+
+            let _ = std::process::Command::new("gtk4-update-icon-cache")
+                .arg("--force")
+                .arg(&base)
+                .status();
+            gtk4::Window::set_default_icon_name("slag");
+        }
 
         let db = db.clone();
         let rt = rt_handle.clone();

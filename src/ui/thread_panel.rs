@@ -7,13 +7,15 @@ use std::rc::Rc;
 
 use crate::slack::client::Client;
 use crate::slack::helpers::format_message_markup;
+use crate::ui::autocomplete::Autocomplete;
 use crate::ui::message_view::ReactionCallback;
+use crate::ui::send_button::SendButton;
 
 pub struct ThreadPanel {
     pub widget: gtk::Box,
     pub list_box: ListBox,
     pub close_button: Button,
-    pub send_button: Button,
+    pub send_button: SendButton,
     pub text_view: TextView,
     pub separator: gtk::Separator,
     header_label: Label,
@@ -25,6 +27,7 @@ pub struct ThreadPanel {
     /// Message ts to scroll to after thread loads (set by notification click).
     pub pending_scroll: RefCell<Option<String>>,
     picker_cells: Rc<RefCell<Vec<Rc<RefCell<Option<gtk::Popover>>>>>>,
+    autocomplete: Autocomplete,
 }
 
 impl ThreadPanel {
@@ -95,14 +98,15 @@ impl ThreadPanel {
         frame.set_hexpand(true);
         frame.set_child(Some(&text_view));
 
-        let send_button = Button::with_label("Reply");
-        send_button.add_css_class("suggested-action");
-        send_button.set_valign(gtk::Align::End);
+        let send_button = SendButton::new();
 
         input_box.append(&frame);
-        input_box.append(&send_button);
+        input_box.append(&send_button.widget);
 
         container.append(&input_box);
+
+        // Attach shared autocomplete (handles both @mentions and :emoji:)
+        let autocomplete = Autocomplete::attach(&text_view);
 
         // Vertical separator placed to the left of the panel in the parent layout
         let separator = gtk::Separator::new(gtk::Orientation::Vertical);
@@ -123,7 +127,18 @@ impl ThreadPanel {
             channel_id: RefCell::new(None),
             pending_scroll: RefCell::new(None),
             picker_cells: Rc::new(RefCell::new(Vec::new())),
+            autocomplete,
         }
+    }
+
+    /// Set the user list for @mention autocomplete in the thread reply input.
+    pub fn set_mention_users(&self, users: &HashMap<String, String>) {
+        self.autocomplete.set_users(users);
+    }
+
+    /// Set a callback invoked when an emoji is picked via autocomplete.
+    pub fn set_on_emoji_picked(&self, f: Rc<dyn Fn(&str)>) {
+        self.autocomplete.set_on_emoji_picked(f);
     }
 
     pub fn set_reaction_callback(&self, cb: ReactionCallback) {
@@ -284,7 +299,9 @@ fn make_thread_message_row(
 
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
 
-    let user_id = msg.user.as_deref().unwrap_or("unknown");
+    let user_id = msg.user.as_deref()
+        .or(msg.bot_id.as_deref())
+        .unwrap_or("unknown");
     let display_name = users
         .get(user_id)
         .cloned()
@@ -330,17 +347,84 @@ fn make_thread_message_row(
     outer.append(&header);
 
     if !msg.text.is_empty() {
-        let markup = format_message_markup(&msg.text, users);
-        let body = Label::new(None);
-        body.set_markup(&markup);
-        body.set_wrap(true);
-        body.set_halign(gtk::Align::Start);
-        body.set_selectable(true);
-        body.set_xalign(0.0);
+        let body = crate::ui::message_view::make_message_body(&msg.text, users, &None);
         outer.append(&body);
     }
 
-    // Images from file uploads
+    // Render attachment text content (title, pretext, text, fallback)
+    if let Some(attachments) = &msg.attachments {
+        for att in attachments {
+            let mut att_parts: Vec<String> = Vec::new();
+            if let Some(pretext) = &att.pretext {
+                if !pretext.is_empty() {
+                    att_parts.push(pretext.clone());
+                }
+            }
+            if let Some(title) = &att.title {
+                if !title.is_empty() {
+                    if let Some(link) = &att.title_link {
+                        att_parts.push(format!("<{link}|{title}>"));
+                    } else {
+                        att_parts.push(format!("*{title}*"));
+                    }
+                }
+            }
+            if let Some(text) = &att.text {
+                if !text.is_empty() {
+                    att_parts.push(text.clone());
+                }
+            }
+            if att_parts.is_empty() {
+                if let Some(fallback) = &att.fallback {
+                    if !fallback.is_empty() {
+                        att_parts.push(fallback.clone());
+                    }
+                }
+            }
+
+            if !att_parts.is_empty() {
+                let att_text = att_parts.join("\n");
+                let markup = format_message_markup(&att_text, users);
+
+                let att_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+
+                if let Some(color) = &att.color {
+                    let bar = gtk::DrawingArea::new();
+                    bar.set_size_request(3, -1);
+                    bar.set_vexpand(true);
+                    let color = color.clone();
+                    bar.set_draw_func(move |_, cr, _w, h| {
+                        let hex = color.trim_start_matches('#');
+                        if hex.len() == 6 {
+                            if let (Ok(r), Ok(g), Ok(b)) = (
+                                u8::from_str_radix(&hex[0..2], 16),
+                                u8::from_str_radix(&hex[2..4], 16),
+                                u8::from_str_radix(&hex[4..6], 16),
+                            ) {
+                                cr.set_source_rgb(r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0);
+                                cr.rectangle(0.0, 0.0, 3.0, h as f64);
+                                let _ = cr.fill();
+                            }
+                        }
+                    });
+                    att_box.append(&bar);
+                }
+
+                let att_label = Label::new(None);
+                att_label.set_markup(&markup);
+                att_label.set_wrap(true);
+                att_label.set_halign(gtk::Align::Start);
+                att_label.set_selectable(true);
+                att_label.set_xalign(0.0);
+                att_label.set_margin_start(6);
+
+                att_box.append(&att_label);
+                outer.append(&att_box);
+            }
+        }
+    }
+
+    // File attachments
     let mut image_url_sets: Vec<Vec<String>> = Vec::new();
     if let Some(files) = &msg.files {
         for file in files {
@@ -362,6 +446,14 @@ fn make_thread_message_row(
                 if !candidates.is_empty() {
                     image_url_sets.push(candidates);
                 }
+            } else {
+                // Non-image file: show download chip
+                let download_url = file.url_private_download.clone()
+                    .or_else(|| file.url_private.clone());
+                let chip = crate::ui::message_view::make_file_attachment_chip(
+                    file, download_url.as_deref(), client, rt,
+                );
+                outer.append(&chip);
             }
         }
     }
@@ -386,51 +478,92 @@ fn make_thread_message_row(
         picture.set_content_fit(gtk::ContentFit::ScaleDown);
         picture.set_size_request(-1, 150);
         picture.set_can_shrink(true);
+        picture.set_cursor_from_name(Some("pointer"));
         outer.append(&picture);
+
+        // Click to open fullscreen viewer (loads full resolution)
+        let stored_texture: Rc<RefCell<Option<gtk4::gdk::Texture>>> = Rc::new(RefCell::new(None));
+        {
+            let click = gtk::GestureClick::new();
+            click.set_button(1);
+            let tex = stored_texture.clone();
+            let click_urls = urls.clone();
+            let click_client = client.clone();
+            let click_rt = rt.clone();
+            let picture_weak = picture.downgrade();
+            click.connect_released(move |_, _, _, _| {
+                let Some(picture) = picture_weak.upgrade() else { return };
+                if let Some(texture) = tex.borrow().as_ref() {
+                    if let Some(root) = picture.root() {
+                        if let Some(win) = root.downcast_ref::<gtk::Window>() {
+                            crate::ui::image_viewer::show(
+                                texture,
+                                win,
+                                Some(click_urls.clone()),
+                                Some(click_client.clone()),
+                                Some(click_rt.clone()),
+                            );
+                        }
+                    }
+                }
+            });
+            picture.add_controller(click);
+        }
 
         let client = client.clone();
         let rt = rt.clone();
-        let picture = picture.clone();
+        let picture_weak = picture.downgrade();
+        let stored_texture_weak = Rc::downgrade(&stored_texture);
         gtk4::glib::spawn_future_local(async move {
-            let mut bytes_result = Err("no URLs".to_string());
-            for url in &urls {
-                let c = client.clone();
-                let u = url.clone();
-                let res = rt
-                    .spawn(async move { c.fetch_image_bytes(&u).await })
-                    .await;
-                match res {
-                    Ok(Ok(bytes)) => {
-                        bytes_result = Ok(bytes);
-                        break;
+            let c = client.clone();
+            let urls2 = urls.clone();
+            let bytes_result = rt.spawn(async move {
+                for url in &urls2 {
+                    match c.fetch_image_bytes(url).await {
+                        Ok(b) => return Ok(b),
+                        Err(e) => {
+                            tracing::debug!("Image URL failed ({url}): {e}");
+                        }
                     }
-                    _ => {}
                 }
-            }
-            if let Ok(bytes) = bytes_result {
-                let gbytes = gtk4::glib::Bytes::from(&bytes);
-                let stream = gtk4::gio::MemoryInputStream::from_bytes(&gbytes);
-                if let Ok(pixbuf) = gtk4::gdk_pixbuf::Pixbuf::from_stream_at_scale(
-                    &stream,
-                    300,  // max width for thread panel
-                    -1,
-                    true,
-                    gtk4::gio::Cancellable::NONE,
-                ) {
-                    let texture = gtk4::gdk::Texture::for_pixbuf(&pixbuf);
-                    picture.set_paintable(Some(&texture));
-                    let w = pixbuf.width();
-                    let h = pixbuf.height();
-                    if w > 0 && h > 0 {
-                        let display_w = 300.min(w);
-                        let display_h = (h as f64 * display_w as f64 / w as f64) as i32;
-                        picture.set_size_request(display_w, display_h);
+                Err("all URLs failed".to_string())
+            }).await;
+
+            let Some(picture) = picture_weak.upgrade() else { return; };
+            let Some(stored_texture) = stored_texture_weak.upgrade() else { return; };
+
+            match bytes_result {
+                Ok(Ok(bytes)) => {
+                    let gbytes = gtk4::glib::Bytes::from(&bytes);
+                    let stream = gtk4::gio::MemoryInputStream::from_bytes(&gbytes);
+                    match gtk4::gdk_pixbuf::Pixbuf::from_stream_at_scale(
+                        &stream,
+                        300,  // max width for thread panel
+                        -1,
+                        true,
+                        gtk4::gio::Cancellable::NONE,
+                    ) {
+                        Ok(pixbuf) => {
+                            let texture = gtk4::gdk::Texture::for_pixbuf(&pixbuf);
+                            picture.set_paintable(Some(&texture));
+                            *stored_texture.borrow_mut() = Some(texture);
+                            let w = pixbuf.width();
+                            let h = pixbuf.height();
+                            if w > 0 && h > 0 {
+                                let display_w = 300.min(w);
+                                let display_h = (h as f64 * display_w as f64 / w as f64) as i32;
+                                picture.set_size_request(display_w, display_h);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!("Failed to decode image: {e}");
+                            picture.set_visible(false);
+                        }
                     }
-                } else {
+                }
+                _ => {
                     picture.set_visible(false);
                 }
-            } else {
-                picture.set_visible(false);
             }
         });
     }
@@ -475,11 +608,11 @@ fn make_thread_message_row(
                     let rcb3 = rcb2.clone();
                     let cid3 = cid2.clone();
                     let ts3 = ts2.clone();
-                    let on_pick: Rc<dyn Fn(&str)> = Rc::new(move |shortcode: &str| {
+                    let on_react: Rc<dyn Fn(&str)> = Rc::new(move |shortcode: &str| {
                         let dummy = gtk::Button::new();
                         rcb3(&cid3, &ts3, shortcode, &dummy);
                     });
-                    let picker = crate::ui::emoji_picker::build(&btn, on_pick);
+                    let picker = crate::ui::autocomplete::build_reaction_popover(&btn, on_react);
                     *cell_click.borrow_mut() = Some(picker);
                 }
                 if let Some(picker) = cell_click.borrow().as_ref() {

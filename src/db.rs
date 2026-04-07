@@ -41,7 +41,7 @@ impl Database {
     pub async fn open(rt: &tokio::runtime::Handle) -> Result<Self, String> {
         let data_dir = dirs::data_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join("slack-frontend");
+            .join("slag");
 
         std::fs::create_dir_all(&data_dir)
             .map_err(|e| format!("Failed to create data dir: {e}"))?;
@@ -110,6 +110,51 @@ impl Database {
         let _: Result<Option<SavedCredentials>, _> =
             self.db.delete(("credentials", "main")).await;
         info!("Credentials cleared from database");
+    }
+
+    // ── Custom Emoji ──
+
+    pub async fn save_custom_emoji(&self, emoji: &HashMap<String, String>) -> Result<(), String> {
+        let json =
+            serde_json::to_string(emoji).map_err(|e| format!("JSON serialize error: {e}"))?;
+        let cache = JsonCache { data: json };
+        let _: Result<Option<JsonCache>, _> = self.db.delete(("cache", "custom_emoji")).await;
+        let _: Option<JsonCache> = self
+            .db
+            .create(("cache", "custom_emoji"))
+            .content(cache)
+            .await
+            .map_err(|e| format!("DB save custom emoji error: {e}"))?;
+        info!("Saved {} custom emoji to database", emoji.len());
+        Ok(())
+    }
+
+    pub async fn load_custom_emoji(&self) -> Option<HashMap<String, String>> {
+        match self
+            .db
+            .select::<Option<JsonCache>>(("cache", "custom_emoji"))
+            .await
+        {
+            Ok(Some(cache)) => match serde_json::from_str(&cache.data) {
+                Ok(emoji) => {
+                    let emoji: HashMap<String, String> = emoji;
+                    info!("Loaded {} cached custom emoji from database", emoji.len());
+                    Some(emoji)
+                }
+                Err(e) => {
+                    error!("Failed to deserialize cached custom emoji: {e}");
+                    None
+                }
+            },
+            Ok(None) => {
+                info!("No cached custom emoji found");
+                None
+            }
+            Err(e) => {
+                error!("DB load custom emoji error: {e}");
+                None
+            }
+        }
     }
 
     // ── Channels ──
@@ -369,6 +414,83 @@ impl Database {
         let updated = msg.reactions.clone();
         let _ = self.save_messages(channel_id, &messages).await;
         updated
+    }
+
+    // ── Presence watches ──
+
+    /// Save the set of user IDs to watch for presence changes.
+    pub async fn save_presence_watches(&self, user_ids: &[String]) {
+        let json = serde_json::to_string(user_ids).unwrap_or_default();
+        let cache = JsonCache { data: json };
+        let _: Result<Option<JsonCache>, _> = self.db.delete(("settings", "presence_watches")).await;
+        let _: Result<Option<JsonCache>, _> = self
+            .db
+            .create(("settings", "presence_watches"))
+            .content(cache)
+            .await;
+    }
+
+    /// Load the set of user IDs being watched for presence changes.
+    pub async fn load_presence_watches(&self) -> Vec<String> {
+        match self
+            .db
+            .select::<Option<JsonCache>>(("settings", "presence_watches"))
+            .await
+        {
+            Ok(Some(cache)) => serde_json::from_str(&cache.data).unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Add a user ID to the presence watch list.
+    pub async fn add_presence_watch(&self, user_id: &str) {
+        let mut watches = self.load_presence_watches().await;
+        if !watches.iter().any(|u| u == user_id) {
+            watches.push(user_id.to_string());
+            self.save_presence_watches(&watches).await;
+        }
+    }
+
+    /// Remove a user ID from the presence watch list.
+    pub async fn remove_presence_watch(&self, user_id: &str) {
+        let mut watches = self.load_presence_watches().await;
+        let before = watches.len();
+        watches.retain(|u| u != user_id);
+        if watches.len() != before {
+            self.save_presence_watches(&watches).await;
+        }
+    }
+
+    // ── Recent emoji ──
+
+    /// Push an emoji shortcode to the front of the recent list (deduplicating, max 50).
+    pub async fn push_recent_emoji(&self, shortcode: &str) {
+        if shortcode.is_empty() {
+            return;
+        }
+        let mut list = self.load_recent_emoji().await;
+        list.retain(|s| s != shortcode);
+        list.insert(0, shortcode.to_string());
+        list.truncate(50);
+        let json = serde_json::to_string(&list).unwrap_or_default();
+        let cache = JsonCache { data: json };
+        let _: Result<Option<JsonCache>, _> = self.db.delete(("cache", "recent_emoji")).await;
+        let _: Result<Option<JsonCache>, _> = self
+            .db
+            .create(("cache", "recent_emoji"))
+            .content(cache)
+            .await;
+    }
+
+    pub async fn load_recent_emoji(&self) -> Vec<String> {
+        match self
+            .db
+            .select::<Option<JsonCache>>(("cache", "recent_emoji"))
+            .await
+        {
+            Ok(Some(cache)) => serde_json::from_str(&cache.data).unwrap_or_default(),
+            _ => Vec::new(),
+        }
     }
 
     pub async fn load_channels(&self) -> Option<Vec<Channel>> {

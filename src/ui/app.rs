@@ -48,7 +48,7 @@ pub fn build_app(
 ) {
     let window = ApplicationWindow::builder()
         .application(app)
-        .title("Slack")
+        .title("Slag")
         .default_width(1200)
         .default_height(800)
         .build();
@@ -161,35 +161,50 @@ pub fn build_app(
     popover_box.append(&status_header);
 
     let emoji_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let emoji_entry = gtk::Entry::new();
-    emoji_entry.set_placeholder_text(Some(":emoji:"));
-    emoji_entry.set_width_chars(10);
-    emoji_row.append(&emoji_entry);
-
-    // Lightweight emoji picker for status
-    let emoji_choose_btn = gtk::Button::from_icon_name("face-smile-symbolic");
-    emoji_choose_btn.add_css_class("flat");
+    let emoji_entry = gtk::TextView::new();
+    emoji_entry.set_width_request(100);
+    emoji_entry.set_top_margin(6);
+    emoji_entry.set_bottom_margin(6);
+    emoji_entry.set_left_margin(6);
+    emoji_entry.set_right_margin(6);
+    emoji_entry.add_css_class("card");
+    emoji_entry.set_accepts_tab(false);
+    // Single-line: suppress Enter from inserting newlines
     {
-        let emoji_entry_ref = emoji_entry.clone();
-        let picker_cell: Rc<RefCell<Option<gtk::Popover>>> = Rc::new(RefCell::new(None));
-        let cell_click = picker_cell.clone();
-        let btn_weak = emoji_choose_btn.downgrade();
-        emoji_choose_btn.connect_clicked(move |_| {
-            let Some(btn) = btn_weak.upgrade() else { return };
-            if cell_click.borrow().is_none() {
-                let entry = emoji_entry_ref.clone();
-                let on_pick: Rc<dyn Fn(&str)> = Rc::new(move |shortcode: &str| {
-                    entry.set_text(&format!(":{shortcode}:"));
-                });
-                let picker = crate::ui::emoji_picker::build(&btn, on_pick);
-                *cell_click.borrow_mut() = Some(picker);
+        let key_ctl = gtk::EventControllerKey::new();
+        key_ctl.set_propagation_phase(gtk::PropagationPhase::Capture);
+        key_ctl.connect_key_pressed(|_, key, _, _| {
+            if key == gtk4::gdk::Key::Return || key == gtk4::gdk::Key::KP_Enter {
+                gtk4::glib::Propagation::Stop
+            } else {
+                gtk4::glib::Propagation::Proceed
             }
-            if let Some(picker) = cell_click.borrow().as_ref() {
-                picker.popup();
+        });
+        emoji_entry.add_controller(key_ctl);
+    }
+    let emoji_frame = gtk::Frame::new(None);
+    emoji_frame.set_child(Some(&emoji_entry));
+    emoji_row.append(&emoji_frame);
+
+    // Attach emoji autocomplete (type : to search)
+    let _emoji_autocomplete = crate::ui::autocomplete::Autocomplete::attach(&emoji_entry);
+
+    // Pre-fill ":" when the popover opens if the emoji field is empty
+    {
+        let ee = emoji_entry.clone();
+        popover.connect_show(move |_| {
+            let buf = ee.buffer();
+            let (s, e) = buf.bounds();
+            if buf.text(&s, &e, false).is_empty() {
+                let t = ee.clone();
+                gtk4::glib::idle_add_local_once(move || {
+                    t.buffer().set_text(":");
+                    let iter = t.buffer().end_iter();
+                    t.buffer().place_cursor(&iter);
+                });
             }
         });
     }
-    emoji_row.append(&emoji_choose_btn);
 
     let status_entry = gtk::Entry::new();
     status_entry.set_placeholder_text(Some("What's your status?"));
@@ -263,7 +278,7 @@ pub fn build_app(
                 let se = status_entry.clone();
                 let s = status.clone();
                 btn.connect_clicked(move |_| {
-                    ee.set_text(&s.emoji);
+                    ee.buffer().set_text(&s.emoji);
                     se.set_text(&s.text);
                 });
 
@@ -272,8 +287,14 @@ pub fn build_app(
         })
     };
 
+    // Profile button: avatar + status emoji
+    let profile_box = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    profile_box.append(&profile_avatar);
+    let self_status_icon = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    profile_box.append(&self_status_icon);
+
     let profile_btn = gtk::MenuButton::new();
-    profile_btn.set_child(Some(&profile_avatar));
+    profile_btn.set_child(Some(&profile_box));
     profile_btn.set_popover(Some(&popover));
     profile_btn.add_css_class("flat");
 
@@ -285,10 +306,11 @@ pub fn build_app(
 
     let sidebar = Rc::new(ChannelSidebar::new());
 
-    // Put search in the title bar (left-aligned, compact)
-    sidebar.search_entry.set_hexpand(false);
-    sidebar.search_entry.set_width_chars(20);
-    header_bar.pack_start(&sidebar.search_entry);
+    // Search button in the header bar
+    let search_btn = gtk::Button::from_icon_name("system-search-symbolic");
+    search_btn.add_css_class("flat");
+    header_bar.pack_start(&search_btn);
+
     window.set_titlebar(Some(&header_bar));
     let message_view = Rc::new(MessageView::new());
     let message_input = Rc::new(MessageInput::new());
@@ -311,7 +333,52 @@ pub fn build_app(
     main_box.append(&thread_panel.separator);
     main_box.append(&thread_panel.widget);
 
-    window.set_child(Some(&main_box));
+    // Floating search popover centered near the top of the window
+    let search_overlay = gtk::Overlay::new();
+    search_overlay.set_child(Some(&main_box));
+
+    let search_anchor = gtk::Label::new(None);
+    search_anchor.set_halign(gtk::Align::Center);
+    search_anchor.set_valign(gtk::Align::Start);
+    search_anchor.set_margin_top(0);
+    search_anchor.set_opacity(0.0);
+    search_overlay.add_overlay(&search_anchor);
+
+    let search_popover = gtk::Popover::new();
+    search_popover.set_autohide(true);
+    search_popover.set_position(gtk::PositionType::Bottom);
+    search_popover.set_has_arrow(false);
+    sidebar.search_entry.set_hexpand(true);
+    sidebar.search_entry.set_width_chars(40);
+    search_popover.set_child(Some(&sidebar.search_entry));
+    search_popover.set_parent(&search_anchor);
+
+    // Focus the search entry when popover opens (deferred so it's mapped)
+    {
+        let entry = sidebar.search_entry.clone();
+        search_popover.connect_show(move |_| {
+            let e = entry.clone();
+            gtk4::glib::idle_add_local_once(move || {
+                e.grab_focus();
+            });
+        });
+    }
+    // Clear search text when popover closes
+    {
+        let entry = sidebar.search_entry.clone();
+        search_popover.connect_closed(move |_| {
+            entry.set_text("");
+        });
+    }
+    // Wire up the search button
+    {
+        let popover = search_popover.clone();
+        search_btn.connect_clicked(move |_| {
+            popover.popup();
+        });
+    }
+
+    window.set_child(Some(&search_overlay));
 
     let state = Rc::new(RefCell::new(AppState {
         channels: Vec::new(),
@@ -342,6 +409,7 @@ pub fn build_app(
         let away_btn = away_btn.clone();
         let rebuild_recent = rebuild_recent.clone();
         let presence_user_changed = presence_user_changed.clone();
+        let self_status_icon_init = self_status_icon.clone();
         gtk4::glib::spawn_future_local(async move {
             // Load recent statuses from DB
             {
@@ -387,8 +455,13 @@ pub fn build_app(
                     status_entry.set_text(text);
                 }
                 if let Some(emoji) = profile.get("status_emoji").and_then(|v| v.as_str()) {
-                    emoji_entry.set_text(emoji);
+                    emoji_entry.buffer().set_text(emoji);
                 }
+                // Show status emoji beside profile avatar
+                update_self_status_icon(
+                    &self_status_icon_init,
+                    profile.get("status_emoji").and_then(|v| v.as_str()),
+                );
 
                 // Load profile image (prefer image_72)
                 let image_url = profile
@@ -479,14 +552,18 @@ pub fn build_app(
         let emoji_save = emoji_entry.clone();
         let status_save = status_entry.clone();
         let rebuild_save = rebuild_recent.clone();
+        let self_status_save = self_status_icon.clone();
         save_btn.connect_clicked(move |_| {
             let text = status_save.text().to_string();
-            let emoji = emoji_save.text().to_string();
+            let buf = emoji_save.buffer();
+            let (s, e) = buf.bounds();
+            let emoji = buf.text(&s, &e, false).to_string();
             let client = client_save.clone();
             let rt = rt_save.clone();
             let db = db_save.clone();
             let popover = popover_save.clone();
             let rebuild = rebuild_save.clone();
+            let status_icon = self_status_save.clone();
             gtk4::glib::spawn_future_local(async move {
                 let text2 = text.clone();
                 let emoji2 = emoji.clone();
@@ -512,6 +589,7 @@ pub fn build_app(
                         .await
                         .unwrap();
                     rebuild(recents);
+                    update_self_status_icon(&status_icon, Some(&emoji));
                 }
                 popover.popdown();
             });
@@ -522,12 +600,14 @@ pub fn build_app(
         let popover_clear = popover.clone();
         let emoji_clear = emoji_entry.clone();
         let status_clear = status_entry.clone();
+        let self_status_clear = self_status_icon.clone();
         clear_btn.connect_clicked(move |_| {
             let client = client_clear.clone();
             let rt = rt_clear.clone();
             let popover = popover_clear.clone();
             let emoji_entry = emoji_clear.clone();
             let status_entry = status_clear.clone();
+            let status_icon = self_status_clear.clone();
             gtk4::glib::spawn_future_local(async move {
                 let result = rt
                     .spawn(async move { client.set_user_status("", "").await })
@@ -537,7 +617,8 @@ pub fn build_app(
                     tracing::error!("Failed to clear status: {e}");
                 }
                 status_entry.set_text("");
-                emoji_entry.set_text("");
+                emoji_entry.buffer().set_text("");
+                update_self_status_icon(&status_icon, None);
                 popover.popdown();
             });
         });
@@ -566,6 +647,7 @@ pub fn build_app(
                 tp.set_channel_id(&channel_id);
                 tp.clear();
                 tp.show();
+                tp.text_view.grab_focus();
 
                 let mv = message_view.clone();
                 gtk4::glib::spawn_future_local(async move {
@@ -761,6 +843,23 @@ pub fn build_app(
         let window = window.clone();
         let action_cb: crate::ui::channel_sidebar::ChannelActionCallback =
             Rc::new(move |action, channel_id| {
+                // Presence watch/unwatch — no confirmation needed
+                match &action {
+                    ChannelAction::WatchPresence(uid) => {
+                        let db2 = db.clone();
+                        let uid = uid.clone();
+                        rt.spawn(async move { db2.add_presence_watch(&uid).await });
+                        return;
+                    }
+                    ChannelAction::UnwatchPresence(uid) => {
+                        let db2 = db.clone();
+                        let uid = uid.clone();
+                        rt.spawn(async move { db2.remove_presence_watch(&uid).await });
+                        return;
+                    }
+                    _ => {}
+                }
+
                 let (title, detail) = match action {
                     ChannelAction::Leave => (
                         "Leave channel?",
@@ -774,6 +873,7 @@ pub fn build_app(
                         "Close conversation?",
                         "You can reopen it later.",
                     ),
+                    ChannelAction::WatchPresence(_) | ChannelAction::UnwatchPresence(_) => unreachable!(),
                 };
 
                 let dialog = gtk::AlertDialog::builder()
@@ -835,6 +935,7 @@ pub fn build_app(
                                 ChannelAction::Leave => c.leave_channel(&cid2).await,
                                 ChannelAction::Archive => c.archive_channel(&cid2).await,
                                 ChannelAction::Close => c.close_conversation(&cid2).await,
+                                ChannelAction::WatchPresence(_) | ChannelAction::UnwatchPresence(_) => return,
                             };
                             if let Err(e) = result {
                                 tracing::error!("Channel action failed: {e}");
@@ -912,6 +1013,23 @@ pub fn build_app(
         thread_panel.set_self_user_id(&user_id);
     }
 
+    // ── Emoji pick persistence: record to DB when emoji is selected via autocomplete ──
+    {
+        let db_ep = db.clone();
+        let rt_ep = rt.clone();
+        crate::ui::autocomplete::set_emoji_persist_callback(move |shortcode: &str| {
+            let db = db_ep.clone();
+            let sc = shortcode.to_string();
+            rt_ep.spawn(async move { db.push_recent_emoji(&sc).await });
+        });
+
+        let on_pick: Rc<dyn Fn(&str)> = Rc::new(|shortcode: &str| {
+            crate::ui::autocomplete::record_emoji_used(shortcode);
+        });
+        message_input.set_on_emoji_picked(on_pick.clone());
+        thread_panel.set_on_emoji_picked(on_pick);
+    }
+
     // ── Thread panel: close button ──
     {
         let tp_close = thread_panel.clone();
@@ -928,6 +1046,12 @@ pub fn build_app(
         let state = state.clone();
         let client = client.clone();
         let rt = rt.clone();
+
+        // Clone for schedule callback before do_reply consumes them
+        let sched_state = state.clone();
+        let sched_client = client.clone();
+        let sched_rt = rt.clone();
+        let sched_tp = thread_panel.clone();
 
         let do_reply = move || {
             let text = tp_reply.get_reply_text();
@@ -985,9 +1109,45 @@ pub fn build_app(
 
         let do_reply_btn = do_reply.clone();
         let tp_btn = thread_panel.clone();
-        tp_btn.send_button.connect_clicked(move |_| {
+        tp_btn.send_button.send.connect_clicked(move |_| {
             do_reply_btn();
         });
+
+        // Thread schedule callback
+        {
+            let state = sched_state;
+            let tp = sched_tp;
+            let rt = sched_rt;
+            let client = sched_client;
+            thread_panel.send_button.set_schedule_callback(Rc::new(move |ts: Option<i64>| {
+                let Some(ts) = ts else { return };
+                let text = tp.get_reply_text();
+                if text.trim().is_empty() {
+                    return;
+                }
+                let (thread_ts, channel_id) = match state.borrow().current_thread.clone() {
+                    Some(t) => t,
+                    None => return,
+                };
+                tp.clear_reply();
+                let client = client.clone();
+                let rt2 = rt.clone();
+                gtk4::glib::spawn_future_local(async move {
+                    let c = client.clone();
+                    let cid = channel_id.clone();
+                    let tts = thread_ts.clone();
+                    let txt = text.clone();
+                    let result = rt2
+                        .spawn(async move { c.schedule_message(&cid, &txt, ts, Some(&tts)).await })
+                        .await;
+                    match result {
+                        Ok(Ok(())) => tracing::info!("Thread reply scheduled"),
+                        Ok(Err(e)) => tracing::error!("Failed to schedule reply: {e}"),
+                        Err(e) => tracing::error!("Schedule task error: {e}"),
+                    }
+                });
+            }));
+        }
 
         let key_controller = gtk::EventControllerKey::new();
         let do_reply_key = do_reply.clone();
@@ -1011,39 +1171,73 @@ pub fn build_app(
         let client = client.clone();
         let db = db.clone();
         let message_view = message_view.clone();
+        let message_input = message_input.clone();
+        let thread_panel = thread_panel.clone();
         let presence_tx = presence_tx.clone();
         gtk4::glib::spawn_future_local(async move {
-            // Load cached data in parallel: channels, users, last channel, activity
-            let (cached_channels, cached_users, last_channel, activity) = {
+            // Load cached data in parallel: channels, users, last channel, activity, watched, emoji
+            let (cached_channels, cached_users, last_channel, activity, watched_users, cached_emoji, recent_emoji) = {
                 let db_ch = db.clone();
                 let db_us = db.clone();
                 let db_lc = db.clone();
                 let db_act = db.clone();
+                let db_pw = db.clone();
+                let db_em = db.clone();
+                let db_re = db.clone();
                 let rt2 = rt.clone();
                 rt2.spawn(async move {
                     let ch = db_ch.load_channels().await;
                     let us = db_us.load_users().await;
                     let lc = db_lc.load_last_channel().await;
                     let act = db_act.load_all_channel_activity().await;
-                    (ch, us, lc, act)
+                    let pw = db_pw.load_presence_watches().await;
+                    let em = db_em.load_custom_emoji().await;
+                    let re = db_re.load_recent_emoji().await;
+                    (ch, us, lc, act, pw, em, re)
                 })
                 .await
                 .unwrap()
             };
 
+            // Apply cached custom emoji BEFORE rendering any messages
+            if let Some(ref emoji) = cached_emoji {
+                let paths = build_emoji_path_map(emoji);
+                crate::slack::helpers::set_custom_emoji(paths);
+            }
+
+            // Apply recent emoji for autocomplete sorting
+            crate::slack::helpers::set_recent_emoji(recent_emoji);
+
             // Apply activity data
             sidebar.set_activity(activity);
 
+            // Apply watched presence users
+            sidebar.set_watched_users(watched_users.into_iter().collect());
+
             // Apply cached users
             if let Some(users) = cached_users {
-                let names: HashMap<String, String> = users
-                    .into_iter()
-                    .map(|u| {
-                        let name = user_display_name(&u);
-                        (u.id, name)
-                    })
-                    .collect();
+                let mut names = HashMap::new();
+                let mut status_emoji_map = HashMap::new();
+                let mut status_text_map = HashMap::new();
+                for u in &users {
+                    names.insert(u.id.clone(), user_display_name(u));
+                    if let Some(emoji) = u.profile.as_ref()
+                        .and_then(|p| p.status_emoji.as_deref())
+                        .filter(|e| !e.is_empty())
+                    {
+                        status_emoji_map.insert(u.id.clone(), emoji.to_string());
+                    }
+                    if let Some(text) = u.profile.as_ref()
+                        .and_then(|p| p.status_text.as_deref())
+                        .filter(|t| !t.is_empty())
+                    {
+                        status_text_map.insert(u.id.clone(), text.to_string());
+                    }
+                }
                 sidebar.set_user_names(&names);
+                sidebar.set_all_status(status_emoji_map, status_text_map);
+                message_input.set_mention_users(&names);
+                thread_panel.set_mention_users(&names);
                 state.borrow_mut().user_names = names;
             }
 
@@ -1143,14 +1337,28 @@ pub fn build_app(
                         }
                     });
 
-                    let names: HashMap<String, String> = users
-                        .into_iter()
-                        .map(|u| {
-                            let name = user_display_name(&u);
-                            (u.id, name)
-                        })
-                        .collect();
+                    let mut names = HashMap::new();
+                    let mut status_emoji_map = HashMap::new();
+                    let mut status_text_map = HashMap::new();
+                    for u in &users {
+                        names.insert(u.id.clone(), user_display_name(u));
+                        if let Some(emoji) = u.profile.as_ref()
+                            .and_then(|p| p.status_emoji.as_deref())
+                            .filter(|e| !e.is_empty())
+                        {
+                            status_emoji_map.insert(u.id.clone(), emoji.to_string());
+                        }
+                        if let Some(text) = u.profile.as_ref()
+                            .and_then(|p| p.status_text.as_deref())
+                            .filter(|t| !t.is_empty())
+                        {
+                            status_text_map.insert(u.id.clone(), text.to_string());
+                        }
+                    }
                     sidebar.set_user_names(&names);
+                    sidebar.set_all_status(status_emoji_map, status_text_map);
+                    message_input.set_mention_users(&names);
+                    thread_panel.set_mention_users(&names);
                     state.borrow_mut().user_names = names;
 
                     // Rebuild sidebar now that user names are available for DMs
@@ -1165,6 +1373,27 @@ pub fn build_app(
                     tracing::error!("Failed to load users: {e}");
                 }
             }
+
+            // ── Custom emoji: refresh from API in background ──
+            {
+                let db2 = db.clone();
+                let rt2 = rt.clone();
+                let client2 = client.clone();
+                rt2.spawn(async move {
+                    match client2.emoji_list().await {
+                        Ok(emoji) => {
+                            let paths = download_custom_emoji(&client2, &emoji).await;
+                            crate::slack::helpers::set_custom_emoji(paths);
+                            if let Err(e) = db2.save_custom_emoji(&emoji).await {
+                                tracing::error!("Failed to cache custom emoji: {e}");
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to fetch custom emoji: {e}");
+                        }
+                    }
+                });
+            }
         });
     }
 
@@ -1178,11 +1407,20 @@ pub fn build_app(
             let rt = rt.clone();
             let client = client.clone();
             let db = db.clone();
+            let message_input = message_input.clone();
+            let search_popover = search_popover.clone();
             Rc::new(move |row: &gtk::ListBoxRow| {
                 let channel_id = row.widget_name().to_string();
                 if channel_id.is_empty() {
                     return;
                 }
+
+                // Dismiss search popover and focus the message input box
+                search_popover.popdown();
+                let input_focus = message_input.text_view.clone();
+                gtk4::glib::idle_add_local_once(move || {
+                    input_focus.grab_focus();
+                });
 
                 // Persist last selected channel
                 let db2 = db.clone();
@@ -1325,9 +1563,9 @@ pub fn build_app(
         action.connect_activate(move |_, param| {
             let Some(param) = param.and_then(|p| p.get::<String>()) else { return };
             let parts: Vec<&str> = param.splitn(3, ':').collect();
-            if parts.len() < 2 { return; }
+            if parts.is_empty() { return; }
             let channel_id = parts[0];
-            let message_ts = parts[1];
+            let message_ts = parts.get(1).copied();
             // Third part is thread_ts if the message is a thread reply
             let thread_ts = parts.get(2).copied();
 
@@ -1340,17 +1578,21 @@ pub fn build_app(
             if needs_channel_switch {
                 // Set pending state, then switch channel
                 if let Some(tts) = thread_ts {
-                    state.borrow_mut().pending_thread = Some((tts.to_string(), message_ts.to_string()));
-                } else {
-                    state.borrow_mut().pending_scroll = Some(message_ts.to_string());
+                    if let Some(mts) = message_ts {
+                        state.borrow_mut().pending_thread = Some((tts.to_string(), mts.to_string()));
+                    }
+                } else if let Some(mts) = message_ts {
+                    state.borrow_mut().pending_scroll = Some(mts.to_string());
                 }
                 sidebar.select_channel_by_id(channel_id);
             } else if let Some(tts) = thread_ts {
                 // Already on the channel — open thread and scroll to the reply
-                message_view.open_thread(tts, channel_id);
-                thread_panel.scroll_to_message(message_ts);
-            } else {
-                message_view.scroll_to_message(message_ts);
+                if let Some(mts) = message_ts {
+                    message_view.open_thread(tts, channel_id);
+                    thread_panel.scroll_to_message(mts);
+                }
+            } else if let Some(mts) = message_ts {
+                message_view.scroll_to_message(mts);
             }
         });
         app.add_action(action);
@@ -1371,6 +1613,23 @@ pub fn build_app(
         sidebar.widget.add_controller(key_controller);
     }
 
+    // ── Ctrl+P opens the search popover ──
+    {
+        let popover = search_popover.clone();
+        let key_controller = gtk::EventControllerKey::new();
+        key_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
+        key_controller.connect_key_pressed(move |_, key, _, modifier| {
+            if key == gtk4::gdk::Key::p
+                && modifier.contains(gtk4::gdk::ModifierType::CONTROL_MASK)
+            {
+                popover.popup();
+                return gtk4::glib::Propagation::Stop;
+            }
+            gtk4::glib::Propagation::Proceed
+        });
+        window.add_controller(key_controller);
+    }
+
     // ── Send message ──
     {
         let state_send = state.clone();
@@ -1378,9 +1637,16 @@ pub fn build_app(
         let rt_send = rt.clone();
         let client_send = client.clone();
 
+        // Clone for schedule callback before do_send consumes them
+        let sched_state = state_send.clone();
+        let sched_input = message_input.clone();
+        let sched_rt = rt_send.clone();
+        let sched_client = client_send.clone();
+
         let do_send = move || {
             let text = input.get_text();
-            if text.trim().is_empty() {
+            let files = input.take_files();
+            if text.trim().is_empty() && files.is_empty() {
                 return;
             }
 
@@ -1394,9 +1660,38 @@ pub fn build_app(
             let client = client_send.clone();
             let rt2 = rt_send.clone();
             gtk4::glib::spawn_future_local(async move {
+                let c = client.clone();
+                let ch = channel.clone();
+                let txt = text.clone();
                 let _ = rt2
                     .spawn(async move {
-                        let _ = client.post_message(&channel, &text, None).await;
+                        // Upload files first
+                        for path in &files {
+                            let filename = path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| "file".into());
+                            match tokio::fs::read(path).await {
+                                Ok(bytes) => {
+                                    // First file gets the text as initial_comment, rest get none
+                                    let comment = if path == files.first().unwrap() && !txt.trim().is_empty() {
+                                        Some(txt.as_str())
+                                    } else {
+                                        None
+                                    };
+                                    if let Err(e) = c.upload_file(&ch, bytes, &filename, comment, None).await {
+                                        tracing::error!("Failed to upload file {filename}: {e}");
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!("Failed to read file {}: {e}", path.display());
+                                }
+                            }
+                        }
+                        // If no files, just send a text message
+                        if files.is_empty() && !txt.trim().is_empty() {
+                            let _ = c.post_message(&ch, &txt, None).await;
+                        }
                     })
                     .await;
             });
@@ -1404,9 +1699,44 @@ pub fn build_app(
 
         // Send button click
         let do_send_clone = do_send.clone();
-        message_input.send_button.connect_clicked(move |_| {
+        message_input.send_button.send.connect_clicked(move |_| {
             do_send_clone();
         });
+
+        // Schedule callback
+        {
+            let state = sched_state;
+            let input = sched_input;
+            let rt = sched_rt;
+            let client = sched_client;
+            message_input.send_button.set_schedule_callback(Rc::new(move |ts: Option<i64>| {
+                let Some(ts) = ts else { return };
+                let text = input.get_text();
+                if text.trim().is_empty() {
+                    return;
+                }
+                let channel = match state.borrow().current_channel.clone() {
+                    Some(c) => c,
+                    None => return,
+                };
+                input.clear();
+                let client = client.clone();
+                let rt2 = rt.clone();
+                gtk4::glib::spawn_future_local(async move {
+                    let c = client.clone();
+                    let ch = channel.clone();
+                    let txt = text.clone();
+                    let result = rt2
+                        .spawn(async move { c.schedule_message(&ch, &txt, ts, None).await })
+                        .await;
+                    match result {
+                        Ok(Ok(())) => tracing::info!("Message scheduled"),
+                        Ok(Err(e)) => tracing::error!("Failed to schedule message: {e}"),
+                        Err(e) => tracing::error!("Schedule task error: {e}"),
+                    }
+                });
+            }));
+        }
 
         // Ctrl+Enter to send
         let key_controller = gtk::EventControllerKey::new();
@@ -1437,6 +1767,7 @@ pub fn build_app(
         let avatar_texture = avatar_texture.clone();
         let emoji_entry_rt = emoji_entry.clone();
         let status_entry_rt = status_entry.clone();
+        let self_status_icon_rt = self_status_icon.clone();
         let nav_action = nav_action.clone();
         let (notif_nav_tx, mut notif_nav_rx) = mpsc::unbounded_channel::<String>();
 
@@ -1583,8 +1914,14 @@ pub fn build_app(
                             let nav_thread_ts = thread_ts.clone();
                             let nav_tx = notif_nav_tx.clone();
                             rt_rt.spawn(async move {
+                                // Play notification sound
+                                let _ = tokio::process::Command::new("canberra-gtk-play")
+                                    .arg("-i").arg("message-new-instant")
+                                    .arg("-d").arg("Slag notification")
+                                    .spawn();
+
                                 let mut child = match tokio::process::Command::new("notify-send")
-                                    .arg("--app-name=Slack")
+                                    .arg("--app-name=Slag")
                                     .arg("--urgency=normal")
                                     .arg("--action=default=Open")
                                     .arg("--wait")
@@ -1642,6 +1979,69 @@ pub fn build_app(
                             user.clone()
                         };
                         sidebar.set_presence(&effective_uid, is_active);
+
+                        // Notify if this user is on the watch list and came online
+                        if is_active {
+                            let is_watched = sidebar.is_watched(&effective_uid);
+                            if is_watched {
+                                let st = state.borrow();
+                                let display_name = st.user_names
+                                    .get(&effective_uid)
+                                    .cloned()
+                                    .unwrap_or_else(|| effective_uid.clone());
+                                // Find the DM channel for this user
+                                let dm_channel_id = st.channels.iter()
+                                    .find(|c| c.is_im == Some(true) && c.user.as_deref() == Some(&effective_uid))
+                                    .map(|c| c.id.clone());
+                                drop(st);
+
+                                let title = format!("{display_name} is online");
+                                let nav_tx = notif_nav_tx.clone();
+                                let nav_channel = dm_channel_id.clone();
+                                rt_rt.spawn(async move {
+                                    // Play notification sound
+                                    let _ = tokio::process::Command::new("canberra-gtk-play")
+                                        .arg("-i").arg("message-new-instant")
+                                        .arg("-d").arg("Slag notification")
+                                        .spawn();
+
+                                    let mut child = match tokio::process::Command::new("notify-send")
+                                        .arg("--app-name=Slag")
+                                        .arg("--urgency=normal")
+                                        .arg("--action=default=Open")
+                                        .arg("--wait")
+                                        .arg(&title)
+                                        .arg(format!("{display_name} is now available"))
+                                        .stdout(std::process::Stdio::piped())
+                                        .spawn()
+                                    {
+                                        Ok(c) => c,
+                                        Err(_) => return,
+                                    };
+                                    let stdout_handle = child.stdout.take();
+                                    let result = tokio::time::timeout(
+                                        std::time::Duration::from_secs(30),
+                                        child.wait(),
+                                    ).await;
+                                    match result {
+                                        Ok(Ok(_)) => {
+                                            if let (Some(stdout), Some(cid)) = (stdout_handle, nav_channel) {
+                                                use tokio::io::AsyncReadExt;
+                                                let mut buf = String::new();
+                                                let mut reader = tokio::io::BufReader::new(stdout);
+                                                let _ = reader.read_to_string(&mut buf).await;
+                                                if buf.trim() == "default" {
+                                                    // Navigate to the DM channel
+                                                    let _ = nav_tx.send(cid.clone());
+                                                }
+                                            }
+                                        }
+                                        Ok(Err(_)) => {}
+                                        Err(_) => { let _ = child.kill().await; }
+                                    }
+                                });
+                            }
+                        }
                     }
                     SlackEvent::UserProfileChanged { user, profile } => {
                         tracing::debug!("Profile changed for user {user}");
@@ -1660,12 +2060,24 @@ pub fn build_app(
                                 .insert(user.clone(), display_name.to_string());
                         }
 
+                        // Update status emoji and text for any user
+                        let status_emoji = profile
+                            .get("status_emoji")
+                            .and_then(|v| v.as_str())
+                            .filter(|e| !e.is_empty());
+                        sidebar.set_status_emoji(&user, status_emoji);
+                        let status_text_val = profile
+                            .get("status_text")
+                            .and_then(|v| v.as_str())
+                            .filter(|t| !t.is_empty());
+                        sidebar.set_status_text(&user, status_text_val);
+
                         // Only update our own profile UI
                         if is_self {
                             if let Some(status_text) =
                                 profile.get("status_text").and_then(|v| v.as_str())
                             {
-                                emoji_entry_rt.set_text(
+                                emoji_entry_rt.buffer().set_text(
                                     profile
                                         .get("status_emoji")
                                         .and_then(|v| v.as_str())
@@ -1673,6 +2085,10 @@ pub fn build_app(
                                 );
                                 status_entry_rt.set_text(status_text);
                             }
+                            update_self_status_icon(
+                                &self_status_icon_rt,
+                                profile.get("status_emoji").and_then(|v| v.as_str()),
+                            );
 
                             let image_url = profile
                                 .get("image_72")
@@ -1778,12 +2194,12 @@ pub fn build_app(
         });
     }
 
-    // Focus search entry when window gains focus
+    // Focus message input when window gains focus
     {
-        let search = sidebar.search_entry.clone();
+        let input = message_input.text_view.clone();
         window.connect_is_active_notify(move |win| {
             if win.is_active() {
-                search.grab_focus();
+                input.grab_focus();
             }
         });
     }
@@ -1792,6 +2208,117 @@ pub fn build_app(
     load_css();
 
     window.present();
+}
+
+/// Build emoji path map from cached DB data (name → local path or "alias:name").
+/// For non-alias entries, builds the expected cache path from the URL hash.
+fn build_emoji_path_map(emoji: &HashMap<String, String>) -> HashMap<String, String> {
+    use std::hash::{Hash, Hasher};
+
+    let cache_dir = dirs::data_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("slag")
+        .join("emoji_cache");
+
+    let mut paths = HashMap::new();
+    for (name, value) in emoji {
+        if value.starts_with("alias:") {
+            paths.insert(name.clone(), value.clone());
+        } else {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            value.hash(&mut hasher);
+            let hash = hasher.finish();
+            let path = cache_dir.join(format!("{hash:016x}"));
+            if path.exists() {
+                paths.insert(name.clone(), path.to_string_lossy().to_string());
+            }
+        }
+    }
+    paths
+}
+
+/// Download custom emoji images to local cache and return name → path map.
+async fn download_custom_emoji(
+    client: &Client,
+    emoji: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    use std::hash::{Hash, Hasher};
+
+    let cache_dir = dirs::data_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("slag")
+        .join("emoji_cache");
+
+    let _ = tokio::fs::create_dir_all(&cache_dir).await;
+
+    let mut paths = HashMap::new();
+    for (name, value) in emoji {
+        if value.starts_with("alias:") {
+            paths.insert(name.clone(), value.clone());
+            continue;
+        }
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        value.hash(&mut hasher);
+        let hash = hasher.finish();
+        let path = cache_dir.join(format!("{hash:016x}"));
+
+        // Skip if already cached
+        if path.exists() {
+            paths.insert(name.clone(), path.to_string_lossy().to_string());
+            continue;
+        }
+
+        // Download the emoji image
+        match client.fetch_image_bytes(value).await {
+            Ok(bytes) => {
+                if let Err(e) = tokio::fs::write(&path, &bytes).await {
+                    tracing::debug!("Failed to cache emoji {name}: {e}");
+                } else {
+                    paths.insert(name.clone(), path.to_string_lossy().to_string());
+                }
+            }
+            Err(e) => {
+                tracing::debug!("Failed to download emoji {name}: {e}");
+            }
+        }
+    }
+
+    tracing::info!("Custom emoji cache: {} of {} downloaded", paths.len(), emoji.len());
+    paths
+}
+
+/// Update the self-status emoji icon beside the profile avatar.
+fn update_self_status_icon(container: &gtk::Box, emoji_code: Option<&str>) {
+    use crate::slack::helpers::{get_custom_emoji_path, resolve_slack_shortcode};
+
+    while let Some(child) = container.first_child() {
+        container.remove(&child);
+    }
+
+    let code = match emoji_code.filter(|e| !e.is_empty()) {
+        Some(c) => c,
+        None => return,
+    };
+
+    let trimmed = code.trim_matches(':');
+
+    // Try custom emoji image
+    if let Some(path) = get_custom_emoji_path(trimmed) {
+        if let Ok(pixbuf) = gtk4::gdk_pixbuf::Pixbuf::from_file_at_scale(&path, 16, 16, true) {
+            let texture = gtk4::gdk::Texture::for_pixbuf(&pixbuf);
+            let image = gtk::Image::from_paintable(Some(&texture));
+            image.set_pixel_size(16);
+            container.append(&image);
+            return;
+        }
+    }
+
+    // Standard emoji as text
+    if let Some(emoji_str) = resolve_slack_shortcode(trimmed) {
+        let label = Label::new(Some(emoji_str));
+        container.append(&label);
+    }
 }
 
 fn sort_and_filter_channels(channels: Vec<Channel>) -> Vec<Channel> {
@@ -1900,6 +2427,14 @@ fn load_css() {
         }
         .presence-active {
             color: #2BAC76;
+        }
+        .message-body-textview {
+            background: transparent;
+            padding: 0;
+            margin: 0;
+        }
+        .message-body-textview text {
+            background: transparent;
         }
         .notification-highlight {
             background-color: alpha(@accent_color, 0.15);

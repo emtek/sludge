@@ -1,6 +1,60 @@
 use std::collections::HashMap;
+use std::sync::RwLock;
 
 use slacko::types::{Channel, User};
+
+/// Global registry of custom emoji: shortcode → local cached image path.
+/// Populated on startup from the Slack API, used by emoji rendering.
+static CUSTOM_EMOJI: RwLock<Option<HashMap<String, String>>> = RwLock::new(None);
+
+/// Global ordered list of recently used emoji shortcodes (most recent first).
+static RECENT_EMOJI: RwLock<Vec<String>> = RwLock::new(Vec::new());
+
+/// Set the custom emoji map (name → local file path for images, or "alias:name" for aliases).
+pub fn set_custom_emoji(emoji: HashMap<String, String>) {
+    *CUSTOM_EMOJI.write().unwrap() = Some(emoji);
+}
+
+/// Look up a custom emoji by shortcode. Returns the local cached image path if available.
+pub fn get_custom_emoji_path(shortcode: &str) -> Option<String> {
+    let lock = CUSTOM_EMOJI.read().unwrap();
+    let map = lock.as_ref()?;
+    let mut name = shortcode;
+    // Resolve aliases (up to 5 levels to prevent loops)
+    for _ in 0..5 {
+        let val = map.get(name)?;
+        if let Some(alias) = val.strip_prefix("alias:") {
+            name = alias;
+        } else {
+            return Some(val.clone());
+        }
+    }
+    None
+}
+
+/// Set the recent emoji list (called on startup from DB).
+pub fn set_recent_emoji(emoji: Vec<String>) {
+    *RECENT_EMOJI.write().unwrap() = emoji;
+}
+
+/// Get the recent emoji list (most recent first).
+pub fn get_recent_emoji() -> Vec<String> {
+    RECENT_EMOJI.read().unwrap().clone()
+}
+
+/// Push a shortcode to the front of the recent emoji list.
+pub fn push_recent_emoji(shortcode: &str) {
+    let mut list = RECENT_EMOJI.write().unwrap();
+    list.retain(|s| s != shortcode);
+    list.insert(0, shortcode.to_string());
+    list.truncate(50);
+}
+
+/// Return all custom emoji shortcode names, or None if not yet loaded.
+pub fn get_all_custom_emoji_names() -> Option<Vec<String>> {
+    let lock = CUSTOM_EMOJI.read().unwrap();
+    lock.as_ref().map(|map| map.keys().cloned().collect())
+}
 
 pub fn channel_display_name(channel: &Channel) -> String {
     if channel.is_im == Some(true) {
@@ -321,7 +375,71 @@ fn replace_slack_brackets(text: &str, user_names: &HashMap<String, String>) -> S
 
 use gtk4::glib;
 
-/// Replace Slack-style `:shortcode:` emoji with actual Unicode emoji.
+/// Resolve a Slack emoji shortcode to a Unicode emoji string.
+/// Handles Slack-specific aliases (e.g. `large_green_circle` → `green_circle`)
+/// and skin tone variants. Returns None if not a standard emoji.
+pub fn resolve_slack_shortcode(code: &str) -> Option<&'static str> {
+    // Direct lookup first
+    if let Some(emoji) = emojis::get_by_shortcode(code) {
+        return Some(emoji.as_str());
+    }
+    // Slack-specific aliases: try stripping common prefixes/suffixes
+    // Slack uses "large_*" for many emoji
+    if let Some(stripped) = code.strip_prefix("large_") {
+        if let Some(emoji) = emojis::get_by_shortcode(stripped) {
+            return Some(emoji.as_str());
+        }
+    }
+    // Slack uses "small_*" for some emoji
+    if let Some(stripped) = code.strip_prefix("small_") {
+        if let Some(emoji) = emojis::get_by_shortcode(stripped) {
+            return Some(emoji.as_str());
+        }
+    }
+    // Slack appends _pad to some emoji (e.g. spiral_calendar_pad → spiral_calendar)
+    if let Some(stripped) = code.strip_suffix("_pad") {
+        if let Some(emoji) = emojis::get_by_shortcode(stripped) {
+            return Some(emoji.as_str());
+        }
+    }
+    // Slack skin tone variants: ":+1::skin-tone-2:" stored as "+1::skin-tone-2"
+    if let Some(base) = code.split("::skin-tone-").next() {
+        if let Some(emoji) = emojis::get_by_shortcode(base) {
+            return Some(emoji.as_str());
+        }
+    }
+    // Try removing trailing digits for keycap variants (e.g. "one" not found, try as-is)
+    // Common Slack aliases not in the emojis crate
+    match code {
+        "slightly_smiling_face" => Some("🙂"),
+        "upside_down_face" => Some("🙃"),
+        "simple_smile" => Some("🙂"),
+        "wfh" => Some("🏠"),
+        "white_check_mark" => Some("✅"),
+        "heavy_check_mark" => Some("✔️"),
+        "x" => Some("❌"),
+        "heavy_multiplication_x" => Some("✖️"),
+        "bangbang" => Some("‼️"),
+        "interrobang" => Some("⁉️"),
+        "tada" => Some("🎉"),
+        "party_blob" | "party-blob" => Some("🎉"),
+        "blob-dance" | "blobdance" => Some("🕺"),
+        "spiral_note_pad" | "spiral_notepad" => Some("🗒️"),
+        "memo" | "pencil" => Some("📝"),
+        "phone" | "telephone_receiver" => Some("📞"),
+        "email" | "envelope" => Some("✉️"),
+        "thumbsup" | "thumbup" => Some("👍"),
+        "thumbsdown" | "thumbdown" => Some("👎"),
+        "hankey" | "poop" | "shit" => Some("💩"),
+        "hurtrealbad" => Some("🤕"),
+        "rage" => Some("😡"),
+        "suspect" => Some("🤨"),
+        _ => None,
+    }
+}
+
+/// Replace Slack-style `:shortcode:` emoji with actual Unicode emoji or custom emoji placeholders.
+/// Custom emoji are replaced with U+FFFC (object replacement character) for later rendering.
 pub fn replace_emoji_shortcodes(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let mut rest = text;
@@ -339,8 +457,14 @@ pub fn replace_emoji_shortcodes(text: &str) -> String {
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'+')
             {
-                if let Some(emoji) = emojis::get_by_shortcode(code) {
-                    result.push_str(emoji.as_str());
+                if let Some(emoji_str) = resolve_slack_shortcode(code) {
+                    result.push_str(emoji_str);
+                    rest = &after_colon[end + 1..];
+                    continue;
+                }
+                // Check custom emoji — insert object replacement char for inline rendering
+                if get_custom_emoji_path(code).is_some() {
+                    result.push('\u{FFFC}');
                     rest = &after_colon[end + 1..];
                     continue;
                 }
@@ -356,5 +480,43 @@ pub fn replace_emoji_shortcodes(text: &str) -> String {
     }
 
     result.push_str(rest);
+    result
+}
+
+/// Extract ordered list of custom emoji shortcodes from Slack message text.
+/// Returns shortcodes in the order they appear (for pairing with U+FFFC placeholders).
+pub fn extract_custom_emoji(text: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut rest = text;
+
+    while let Some(start) = rest.find(':') {
+        let after_colon = &rest[start + 1..];
+        if let Some(end) = after_colon.find(':') {
+            let code = &after_colon[..end];
+            if !code.is_empty()
+                && code.len() <= 50
+                && code
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'+')
+            {
+                // Skip standard Unicode emoji (including Slack aliases)
+                if resolve_slack_shortcode(code).is_some() {
+                    rest = &after_colon[end + 1..];
+                    continue;
+                }
+                // Custom emoji
+                if get_custom_emoji_path(code).is_some() {
+                    result.push(code.to_string());
+                    rest = &after_colon[end + 1..];
+                    continue;
+                }
+            }
+            // Not a shortcode — skip the colon
+            rest = after_colon;
+        } else {
+            break;
+        }
+    }
+
     result
 }

@@ -4299,8 +4299,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
-name = "slack-frontend"
-version = "0.1.0"
+name = "slacko"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3b9d54c8480e1ed87ca60d0efcd295b95fe1af990556cb614bc446fa717d5e8a"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "dotenv",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-tungstenite 0.24.0",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
+name = "slag"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "dirs",
@@ -4320,27 +4341,6 @@ dependencies = [
  "tokio-tungstenite 0.29.0",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "slacko"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b9d54c8480e1ed87ca60d0efcd295b95fe1af990556cb614bc446fa717d5e8a"
-dependencies = [
- "anyhow",
- "chrono",
- "dotenv",
- "futures-util",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tokio-tungstenite 0.24.0",
- "tracing",
- "tracing-subscriber",
- "url",
 ]
 
 [[package]]

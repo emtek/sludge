@@ -353,10 +353,17 @@ impl MessageView {
 
     fn scroll_to_bottom(&self) {
         let adj = self.scrolled.vadjustment();
-        // Defer to let GTK lay out the new widget first
-        gtk4::glib::idle_add_local_once(move || {
+        // Wait for GTK to finish layout so `upper` reflects the new content
+        let signal_id: Rc<RefCell<Option<gtk4::glib::SignalHandlerId>>> =
+            Rc::new(RefCell::new(None));
+        let signal_id2 = signal_id.clone();
+        let id = adj.connect_changed(move |adj| {
             adj.set_value(adj.upper() - adj.page_size());
+            if let Some(id) = signal_id2.borrow_mut().take() {
+                adj.disconnect(id);
+            }
         });
+        *signal_id.borrow_mut() = Some(id);
     }
 
     /// Scroll to a specific message by its ts and briefly highlight it.
@@ -425,7 +432,9 @@ fn make_message_row(
     // Username + timestamp header + thread button (right-aligned)
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
 
-    let user_id = msg.user.as_deref().unwrap_or("unknown");
+    let user_id = msg.user.as_deref()
+        .or(msg.bot_id.as_deref())
+        .unwrap_or("unknown");
     let display_name = users
         .get(user_id)
         .cloned()
@@ -530,33 +539,101 @@ fn make_message_row(
 
     outer.append(&header);
 
-    // Message body with clickable @mentions
+    // Message body with clickable @mentions and inline custom emoji
     if !msg.text.is_empty() {
-        let markup = format_message_markup(&msg.text, users);
-        let body = Label::new(None);
-        body.set_markup(&markup);
-        body.set_wrap(true);
-        body.set_halign(gtk::Align::Start);
-        body.set_selectable(true);
-        body.set_xalign(0.0);
-
-        if let Some(cb) = mention_cb.clone() {
-            body.connect_activate_link(move |_, uri| {
-                if let Some(user_id) = uri.strip_prefix("mention:") {
-                    cb(user_id);
-                    return gtk4::glib::Propagation::Stop;
-                }
-                gtk4::glib::Propagation::Proceed
-            });
-        }
-
+        let body = make_message_body(&msg.text, users, mention_cb);
         outer.append(&body);
+    }
+
+    // Render attachment text content (title, pretext, text, fallback)
+    // This is crucial for bot/integration messages (e.g. GitHub) that put content in attachments
+    if let Some(attachments) = &msg.attachments {
+        for att in attachments {
+            let mut att_parts: Vec<String> = Vec::new();
+            if let Some(pretext) = &att.pretext {
+                if !pretext.is_empty() {
+                    att_parts.push(pretext.clone());
+                }
+            }
+            if let Some(title) = &att.title {
+                if !title.is_empty() {
+                    if let Some(link) = &att.title_link {
+                        att_parts.push(format!("<{link}|{title}>"));
+                    } else {
+                        att_parts.push(format!("*{title}*"));
+                    }
+                }
+            }
+            if let Some(text) = &att.text {
+                if !text.is_empty() {
+                    att_parts.push(text.clone());
+                }
+            }
+            if att_parts.is_empty() {
+                if let Some(fallback) = &att.fallback {
+                    if !fallback.is_empty() {
+                        att_parts.push(fallback.clone());
+                    }
+                }
+            }
+
+            if !att_parts.is_empty() {
+                let att_text = att_parts.join("\n");
+                let markup = format_message_markup(&att_text, users);
+
+                let att_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+
+                // Color bar (left border)
+                if let Some(color) = &att.color {
+                    let bar = gtk::DrawingArea::new();
+                    bar.set_size_request(3, -1);
+                    bar.set_vexpand(true);
+                    let color = color.clone();
+                    bar.set_draw_func(move |_, cr, _w, h| {
+                        let hex = color.trim_start_matches('#');
+                        if hex.len() == 6 {
+                            if let (Ok(r), Ok(g), Ok(b)) = (
+                                u8::from_str_radix(&hex[0..2], 16),
+                                u8::from_str_radix(&hex[2..4], 16),
+                                u8::from_str_radix(&hex[4..6], 16),
+                            ) {
+                                cr.set_source_rgb(r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0);
+                                cr.rectangle(0.0, 0.0, 3.0, h as f64);
+                                let _ = cr.fill();
+                            }
+                        }
+                    });
+                    att_box.append(&bar);
+                }
+
+                let att_label = Label::new(None);
+                att_label.set_markup(&markup);
+                att_label.set_wrap(true);
+                att_label.set_halign(gtk::Align::Start);
+                att_label.set_selectable(true);
+                att_label.set_xalign(0.0);
+                att_label.set_margin_start(6);
+
+                if let Some(cb) = mention_cb.clone() {
+                    att_label.connect_activate_link(move |_, uri| {
+                        if let Some(user_id) = uri.strip_prefix("mention:") {
+                            cb(user_id);
+                            return gtk4::glib::Propagation::Stop;
+                        }
+                        gtk4::glib::Propagation::Proceed
+                    });
+                }
+
+                att_box.append(&att_label);
+                outer.append(&att_box);
+            }
+        }
     }
 
     // Collect image URLs to load (with fallback candidates per image)
     let mut image_url_sets: Vec<Vec<String>> = Vec::new();
 
-    // Images from file uploads
+    // File attachments
     if let Some(files) = &msg.files {
         for file in files {
             let is_image = file
@@ -577,6 +654,12 @@ fn make_message_row(
                 if !candidates.is_empty() {
                     image_url_sets.push(candidates);
                 }
+            } else {
+                // Non-image file: show download chip
+                let download_url = file.url_private_download.clone()
+                    .or_else(|| file.url_private.clone());
+                let chip = make_file_attachment_chip(file, download_url.as_deref(), client, rt);
+                outer.append(&chip);
             }
         }
     }
@@ -607,12 +690,15 @@ fn make_message_row(
         picture.set_cursor_from_name(Some("pointer"));
         outer.append(&picture);
 
-        // Click to open fullscreen viewer
+        // Click to open fullscreen viewer (loads full resolution)
         let stored_texture: Rc<RefCell<Option<gtk4::gdk::Texture>>> = Rc::new(RefCell::new(None));
         {
             let click = gtk::GestureClick::new();
             click.set_button(1);
             let tex = stored_texture.clone();
+            let click_urls = urls.clone();
+            let click_client = client.clone();
+            let click_rt = rt.clone();
             // Use weak ref to avoid Picture -> GestureClick -> closure -> Picture cycle
             let picture_weak = picture.downgrade();
             click.connect_released(move |_, _, _, _| {
@@ -620,7 +706,13 @@ fn make_message_row(
                 if let Some(texture) = tex.borrow().as_ref() {
                     if let Some(root) = picture.root() {
                         if let Some(win) = root.downcast_ref::<gtk::Window>() {
-                            crate::ui::image_viewer::show(texture, win);
+                            crate::ui::image_viewer::show(
+                                texture,
+                                win,
+                                Some(click_urls.clone()),
+                                Some(click_client.clone()),
+                                Some(click_rt.clone()),
+                            );
                         }
                     }
                 }
@@ -674,6 +766,7 @@ fn make_message_row(
                         Ok(pixbuf) => {
                             let w = pixbuf.width();
                             let h = pixbuf.height();
+                            tracing::info!("[MEM] Image decoded (scaled): {w}x{h} = {:.2} MiB", (w as f64 * h as f64 * 4.0) / 1048576.0);
                             let texture = gtk4::gdk::Texture::for_pixbuf(&pixbuf);
                             picture.set_paintable(Some(&texture));
                             *stored_texture.borrow_mut() = Some(texture);
@@ -715,7 +808,7 @@ fn make_message_row(
             }
         }
 
-        // Add reaction button with lightweight emoji picker
+        // Add reaction button with emoji autocomplete popover
         if let (Some(rcb), Some(cid)) = (reaction_cb.clone(), channel_id) {
             let add_btn = gtk::Button::from_icon_name("list-add-symbolic");
             add_btn.add_css_class("flat");
@@ -735,11 +828,11 @@ fn make_message_row(
                     let rcb3 = rcb2.clone();
                     let cid3 = cid2.clone();
                     let ts3 = ts2.clone();
-                    let on_pick: Rc<dyn Fn(&str)> = Rc::new(move |shortcode: &str| {
+                    let on_react: Rc<dyn Fn(&str)> = Rc::new(move |shortcode: &str| {
                         let dummy = gtk::Button::new();
                         rcb3(&cid3, &ts3, shortcode, &dummy);
                     });
-                    let picker = crate::ui::emoji_picker::build(&btn, on_pick);
+                    let picker = crate::ui::autocomplete::build_reaction_popover(&btn, on_react);
                     *cell_click.borrow_mut() = Some(picker);
                 }
                 if let Some(picker) = cell_click.borrow().as_ref() {
@@ -782,13 +875,38 @@ pub fn make_reaction_button(
     reaction_cb: &Option<ReactionCallback>,
     channel_id: Option<&str>,
 ) -> gtk::Button {
-    let emoji_unicode = emojis::get_by_shortcode(&reaction.name)
-        .map(|e| e.as_str().to_string())
-        .unwrap_or_else(|| format!(":{}: ", reaction.name));
-    let label_text = format!("{} {}", emoji_unicode, reaction.count);
-    let btn = gtk::Button::with_label(&label_text);
+    use crate::slack::helpers::{resolve_slack_shortcode, get_custom_emoji_path};
+
+    let btn = gtk::Button::new();
     btn.add_css_class("flat");
     btn.add_css_class("reaction-btn");
+
+    let content = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+
+    if let Some(emoji_str) = resolve_slack_shortcode(&reaction.name) {
+        // Standard emoji
+        let label = Label::new(Some(&format!("{emoji_str} {}", reaction.count)));
+        content.append(&label);
+    } else if let Some(path) = get_custom_emoji_path(&reaction.name) {
+        // Custom emoji — render as small image
+        if let Ok(pixbuf) = gtk4::gdk_pixbuf::Pixbuf::from_file_at_scale(&path, 18, 18, true) {
+            let texture = gtk4::gdk::Texture::for_pixbuf(&pixbuf);
+            let image = gtk::Image::from_paintable(Some(&texture));
+            image.set_pixel_size(18);
+            content.append(&image);
+        } else {
+            let label = Label::new(Some(&format!(":{}: ", reaction.name)));
+            content.append(&label);
+        }
+        let count_label = Label::new(Some(&format!("{}", reaction.count)));
+        content.append(&count_label);
+    } else {
+        // Unknown emoji — show name
+        let label = Label::new(Some(&format!(":{}: {}", reaction.name, reaction.count)));
+        content.append(&label);
+    }
+
+    btn.set_child(Some(&content));
 
     // Left-click toggles the reaction
     if let (Some(rcb), Some(cid)) = (reaction_cb.clone(), channel_id) {
@@ -820,7 +938,10 @@ pub fn make_reaction_button(
         list_box.set_margin_start(12);
         list_box.set_margin_end(12);
 
-        let header = Label::new(Some(&format!("{} :{}: ", emoji_unicode, reaction.name)));
+        let emoji_display = resolve_slack_shortcode(&reaction.name)
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let header = Label::new(Some(&format!("{} :{}: ", emoji_display, reaction.name)));
         header.add_css_class("heading");
         header.set_halign(gtk::Align::Start);
         list_box.append(&header);
@@ -848,4 +969,221 @@ pub fn make_reaction_button(
     }
 
     btn
+}
+
+/// Build a widget showing a non-image file attachment with a download button.
+pub fn make_file_attachment_chip(
+    file: &slacko::types::File,
+    download_url: Option<&str>,
+    client: &Client,
+    rt: &tokio::runtime::Handle,
+) -> gtk::Box {
+    let chip = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    chip.add_css_class("card");
+    chip.set_margin_top(4);
+    chip.set_margin_bottom(4);
+    chip.set_halign(gtk::Align::Start);
+
+    let icon = gtk::Image::from_icon_name("document-save-symbolic");
+    icon.set_margin_start(10);
+    icon.set_margin_top(6);
+    icon.set_margin_bottom(6);
+    chip.append(&icon);
+
+    let info_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    info_box.set_margin_top(6);
+    info_box.set_margin_bottom(6);
+
+    let name = file.name.as_deref()
+        .or(file.title.as_deref())
+        .unwrap_or("file");
+    let name_label = Label::new(Some(name));
+    name_label.set_halign(gtk::Align::Start);
+    name_label.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
+    name_label.set_max_width_chars(40);
+    name_label.add_css_class("heading");
+    info_box.append(&name_label);
+
+    let mut detail_parts: Vec<String> = Vec::new();
+    if let Some(size) = file.size {
+        detail_parts.push(format_file_size(size));
+    }
+    if let Some(ft) = &file.filetype {
+        detail_parts.push(ft.to_uppercase());
+    }
+    if !detail_parts.is_empty() {
+        let detail_label = Label::new(Some(&detail_parts.join(" · ")));
+        detail_label.set_halign(gtk::Align::Start);
+        detail_label.add_css_class("dim-label");
+        detail_label.add_css_class("caption");
+        info_box.append(&detail_label);
+    }
+
+    chip.append(&info_box);
+
+    if let Some(url) = download_url {
+        let dl_btn = gtk::Button::from_icon_name("folder-download-symbolic");
+        dl_btn.add_css_class("flat");
+        dl_btn.set_valign(gtk::Align::Center);
+        dl_btn.set_margin_end(6);
+        dl_btn.set_tooltip_text(Some("Save file"));
+
+        let url = url.to_string();
+        let filename = name.to_string();
+        let client = client.clone();
+        let rt = rt.clone();
+        dl_btn.connect_clicked(move |btn| {
+            let Some(root) = btn.root() else { return };
+            let Some(win) = root.downcast_ref::<gtk::Window>() else { return };
+
+            let dialog = gtk::FileDialog::new();
+            dialog.set_initial_name(Some(&filename));
+
+            let url = url.clone();
+            let client = client.clone();
+            let rt = rt.clone();
+            let btn_weak = btn.downgrade();
+            dialog.save(Some(win), gtk4::gio::Cancellable::NONE, move |result| {
+                let Ok(gfile) = result else { return };
+                let Some(path) = gfile.path() else { return };
+
+                // Show spinner on button while downloading
+                let btn_ref = btn_weak.upgrade();
+                if let Some(btn) = &btn_ref {
+                    btn.set_sensitive(false);
+                    btn.set_icon_name("process-working-symbolic");
+                }
+
+                let btn_weak2 = btn_weak.clone();
+                gtk4::glib::spawn_future_local(async move {
+                    let c = client.clone();
+                    let u = url.clone();
+                    let p = path.clone();
+                    let result = rt.spawn(async move {
+                        let bytes = c.fetch_image_bytes(&u).await?;
+                        tokio::fs::write(&p, &bytes).await
+                            .map_err(|e| format!("Write error: {e}"))
+                    }).await;
+
+                    if let Some(btn) = btn_weak2.upgrade() {
+                        btn.set_sensitive(true);
+                        match result {
+                            Ok(Ok(())) => {
+                                btn.set_icon_name("emblem-ok-symbolic");
+                            }
+                            _ => {
+                                btn.set_icon_name("dialog-error-symbolic");
+                                tracing::error!("Failed to download file");
+                            }
+                        }
+                    }
+                });
+            });
+        });
+
+        chip.append(&dl_btn);
+    }
+
+    chip
+}
+
+/// Build a message body widget from Slack text.
+/// Uses a plain Label for messages without custom emoji,
+/// or a non-editable TextView with inline emoji images for messages containing them.
+pub fn make_message_body(
+    text: &str,
+    users: &HashMap<String, String>,
+    mention_cb: &Option<MentionCallback>,
+) -> gtk::Widget {
+    use crate::slack::helpers::{extract_custom_emoji, get_custom_emoji_path};
+
+    let custom_emoji = extract_custom_emoji(text);
+
+    if custom_emoji.is_empty() {
+        // No custom emoji — use a simple Label with Pango markup
+        let markup = format_message_markup(text, users);
+        let body = Label::new(None);
+        body.set_markup(&markup);
+        body.set_wrap(true);
+        body.set_halign(gtk::Align::Start);
+        body.set_selectable(true);
+        body.set_xalign(0.0);
+
+        if let Some(cb) = mention_cb.clone() {
+            body.connect_activate_link(move |_, uri| {
+                if let Some(user_id) = uri.strip_prefix("mention:") {
+                    cb(user_id);
+                    return gtk4::glib::Propagation::Stop;
+                }
+                gtk4::glib::Propagation::Proceed
+            });
+        }
+
+        body.upcast()
+    } else {
+        // Has custom emoji — use a TextView with inline paintables
+        let text_view = gtk::TextView::new();
+        text_view.set_editable(false);
+        text_view.set_cursor_visible(false);
+        text_view.set_wrap_mode(gtk::WrapMode::WordChar);
+        text_view.add_css_class("message-body-textview");
+
+        let buffer = text_view.buffer();
+
+        // Build plain text (with U+FFFC placeholders for custom emoji) and insert paintables
+        let plain = crate::slack::helpers::format_message_plain(text, users);
+        let custom_emoji_reextracted = extract_custom_emoji(text);
+
+        // Split plain text at U+FFFC boundaries and insert paintables
+        let parts: Vec<&str> = plain.split('\u{FFFC}').collect();
+        let mut emoji_idx = 0;
+
+        for (i, part) in parts.iter().enumerate() {
+            if !part.is_empty() {
+                let mut end = buffer.end_iter();
+                buffer.insert(&mut end, part);
+            }
+            // Insert custom emoji image after each split (except after the last part)
+            if i < parts.len() - 1 {
+                if let Some(shortcode) = custom_emoji_reextracted.get(emoji_idx) {
+                    if let Some(path) = get_custom_emoji_path(shortcode) {
+                        if let Ok(pixbuf) = gtk4::gdk_pixbuf::Pixbuf::from_file_at_scale(
+                            &path, 20, 20, true,
+                        ) {
+                            let texture = gtk4::gdk::Texture::for_pixbuf(&pixbuf);
+                            let mut end = buffer.end_iter();
+                            buffer.insert_paintable(&mut end, &texture);
+                        } else {
+                            // Fallback: show the shortcode as text
+                            let mut end = buffer.end_iter();
+                            buffer.insert(&mut end, &format!(":{shortcode}:"));
+                        }
+                    } else {
+                        let mut end = buffer.end_iter();
+                        buffer.insert(&mut end, &format!(":{shortcode}:"));
+                    }
+                    emoji_idx += 1;
+                }
+            }
+        }
+
+        text_view.set_halign(gtk::Align::Fill);
+        text_view.set_hexpand(true);
+        text_view.upcast()
+    }
+}
+
+fn format_file_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.0} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes} B")
+    }
 }

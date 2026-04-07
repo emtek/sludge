@@ -13,7 +13,7 @@ use crate::ui::app::build_app;
 pub fn show_login(app: &Application, rt: tokio::runtime::Handle, db: Arc<Database>) {
     let window = ApplicationWindow::builder()
         .application(app)
-        .title("Slack — Sign In")
+        .title("Slag — Sign In")
         .default_width(400)
         .default_height(340)
         .resizable(false)
@@ -27,7 +27,7 @@ pub fn show_login(app: &Application, rt: tokio::runtime::Handle, db: Arc<Databas
     outer.set_valign(gtk::Align::Center);
     outer.set_vexpand(true);
 
-    let title = Label::new(Some("Sign in to Slack"));
+    let title = Label::new(Some("Sign in to Slag"));
     title.add_css_class("title-1");
     outer.append(&title);
 
