@@ -562,6 +562,14 @@ impl Client {
         Ok(())
     }
 
+    pub async fn update_message(&self, channel: &str, ts: &str, text: &str) -> Result<(), String> {
+        info!("Calling chat.update on channel={channel} ts={ts}");
+        let _: serde_json::Value =
+            Self::stealth_post(&self.http, &self.creds, "chat.update", &[("channel", channel), ("ts", ts), ("text", text)])
+                .await?;
+        Ok(())
+    }
+
     /// Request a Google Meet call link for a channel (stealth-only internal API).
     pub async fn calls_request(&self, channel: &str) -> Result<String, String> {
         info!("Calling calls.request for channel={channel}");

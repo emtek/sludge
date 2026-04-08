@@ -24,6 +24,7 @@ pub struct ThreadPanel {
     mention_callback: RefCell<Option<crate::ui::message_view::MentionCallback>>,
     reaction_callback: RefCell<Option<ReactionCallback>>,
     delete_callback: RefCell<Option<crate::ui::message_view::DeleteCallback>>,
+    edit_callback: RefCell<Option<crate::ui::message_view::EditCallback>>,
     self_user_id: RefCell<String>,
     channel_id: RefCell<Option<String>>,
     /// Message ts to scroll to after thread loads (set by notification click).
@@ -189,6 +190,7 @@ impl ThreadPanel {
             mention_callback: RefCell::new(None),
             reaction_callback: RefCell::new(None),
             delete_callback: RefCell::new(None),
+            edit_callback: RefCell::new(None),
             self_user_id: RefCell::new(String::new()),
             channel_id: RefCell::new(None),
             pending_scroll: RefCell::new(None),
@@ -224,6 +226,10 @@ impl ThreadPanel {
 
     pub fn set_delete_callback(&self, cb: crate::ui::message_view::DeleteCallback) {
         *self.delete_callback.borrow_mut() = Some(cb);
+    }
+
+    pub fn set_edit_callback(&self, cb: crate::ui::message_view::EditCallback) {
+        *self.edit_callback.borrow_mut() = Some(cb);
     }
 
     pub fn set_self_user_id(&self, uid: &str) {
@@ -279,6 +285,7 @@ impl ThreadPanel {
         let mcb = self.mention_callback.borrow();
         let rcb = self.reaction_callback.borrow();
         let dcb = self.delete_callback.borrow();
+        let ecb = self.edit_callback.borrow();
         let self_uid = self.self_user_id.borrow();
         let cid = self.channel_id.borrow();
         let subteam_names = self.subteam_names.borrow();
@@ -286,7 +293,7 @@ impl ThreadPanel {
         for msg in messages {
             let row = crate::ui::message_view::make_message_row(
                 msg, users, &subteam_names, client, rt,
-                &None, &mcb, &rcb, &dcb,
+                &None, &mcb, &rcb, &dcb, &ecb,
                 cid.as_deref(), &self.thread_counts.borrow(), &self.thread_labels, &self.reaction_boxes, &self_uid,
                 &self.image_generation, &self.picker_cells,
             );
@@ -306,12 +313,13 @@ impl ThreadPanel {
         let mcb = self.mention_callback.borrow();
         let rcb = self.reaction_callback.borrow();
         let dcb = self.delete_callback.borrow();
+        let ecb = self.edit_callback.borrow();
         let self_uid = self.self_user_id.borrow();
         let cid = self.channel_id.borrow();
         let subteam_names = self.subteam_names.borrow();
         let row = crate::ui::message_view::make_message_row(
             msg, users, &subteam_names, client, rt,
-            &None, &mcb, &rcb, &dcb,
+            &None, &mcb, &rcb, &dcb, &ecb,
             cid.as_deref(), &self.thread_counts.borrow(), &self.thread_labels, &self.reaction_boxes, &self_uid,
             &self.image_generation, &self.picker_cells,
         );

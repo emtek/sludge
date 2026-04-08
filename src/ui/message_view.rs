@@ -20,6 +20,10 @@ pub type ReactionCallback = Rc<dyn Fn(&str, &str, &str, &gtk::Button)>;
 /// Callback type for deleting a message: (channel_id, message_ts, row)
 pub type DeleteCallback = Rc<dyn Fn(&str, &str, &ListBoxRow)>;
 
+/// Callback type for editing a message: (channel_id, message_ts, current_text, outer_box)
+/// The outer_box is the message container; the body widget is the child after the header.
+pub type EditCallback = Rc<dyn Fn(&str, &str, &str, &gtk::Box)>;
+
 /// Callback for loading older messages: called with channel_id and oldest message ts.
 pub type LoadMoreCallback = Rc<dyn Fn(&str, &str)>;
 
@@ -36,6 +40,7 @@ pub struct MessageView {
     mention_callback: RefCell<Option<MentionCallback>>,
     reaction_callback: RefCell<Option<ReactionCallback>>,
     delete_callback: RefCell<Option<DeleteCallback>>,
+    edit_callback: RefCell<Option<EditCallback>>,
     self_user_id: RefCell<String>,
     channel_id: Rc<RefCell<Option<String>>>,
     /// Known thread reply counts: thread_ts -> reply count (excluding parent).
@@ -148,6 +153,7 @@ impl MessageView {
             mention_callback: RefCell::new(None),
             reaction_callback: RefCell::new(None),
             delete_callback: RefCell::new(None),
+            edit_callback: RefCell::new(None),
             self_user_id: RefCell::new(String::new()),
             channel_id: Rc::new(RefCell::new(None)),
             thread_counts: Rc::new(RefCell::new(HashMap::new())),
@@ -186,6 +192,10 @@ impl MessageView {
 
     pub fn set_delete_callback(&self, cb: DeleteCallback) {
         *self.delete_callback.borrow_mut() = Some(cb);
+    }
+
+    pub fn set_edit_callback(&self, cb: EditCallback) {
+        *self.edit_callback.borrow_mut() = Some(cb);
     }
 
     pub fn set_self_user_id(&self, uid: &str) {
@@ -247,6 +257,7 @@ impl MessageView {
         let mention_cb = self.mention_callback.borrow();
         let reaction_cb = self.reaction_callback.borrow();
         let delete_cb = self.delete_callback.borrow();
+        let edit_cb = self.edit_callback.borrow();
         let self_uid = self.self_user_id.borrow();
         let channel_id = self.channel_id.borrow();
         let subteam_names = self.subteam_names.borrow();
@@ -259,7 +270,7 @@ impl MessageView {
         for msg in messages.iter().rev() {
             let row = make_message_row(
                 msg, users, &subteam_names, client, rt,
-                &thread_cb, &mention_cb, &reaction_cb, &delete_cb,
+                &thread_cb, &mention_cb, &reaction_cb, &delete_cb, &edit_cb,
                 channel_id.as_deref(), &self.thread_counts.borrow(), &self.thread_labels, &self.reaction_boxes, &self_uid,
                 &self.image_generation, &self.picker_cells,
             );
@@ -435,6 +446,7 @@ impl MessageView {
         let mention_cb = self.mention_callback.borrow();
         let reaction_cb = self.reaction_callback.borrow();
         let delete_cb = self.delete_callback.borrow();
+        let edit_cb = self.edit_callback.borrow();
         let self_uid = self.self_user_id.borrow();
         let channel_id = self.channel_id.borrow();
         let subteam_names = self.subteam_names.borrow();
@@ -443,7 +455,7 @@ impl MessageView {
         for msg in messages.iter().rev() {
             let row = make_message_row(
                 msg, users, &subteam_names, client, rt,
-                &thread_cb, &mention_cb, &reaction_cb, &delete_cb,
+                &thread_cb, &mention_cb, &reaction_cb, &delete_cb, &edit_cb,
                 channel_id.as_deref(), &self.thread_counts.borrow(), &self.thread_labels, &self.reaction_boxes, &self_uid,
                 &self.image_generation, &self.picker_cells,
             );
@@ -471,6 +483,7 @@ impl MessageView {
         let mention_cb = self.mention_callback.borrow();
         let reaction_cb = self.reaction_callback.borrow();
         let delete_cb = self.delete_callback.borrow();
+        let edit_cb = self.edit_callback.borrow();
         let self_uid = self.self_user_id.borrow();
         let search_cb = self.search_result_callback.borrow();
         let subteam_names = self.subteam_names.borrow();
@@ -494,7 +507,7 @@ impl MessageView {
 
             let row = make_message_row(
                 msg, users, &subteam_names, client, rt,
-                &thread_cb, &mention_cb, &reaction_cb, &delete_cb,
+                &thread_cb, &mention_cb, &reaction_cb, &delete_cb, &edit_cb,
                 Some(channel_id), &self.thread_counts.borrow(), &self.thread_labels, &self.reaction_boxes, &self_uid,
                 &self.image_generation, &self.picker_cells,
             );
@@ -540,12 +553,13 @@ impl MessageView {
         let mention_cb = self.mention_callback.borrow();
         let reaction_cb = self.reaction_callback.borrow();
         let delete_cb = self.delete_callback.borrow();
+        let edit_cb = self.edit_callback.borrow();
         let self_uid = self.self_user_id.borrow();
         let channel_id = self.channel_id.borrow();
         let subteam_names = self.subteam_names.borrow();
         let row = make_message_row(
             msg, users, &subteam_names, client, rt,
-            &thread_cb, &mention_cb, &reaction_cb, &delete_cb,
+            &thread_cb, &mention_cb, &reaction_cb, &delete_cb, &edit_cb,
             channel_id.as_deref(), &self.thread_counts.borrow(), &self.thread_labels, &self.reaction_boxes, &self_uid,
             &self.image_generation, &self.picker_cells,
         );
@@ -614,6 +628,7 @@ pub fn make_message_row(
     mention_cb: &Option<MentionCallback>,
     reaction_cb: &Option<ReactionCallback>,
     delete_cb: &Option<DeleteCallback>,
+    edit_cb: &Option<EditCallback>,
     channel_id: Option<&str>,
     thread_counts: &HashMap<String, usize>,
     thread_labels: &Rc<RefCell<HashMap<String, Label>>>,
@@ -714,27 +729,50 @@ pub fn make_message_row(
         header.append(&thread_btn);
     }
 
-    // Delete button (only for own messages)
+    // Edit & delete buttons (only for own messages)
     let is_own = msg.user.as_deref() == Some(self_user_id) && !self_user_id.is_empty();
     if is_own {
-        if let (Some(dcb), Some(cid)) = (delete_cb, channel_id) {
-            let del_btn = gtk::Button::from_icon_name("user-trash-symbolic");
-            del_btn.add_css_class("flat");
-            del_btn.add_css_class("delete-btn");
-            del_btn.set_halign(gtk::Align::End);
-            del_btn.set_tooltip_text(Some("Delete message"));
+        if let Some(cid) = channel_id {
+            // Edit button
+            if let Some(ecb) = edit_cb {
+                let edit_btn = gtk::Button::from_icon_name("document-edit-symbolic");
+                edit_btn.add_css_class("flat");
+                edit_btn.add_css_class("edit-btn");
+                edit_btn.set_halign(gtk::Align::End);
+                edit_btn.set_tooltip_text(Some("Edit message"));
 
-            let dcb = dcb.clone();
-            let cid = cid.to_string();
-            let ts = msg.ts.clone();
-            let row_weak = row.downgrade();
-            del_btn.connect_clicked(move |_| {
-                if let Some(row) = row_weak.upgrade() {
-                    dcb(&cid, &ts, &row);
-                }
-            });
+                let ecb = ecb.clone();
+                let cid_e = cid.to_string();
+                let ts = msg.ts.clone();
+                let text = msg.text.clone();
+                let outer_ref = outer.clone();
+                edit_btn.connect_clicked(move |_| {
+                    ecb(&cid_e, &ts, &text, &outer_ref);
+                });
 
-            header.append(&del_btn);
+                header.append(&edit_btn);
+            }
+
+            // Delete button
+            if let Some(dcb) = delete_cb {
+                let del_btn = gtk::Button::from_icon_name("user-trash-symbolic");
+                del_btn.add_css_class("flat");
+                del_btn.add_css_class("delete-btn");
+                del_btn.set_halign(gtk::Align::End);
+                del_btn.set_tooltip_text(Some("Delete message"));
+
+                let dcb = dcb.clone();
+                let cid_d = cid.to_string();
+                let ts = msg.ts.clone();
+                let row_weak = row.downgrade();
+                del_btn.connect_clicked(move |_| {
+                    if let Some(row) = row_weak.upgrade() {
+                        dcb(&cid_d, &ts, &row);
+                    }
+                });
+
+                header.append(&del_btn);
+            }
         }
     }
 

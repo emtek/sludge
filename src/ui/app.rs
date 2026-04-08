@@ -1052,6 +1052,145 @@ pub fn build_app(
         thread_panel.set_self_user_id(&user_id);
     }
 
+    // ── Edit message callback ──
+    {
+        let client = client.clone();
+        let rt = rt.clone();
+        let db = db.clone();
+        let window = window.clone();
+        let state = state.clone();
+        let edit_cb: crate::ui::message_view::EditCallback =
+            Rc::new(move |channel_id, message_ts, current_text, outer_box| {
+                let dialog = gtk::Window::builder()
+                    .title("Edit message")
+                    .modal(true)
+                    .transient_for(&window)
+                    .default_width(500)
+                    .default_height(200)
+                    .build();
+
+                let vbox = gtk::Box::new(gtk::Orientation::Vertical, 8);
+                vbox.set_margin_top(12);
+                vbox.set_margin_bottom(12);
+                vbox.set_margin_start(12);
+                vbox.set_margin_end(12);
+
+                let text_view = gtk::TextView::new();
+                text_view.set_hexpand(true);
+                text_view.set_vexpand(true);
+                text_view.set_wrap_mode(gtk::WrapMode::WordChar);
+                text_view.set_top_margin(6);
+                text_view.set_bottom_margin(6);
+                text_view.set_left_margin(6);
+                text_view.set_right_margin(6);
+                text_view.add_css_class("card");
+                text_view.buffer().set_text(current_text);
+
+                let scrolled = gtk::ScrolledWindow::new();
+                scrolled.set_vexpand(true);
+                scrolled.set_child(Some(&text_view));
+                vbox.append(&scrolled);
+
+                let btn_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+                btn_box.set_halign(gtk::Align::End);
+
+                let cancel_btn = gtk::Button::with_label("Cancel");
+                cancel_btn.add_css_class("flat");
+                let save_btn = gtk::Button::with_label("Save");
+                save_btn.add_css_class("suggested-action");
+
+                btn_box.append(&cancel_btn);
+                btn_box.append(&save_btn);
+                vbox.append(&btn_box);
+
+                dialog.set_child(Some(&vbox));
+
+                let dialog_weak = dialog.downgrade();
+                cancel_btn.connect_clicked(move |_| {
+                    if let Some(d) = dialog_weak.upgrade() {
+                        d.close();
+                    }
+                });
+
+                let c = client.clone();
+                let rt2 = rt.clone();
+                let db2 = db.clone();
+                let cid = channel_id.to_string();
+                let ts = message_ts.to_string();
+                let outer = outer_box.clone();
+                let state2 = state.clone();
+                let dialog_weak = dialog.downgrade();
+                save_btn.connect_clicked(move |btn| {
+                    let buf = text_view.buffer();
+                    let new_text = buf.text(&buf.start_iter(), &buf.end_iter(), false).to_string();
+                    if new_text.is_empty() {
+                        return;
+                    }
+                    btn.set_sensitive(false);
+                    let c = c.clone();
+                    let db2 = db2.clone();
+                    let cid = cid.clone();
+                    let ts = ts.clone();
+                    let new_text2 = new_text.clone();
+                    let outer = outer.clone();
+                    let state2 = state2.clone();
+                    let dialog_weak = dialog_weak.clone();
+                    rt2.spawn(async move {
+                        match c.update_message(&cid, &ts, &new_text2).await {
+                            Ok(()) => {
+                                // Update DB cache
+                                if let Some(mut msgs) = db2.load_messages(&cid).await {
+                                    if let Some(m) = msgs.iter_mut().find(|m| m.ts == ts) {
+                                        m.text = new_text2.clone();
+                                    }
+                                    let _ = db2.save_messages(&cid, &msgs).await;
+                                }
+                                // Update UI on main thread
+                                let new_text_ui = new_text2;
+                                gtk4::glib::idle_add_local_once(move || {
+                                    // Close dialog
+                                    if let Some(d) = dialog_weak.upgrade() {
+                                        d.close();
+                                    }
+                                    // Replace the body widget in the outer box
+                                    let st = state2.borrow();
+                                    let users = &st.user_names;
+                                    let subteam_names = &st.subteam_names;
+                                    // Find and remove the old body (second child, after header)
+                                    if let Some(header) = outer.first_child() {
+                                        if let Some(old_body) = header.next_sibling() {
+                                            // Only replace if it's the text body (Label or TextView), not attachments
+                                            if old_body.downcast_ref::<gtk::Label>().is_some()
+                                                || old_body.downcast_ref::<gtk::TextView>().is_some()
+                                            {
+                                                let new_body = crate::ui::message_view::make_message_body(
+                                                    &new_text_ui, users, subteam_names, &None,
+                                                );
+                                                outer.insert_child_after(&new_body, Some(&header));
+                                                outer.remove(&old_body);
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to edit message: {e}");
+                                gtk4::glib::idle_add_local_once(move || {
+                                    if let Some(d) = dialog_weak.upgrade() {
+                                        d.close();
+                                    }
+                                });
+                            }
+                        }
+                    });
+                });
+
+                dialog.present();
+            });
+        message_view.set_edit_callback(edit_cb.clone());
+        thread_panel.set_edit_callback(edit_cb);
+    }
+
     // ── Google Meet call button ──
     {
         let state = state.clone();
