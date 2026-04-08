@@ -39,9 +39,6 @@ echo "Installing D-Bus services..."
 sed "s|^Exec=.*|Exec=$BINARY|" \
     "$SCRIPTDIR/assets/dev.sludge.app.service" | \
     install -Dm644 /dev/stdin "$DATADIR/dbus-1/services/dev.sludge.app.service"
-sed "s|^Exec=.*|Exec=$BINARY --search-provider|" \
-    "$SCRIPTDIR/assets/dev.sludge.app.SearchProvider.service" | \
-    install -Dm644 /dev/stdin "$DATADIR/dbus-1/services/dev.sludge.app.SearchProvider.service"
 
 # Update icon cache if available
 if command -v gtk-update-icon-cache &>/dev/null; then

@@ -44,37 +44,6 @@ fn parse_startup_action() -> Option<StartupAction> {
 fn main() {
     tracing_subscriber::fmt::init();
 
-    // Run as headless D-Bus search provider if requested
-    if std::env::args().any(|a| a == "--search-provider") {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create tokio runtime");
-
-        let launch_args = rt.block_on(async {
-            let db = match Database::open(rt.handle()).await {
-                Ok(db) => Arc::new(db),
-                Err(e) => {
-                    eprintln!("Failed to open database: {e}");
-                    std::process::exit(1);
-                }
-            };
-            match search_provider::run_search_provider(db).await {
-                Ok(search_provider::SearchProviderExit::Launch(args)) => Some(args),
-                Ok(search_provider::SearchProviderExit::MainAppTookOver) => None,
-                Err(e) => {
-                    eprintln!("Search provider error: {e}");
-                    std::process::exit(1);
-                }
-            }
-        });
-        // DB is fully dropped here — safe to launch the main app
-        if let Some(args) = launch_args {
-            let _ = std::process::Command::new("sludge").args(&args).spawn();
-        }
-        return;
-    }
-
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

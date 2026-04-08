@@ -1,3 +1,0 @@
-[D-BUS Service]
-Name=dev.sludge.app.SearchProvider
-Exec=/home/emlyn/.local/bin/sludge --search-provider
