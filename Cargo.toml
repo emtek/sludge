@@ -1,6 +1,6 @@
 [package]
 name = "sludge"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "A native GTK4/libadwaita Slack client for the Linux desktop"
 license = "GPL-3.0-or-later"

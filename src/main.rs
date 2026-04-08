@@ -51,7 +51,7 @@ fn main() {
             .build()
             .expect("Failed to create tokio runtime");
 
-        rt.block_on(async {
+        let launch_args = rt.block_on(async {
             let db = match Database::open(rt.handle()).await {
                 Ok(db) => Arc::new(db),
                 Err(e) => {
@@ -59,11 +59,19 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            if let Err(e) = search_provider::run_search_provider(db).await {
-                eprintln!("Search provider error: {e}");
-                std::process::exit(1);
+            match search_provider::run_search_provider(db).await {
+                Ok(search_provider::SearchProviderExit::Launch(args)) => Some(args),
+                Ok(search_provider::SearchProviderExit::MainAppTookOver) => None,
+                Err(e) => {
+                    eprintln!("Search provider error: {e}");
+                    std::process::exit(1);
+                }
             }
         });
+        // DB is fully dropped here — safe to launch the main app
+        if let Some(args) = launch_args {
+            let _ = std::process::Command::new("sludge").args(&args).spawn();
+        }
         return;
     }
 

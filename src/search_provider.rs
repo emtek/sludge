@@ -3,8 +3,6 @@ use std::sync::Arc;
 
 use zbus::zvariant::{OwnedValue, Value};
 
-use gtk4::prelude::*;
-
 use crate::db::Database;
 
 /// Helper to convert a string into an OwnedValue for D-Bus `a{sv}` dicts.
@@ -15,11 +13,33 @@ fn str_val(s: impl Into<String>) -> OwnedValue {
 
 pub struct SearchProvider {
     db: Arc<Database>,
+    /// When running as a headless process, sending args here signals the run loop
+    /// to shut down (releasing the DB lock) and launch the main app with these args.
+    launch_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<String>>>,
 }
 
 impl SearchProvider {
     pub fn new(db: Arc<Database>) -> Self {
-        Self { db }
+        Self { db, launch_tx: None }
+    }
+
+    pub fn new_headless(db: Arc<Database>, launch_tx: tokio::sync::mpsc::UnboundedSender<Vec<String>>) -> Self {
+        Self { db, launch_tx: Some(launch_tx) }
+    }
+
+    /// Launch the main app, either by signaling the headless run loop to exit first
+    /// (so it releases the DB lock), or by spawning directly (when running in-process).
+    fn launch_app(&self, args: Vec<String>) {
+        if let Some(tx) = &self.launch_tx {
+            // Headless mode: signal shutdown so DB is released before the app starts
+            let _ = tx.send(args);
+        } else {
+            // In-process: GTK single-instance will forward to the running app.
+            // Wait in a background thread so the child doesn't become a zombie.
+            if let Ok(mut child) = std::process::Command::new("sludge").args(&args).spawn() {
+                std::thread::spawn(move || { let _ = child.wait(); });
+            }
+        }
     }
 }
 
@@ -166,27 +186,12 @@ impl SearchProvider {
     }
 
     async fn activate_result(&self, identifier: String, _terms: Vec<String>, _timestamp: u32) {
-        // Pass the full identifier — the navigate action knows how to parse all prefixes
-        let nav_param = identifier.clone();
-
-        // Dispatch to the GLib main context (main thread) where the GApplication lives.
-        // We use invoke() rather than idle_add_local_once() because this runs on the tokio thread.
-        gtk4::glib::MainContext::default().invoke(move || {
-            if let Some(app) = gtk4::gio::Application::default() {
-                app.activate_action("navigate", Some(&nav_param.to_variant()));
-            } else {
-                tracing::warn!("No default GApplication to activate navigate action");
-            }
-        });
+        self.launch_app(vec!["--open".into(), identifier]);
     }
 
     async fn launch_search(&self, terms: Vec<String>, _timestamp: u32) {
         let query = terms.join(" ");
-        // Fall back to spawning the process since there's no "search" action yet
-        let _ = std::process::Command::new("sludge")
-            .arg("--search")
-            .arg(&query)
-            .spawn();
+        self.launch_app(vec!["--search".into(), query]);
     }
 }
 
@@ -205,10 +210,49 @@ pub async fn register_search_provider(db: Arc<Database>) -> Result<zbus::Connect
     Ok(connection)
 }
 
-pub async fn run_search_provider(db: Arc<Database>) -> Result<(), Box<dyn std::error::Error>> {
-    let _connection = register_search_provider(db).await?;
+/// Reason the headless search provider exited.
+pub enum SearchProviderExit {
+    /// The main app appeared on D-Bus — no further action needed.
+    MainAppTookOver,
+    /// A search result was activated — launch the main app with these args.
+    Launch(Vec<String>),
+}
 
-    // Keep the connection alive
-    std::future::pending::<()>().await;
-    Ok(())
+/// Run the headless search provider until the main app takes over or a result is activated.
+pub async fn run_search_provider(db: Arc<Database>) -> Result<SearchProviderExit, Box<dyn std::error::Error>> {
+    let (launch_tx, mut launch_rx) = tokio::sync::mpsc::unbounded_channel();
+    let provider = SearchProvider::new_headless(db, launch_tx);
+
+    let _connection = zbus::connection::Builder::session()?
+        .name("dev.sludge.app.SearchProvider")?
+        .serve_at("/dev/sludge/app/SearchProvider", provider)?
+        .build()
+        .await?;
+
+    tracing::info!("Headless search provider registered on D-Bus");
+
+    // Watch for the main app to appear on D-Bus
+    let monitor = zbus::Connection::session().await?;
+    let proxy = zbus::fdo::DBusProxy::new(&monitor).await?;
+    let mut name_stream = proxy.receive_name_owner_changed().await?;
+
+    use futures_util::StreamExt;
+    let exit = tokio::select! {
+        Some(args) = launch_rx.recv() => SearchProviderExit::Launch(args),
+        _ = async {
+            while let Some(signal) = name_stream.next().await {
+                if let Ok(args) = signal.args() {
+                    if args.name.as_str() == "dev.sludge.app"
+                        && args.new_owner.as_ref().is_some_and(|o| !o.is_empty())
+                    {
+                        tracing::info!("Main app appeared on D-Bus, search provider exiting");
+                        return;
+                    }
+                }
+            }
+        } => SearchProviderExit::MainAppTookOver,
+    };
+
+    // _connection is dropped here, releasing the D-Bus name and the Arc<Database>
+    Ok(exit)
 }
