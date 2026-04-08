@@ -225,7 +225,7 @@ pub fn show(
             }
 
             if let Ok(Ok(bytes)) = bytes_result {
-                let gbytes = glib::Bytes::from(&bytes);
+                let gbytes = glib::Bytes::from_owned(bytes);
                 let stream = gtk4::gio::MemoryInputStream::from_bytes(&gbytes);
                 // Decode at full resolution
                 match gtk4::gdk_pixbuf::Pixbuf::from_stream(
@@ -236,10 +236,6 @@ pub fn show(
                         if closed.get() { return; }
                         let w = pixbuf.width() as f64;
                         let h = pixbuf.height() as f64;
-                        tracing::info!(
-                            "[MEM] Full-res image decoded: {w}x{h} = {:.2} MiB",
-                            (w * h * 4.0) / 1048576.0
-                        );
                         let texture = gdk::Texture::for_pixbuf(&pixbuf);
                         img_w.set(w);
                         img_h.set(h);

@@ -2,7 +2,7 @@ use gtk4::prelude::*;
 use gtk4::{self as gtk, Application, ApplicationWindow, Label};
 use gtk4::gio;
 use slacko::types::{Channel, Message};
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -46,8 +46,10 @@ pub enum StartupAction {
 /// Shared application state accessible from GTK callbacks.
 struct AppState {
     channels: Vec<Channel>,
-    /// Map from user ID to display name.
-    user_names: HashMap<String, String>,
+    /// Map from user ID to display name (Rc-wrapped for cheap cloning).
+    user_names: Rc<HashMap<String, String>>,
+    /// Map from subteam/usergroup ID to @handle.
+    subteam_names: Rc<HashMap<String, String>>,
     /// The authenticated user's ID.
     self_user_id: String,
     /// Currently selected channel ID.
@@ -60,6 +62,8 @@ struct AppState {
     pending_scroll: Option<String>,
     /// (thread_ts, reply_ts) to open thread panel and scroll to after channel load.
     pending_thread: Option<(String, String)>,
+    /// Timestamps of messages we sent optimistically (to suppress socket duplicates).
+    sent_ts: std::collections::HashSet<String>,
 }
 
 pub fn build_app(
@@ -402,13 +406,15 @@ pub fn build_app(
 
     let state = Rc::new(RefCell::new(AppState {
         channels: Vec::new(),
-        user_names: HashMap::new(),
+        user_names: Rc::new(HashMap::new()),
+        subteam_names: Rc::new(HashMap::new()),
         self_user_id: user_id.clone(),
         current_channel: None,
         current_thread: None,
         unread_counts: HashMap::new(),
         pending_scroll: None,
         pending_thread: None,
+        sent_ts: std::collections::HashSet::new(),
     }));
 
     // Flag to suppress presence API calls during initial load
@@ -498,7 +504,7 @@ pub fn build_app(
                         .unwrap();
 
                     if let Ok(bytes) = res {
-                        let gbytes = gtk4::glib::Bytes::from(&bytes);
+                        let gbytes = gtk4::glib::Bytes::from_owned(bytes);
                         let stream = gtk4::gio::MemoryInputStream::from_bytes(&gbytes);
                         if let Ok(pixbuf) = gtk4::gdk_pixbuf::Pixbuf::from_stream(
                             &stream,
@@ -737,7 +743,8 @@ pub fn build_app(
                     tracing::warn!("No DM channel found for user {user_id}");
                 }
             });
-        message_view.set_mention_callback(mention_cb);
+        message_view.set_mention_callback(mention_cb.clone());
+        thread_panel.set_mention_callback(mention_cb);
     }
 
     // ── Reaction callback: add/remove reaction via API ──
@@ -1045,6 +1052,42 @@ pub fn build_app(
         thread_panel.set_self_user_id(&user_id);
     }
 
+    // ── Google Meet call button ──
+    {
+        let state = state.clone();
+        let client = client.clone();
+        let rt = rt.clone();
+        message_view.call_button.connect_clicked(move |_| {
+            let channel = match state.borrow().current_channel.clone() {
+                Some(c) => c,
+                None => return,
+            };
+            let client = client.clone();
+            let rt2 = rt.clone();
+            gtk4::glib::spawn_future_local(async move {
+                let c = client.clone();
+                let ch = channel.clone();
+                let result = rt2
+                    .spawn(async move { c.calls_request(&ch).await })
+                    .await
+                    .unwrap();
+                match result {
+                    Ok(url) => {
+                        if let Err(e) = gtk4::gio::AppInfo::launch_default_for_uri(
+                            &url,
+                            gtk4::gio::AppLaunchContext::NONE,
+                        ) {
+                            tracing::error!("Failed to open Meet URL: {e}");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to request call: {e}");
+                    }
+                }
+            });
+        });
+    }
+
     // ── Infinite scroll: load older messages when scrolling to top ──
     {
         let mv = message_view.clone();
@@ -1142,7 +1185,7 @@ pub fn build_app(
                 let cid = channel_id.clone();
                 let tts = thread_ts.clone();
                 let txt = text.clone();
-                let result = rt2
+                let sent_ts = rt2
                     .spawn(async move {
                         // Upload files first
                         for path in &files {
@@ -1166,36 +1209,45 @@ pub fn build_app(
                                 }
                             }
                         }
-                        // If no files, just send a text message
+                        // If no files, just send a text message and return the ts
                         if files.is_empty() && !txt.trim().is_empty() {
-                            c.post_message(&cid, &txt, Some(&tts)).await
+                            match c.post_message(&cid, &txt, Some(&tts)).await {
+                                Ok(ts) => Some(ts),
+                                Err(e) => {
+                                    tracing::error!("Failed to send thread reply: {e}");
+                                    None
+                                }
+                            }
                         } else {
-                            Ok(())
+                            None
                         }
                     })
                     .await
-                    .unwrap();
+                    .unwrap_or(None);
 
-                if let Err(e) = result {
-                    tracing::error!("Failed to send thread reply: {e}");
-                    return;
+                // Optimistically append the sent message so it's visible immediately
+                if let Some(ts) = sent_ts {
+                    state2.borrow_mut().sent_ts.insert(ts.clone());
+                    if !list_has_ts(&tp.list_box, &ts) {
+                        let st = state2.borrow();
+                        let self_uid = st.self_user_id.clone();
+                        let users = st.user_names.clone();
+                        drop(st);
+                        let msg = Message {
+                            msg_type: "message".into(),
+                            user: Some(self_uid),
+                            bot_id: None,
+                            text,
+                            ts,
+                            thread_ts: Some(thread_ts),
+                            channel: Some(channel_id),
+                            attachments: None,
+                            reactions: None,
+                            files: None,
+                        };
+                        tp.append_message(&msg, &users, &client2, &rt3);
+                    }
                 }
-
-                // Append the sent message locally
-                let msg = Message {
-                    msg_type: "message".into(),
-                    user: None,
-                    bot_id: None,
-                    text,
-                    ts: String::new(),
-                    thread_ts: Some(thread_ts),
-                    channel: Some(channel_id),
-                    attachments: None,
-                    reactions: None,
-                    files: None,
-                };
-                let users = state2.borrow().user_names.clone();
-                tp.append_message(&msg, &users, &client2, &rt3);
             });
         };
 
@@ -1207,10 +1259,15 @@ pub fn build_app(
 
         let key_controller = gtk::EventControllerKey::new();
         let do_reply_key = do_reply.clone();
+        let tv = thread_panel.text_view.clone();
         key_controller.connect_key_pressed(move |_, key, _, modifier| {
-            if key == gtk4::gdk::Key::Return
-                && modifier.contains(gtk4::gdk::ModifierType::CONTROL_MASK)
-            {
+            if key == gtk4::gdk::Key::Return || key == gtk4::gdk::Key::KP_Enter {
+                if modifier.contains(gtk4::gdk::ModifierType::SHIFT_MASK)
+                    || modifier.contains(gtk4::gdk::ModifierType::CONTROL_MASK)
+                {
+                    tv.buffer().insert_at_cursor("\n");
+                    return gtk4::glib::Propagation::Stop;
+                }
                 do_reply_key();
                 return gtk4::glib::Propagation::Stop;
             }
@@ -1316,7 +1373,7 @@ pub fn build_app(
                 sidebar.set_all_status(status_emoji_map, status_text_map);
                 message_input.set_mention_users(&names);
                 thread_panel.set_mention_users(&names);
-                state.borrow_mut().user_names = names;
+                state.borrow_mut().user_names = Rc::new(names);
             }
 
             // Subscribe to presence for DM user IDs
@@ -1361,7 +1418,8 @@ pub fn build_app(
 
                 let client2 = client.clone();
                 let rt2 = rt.clone();
-                let (ch_result, usr_result) = rt2
+                let fetch_subteams = state.borrow().subteam_names.is_empty();
+                let (ch_result, usr_result, subteam_result) = rt2
                     .spawn(async move {
                         let ch = if fetch_channels {
                             Some(client2.conversations_list_all().await)
@@ -1373,7 +1431,12 @@ pub fn build_app(
                         } else {
                             None
                         };
-                        (ch, us)
+                        let st: Option<Result<HashMap<String, String>, String>> = if fetch_subteams {
+                            Some(client2.usergroups_list().await)
+                        } else {
+                            None
+                        };
+                        (ch, us, st)
                     })
                     .await
                     .unwrap();
@@ -1446,7 +1509,7 @@ pub fn build_app(
                     sidebar.set_all_status(status_emoji_map, status_text_map);
                     message_input.set_mention_users(&names);
                     thread_panel.set_mention_users(&names);
-                    state.borrow_mut().user_names = names;
+                    state.borrow_mut().user_names = Rc::new(names);
 
                     // Rebuild sidebar now that user names are available for DMs
                     if have_cache {
@@ -1467,6 +1530,16 @@ pub fn build_app(
                         crate::ui::login::show_login(&app_logout, rt, db);
                         return;
                     }
+                }
+
+                if let Some(Ok(subteams)) = subteam_result {
+                    tracing::info!("Loaded {} subteam names", subteams.len());
+                    let names = Rc::new(subteams);
+                    message_view.set_subteam_names(names.clone());
+                    thread_panel.set_subteam_names(names.clone());
+                    state.borrow_mut().subteam_names = names;
+                } else if let Some(Err(e)) = subteam_result {
+                    tracing::error!("Failed to load usergroups: {e}");
                 }
             }
 
@@ -1910,6 +1983,7 @@ pub fn build_app(
         let input = message_input.clone();
         let rt_send = rt.clone();
         let client_send = client.clone();
+        let message_view_send = message_view.clone();
 
         let do_send = move || {
             let text = input.get_text();
@@ -1927,11 +2001,15 @@ pub fn build_app(
 
             let client = client_send.clone();
             let rt2 = rt_send.clone();
+            let mv = message_view_send.clone();
+            let state2 = state_send.clone();
+            let client2 = client_send.clone();
+            let rt3 = rt_send.clone();
             gtk4::glib::spawn_future_local(async move {
                 let c = client.clone();
                 let ch = channel.clone();
                 let txt = text.clone();
-                let _ = rt2
+                let sent_ts = rt2
                     .spawn(async move {
                         // Upload files first
                         for path in &files {
@@ -1956,12 +2034,47 @@ pub fn build_app(
                                 }
                             }
                         }
-                        // If no files, just send a text message
+                        // If no files, just send a text message and return the ts
                         if files.is_empty() && !txt.trim().is_empty() {
-                            let _ = c.post_message(&ch, &txt, None).await;
+                            match c.post_message(&ch, &txt, None).await {
+                                Ok(ts) => Some(ts),
+                                Err(e) => {
+                                    tracing::error!("Failed to send message: {e}");
+                                    None
+                                }
+                            }
+                        } else {
+                            None
                         }
                     })
-                    .await;
+                    .await
+                    .unwrap_or(None);
+
+                // Optimistically append the sent message so it's visible immediately
+                if let Some(ts) = sent_ts {
+                    state2.borrow_mut().sent_ts.insert(ts.clone());
+                    // If the socket event already added this message while we
+                    // were awaiting the API call, don't add it again.
+                    if !list_has_ts(&mv.list_box, &ts) {
+                        let st = state2.borrow();
+                        let self_uid = st.self_user_id.clone();
+                        let users = st.user_names.clone();
+                        drop(st);
+                        let msg = Message {
+                            msg_type: "message".into(),
+                            user: Some(self_uid),
+                            bot_id: None,
+                            text,
+                            ts,
+                            thread_ts: None,
+                            channel: Some(channel),
+                            attachments: None,
+                            reactions: None,
+                            files: None,
+                        };
+                        mv.append_message(&msg, &users, &client2, &rt3);
+                    }
+                }
             });
         };
 
@@ -1971,13 +2084,18 @@ pub fn build_app(
             do_send_clone();
         });
 
-        // Ctrl+Enter to send
+        // Enter to send, Shift+Enter or Ctrl+Enter to insert newline
         let key_controller = gtk::EventControllerKey::new();
         let do_send_key = do_send.clone();
+        let tv = message_input.text_view.clone();
         key_controller.connect_key_pressed(move |_, key, _, modifier| {
-            if key == gtk4::gdk::Key::Return
-                && modifier.contains(gtk4::gdk::ModifierType::CONTROL_MASK)
-            {
+            if key == gtk4::gdk::Key::Return || key == gtk4::gdk::Key::KP_Enter {
+                if modifier.contains(gtk4::gdk::ModifierType::SHIFT_MASK)
+                    || modifier.contains(gtk4::gdk::ModifierType::CONTROL_MASK)
+                {
+                    tv.buffer().insert_at_cursor("\n");
+                    return gtk4::glib::Propagation::Stop;
+                }
                 do_send_key();
                 return gtk4::glib::Propagation::Stop;
             }
@@ -2023,6 +2141,7 @@ pub fn build_app(
                         text,
                         ts,
                         thread_ts,
+                        files,
                     } => {
                         let msg = Message {
                             msg_type: "message".into(),
@@ -2034,18 +2153,43 @@ pub fn build_app(
                             channel: Some(channel.clone()),
                             attachments: None,
                             reactions: None,
-                            files: None,
+                            files,
                         };
 
-                        let current = state.borrow().current_channel.clone();
-                        let current_thread = state.borrow().current_thread.clone();
+                        // Skip messages we already appended optimistically
+                        if state.borrow_mut().sent_ts.remove(&msg.ts) {
+                            // Still need to cache, update activity, and ensure scroll
+                            let is_current = state.borrow().current_channel.as_deref() == Some(&channel);
+                            if is_current {
+                                message_view.scroll_to_bottom();
+                            }
+                            sidebar.update_activity(&channel, &msg.ts);
+                            let db2 = db.clone();
+                            let msg2 = msg.clone();
+                            let cid = channel.clone();
+                            let ts = msg.ts.clone();
+                            rt_rt.spawn(async move {
+                                db2.append_message(&cid, &msg2).await;
+                                db2.index_messages(&cid, &[msg2]).await;
+                                db2.update_channel_activity(&cid, &ts).await;
+                            });
+                            continue;
+                        }
+
+                        let (current, current_thread, users) = {
+                            let st = state.borrow();
+                            (
+                                st.current_channel.clone(),
+                                st.current_thread.clone(),
+                                st.user_names.clone(), // Rc clone, O(1)
+                            )
+                        };
 
                         // Append to thread panel if the message belongs to the open thread
                         if let Some((tts, tcid)) = &current_thread {
                             if *tcid == channel
                                 && thread_ts.as_deref() == Some(tts.as_str())
                             {
-                                let users = state.borrow().user_names.clone();
                                 thread_panel.append_message(
                                     &msg, &users, &client_rt, &rt_rt,
                                 );
@@ -2070,13 +2214,12 @@ pub fn build_app(
                         }
 
                         // Append to main message view if in current channel
-                        // (skip thread replies that aren't top-level)
+                        // (skip thread replies that aren't top-level, skip already-displayed messages)
                         if is_current {
                             let is_thread_reply = thread_ts
                                 .as_ref()
                                 .is_some_and(|tts| *tts != msg.ts);
                             if !is_thread_reply {
-                                let users = state.borrow().user_names.clone();
                                 message_view.append_message(
                                     &msg, &users, &client_rt, &rt_rt,
                                 );
@@ -2134,7 +2277,7 @@ pub fn build_app(
                                     }
                                 })
                                 .unwrap_or_else(|| channel.clone());
-                            let plain_text = format_message_plain(&text, &st.user_names);
+                            let plain_text = format_message_plain(&text, &st.user_names, &st.subteam_names);
                             drop(st);
 
                             let title = format!("{sender} in #{channel_name}");
@@ -2152,12 +2295,13 @@ pub fn build_app(
                                 // Play notification sound
                                 let _ = tokio::process::Command::new("canberra-gtk-play")
                                     .arg("-i").arg("message-new-instant")
-                                    .arg("-d").arg("Slag notification")
+                                    .arg("-d").arg("Sludge notification")
                                     .spawn();
 
                                 let mut child = match tokio::process::Command::new("notify-send")
-                                    .arg("--app-name=Slag")
+                                    .arg("--app-name=Sludge")
                                     .arg("--urgency=normal")
+                                    .arg("--expire-time=15000")
                                     .arg("--action=default=Open")
                                     .arg("--wait")
                                     .arg(&title)
@@ -2202,17 +2346,14 @@ pub fn build_app(
                     SlackEvent::PresenceChange { user, presence } => {
                         tracing::debug!("Presence change: {user} -> {presence}");
                         let is_active = presence == "active";
-                        let is_self = user.is_empty() || state.borrow().self_user_id == user;
+                        let self_uid = state.borrow().self_user_id.clone();
+                        let is_self = user.is_empty() || self_uid == user;
                         if is_self {
                             *presence_active.borrow_mut() = is_active;
                             profile_avatar.queue_draw();
                         }
                         // Resolve effective user ID (manual_presence_change has empty user)
-                        let effective_uid = if user.is_empty() {
-                            state.borrow().self_user_id.clone()
-                        } else {
-                            user.clone()
-                        };
+                        let effective_uid = if user.is_empty() { self_uid } else { user.clone() };
                         sidebar.set_presence(&effective_uid, is_active);
 
                         // Notify if this user is on the watch list and came online
@@ -2237,11 +2378,11 @@ pub fn build_app(
                                     // Play notification sound
                                     let _ = tokio::process::Command::new("canberra-gtk-play")
                                         .arg("-i").arg("message-new-instant")
-                                        .arg("-d").arg("Slag notification")
+                                        .arg("-d").arg("Sludge notification")
                                         .spawn();
 
                                     let mut child = match tokio::process::Command::new("notify-send")
-                                        .arg("--app-name=Slag")
+                                        .arg("--app-name=Sludge")
                                         .arg("--urgency=normal")
                                         .arg("--action=default=Open")
                                         .arg("--wait")
@@ -2289,9 +2430,7 @@ pub fn build_app(
                             .filter(|n| !n.is_empty())
                             .or_else(|| profile.get("real_name").and_then(|v| v.as_str()))
                         {
-                            state
-                                .borrow_mut()
-                                .user_names
+                            Rc::make_mut(&mut state.borrow_mut().user_names)
                                 .insert(user.clone(), display_name.to_string());
                         }
 
@@ -2342,7 +2481,7 @@ pub fn build_app(
                                     .unwrap();
 
                                 if let Ok(bytes) = res {
-                                    let gbytes = gtk4::glib::Bytes::from(&bytes);
+                                    let gbytes = gtk4::glib::Bytes::from_owned(bytes);
                                     let stream =
                                         gtk4::gio::MemoryInputStream::from_bytes(&gbytes);
                                     if let Ok(pixbuf) =
@@ -2376,19 +2515,25 @@ pub fn build_app(
                         }).await;
 
                         if let Ok(Some(reactions)) = updated {
-                            let is_current = state2.borrow().current_channel.as_deref() == Some(&channel);
+                            let (is_current, users) = {
+                                let st = state2.borrow();
+                                (st.current_channel.as_deref() == Some(&channel), st.user_names.clone())
+                            };
                             if is_current {
-                                let users = state2.borrow().user_names.clone();
                                 message_view2.update_reactions(&message_ts, &reactions, &users);
                                 thread_panel2.update_reactions(&message_ts, &reactions, &users);
                             }
                         }
                     }
-                    SlackEvent::UserTyping { channel, user, thread_ts: _ } => {
-                        let current = state.borrow().current_channel.clone();
-                        if current.as_deref() == Some(&channel) {
-                            let name = state.borrow().user_names.get(&user).cloned()
+                    SlackEvent::UserTyping { channel, user } => {
+                        let (is_current, name) = {
+                            let st = state.borrow();
+                            let is_current = st.current_channel.as_deref() == Some(&channel);
+                            let name = st.user_names.get(&user).cloned()
                                 .unwrap_or_else(|| "Someone".into());
+                            (is_current, name)
+                        };
+                        if is_current {
                             let tl = &message_view.typing_label;
                             tl.set_text(&format!("{name} is typing..."));
                             tl.set_visible(true);
@@ -2441,10 +2586,32 @@ pub fn build_app(
         });
     }
 
+    // Focus channel search when window gains focus
+    {
+        let search_entry = sidebar.search_entry.clone();
+        window.connect_is_active_notify(move |win| {
+            if win.is_active() {
+                search_entry.grab_focus();
+            }
+        });
+    }
+
     // Apply CSS
     load_css();
 
     window.present();
+}
+
+/// Check if a ListBox already contains a row with the given widget name (ts).
+fn list_has_ts(list_box: &gtk::ListBox, ts: &str) -> bool {
+    let mut idx = 0;
+    while let Some(row) = list_box.row_at_index(idx) {
+        if row.widget_name() == ts {
+            return true;
+        }
+        idx += 1;
+    }
+    false
 }
 
 /// Build emoji path map from cached DB data (name → local path or "alias:name").

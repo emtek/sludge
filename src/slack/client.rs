@@ -1,8 +1,6 @@
+use std::collections::HashMap;
 use reqwest::header::{HeaderMap, HeaderValue, COOKIE};
-use slacko::api::chat::PostMessageRequest;
-use slacko::api::conversations::{ConversationHistoryRequest, ListConversationsRequest};
 use slacko::types::{Channel, Message, User};
-use slacko::{AuthConfig, SlackClient};
 use tracing::{debug, error, info};
 
 /// Generic Slack API response envelope for stealth-mode raw HTTP calls.
@@ -43,7 +41,9 @@ struct RawUsersList {
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct RawPostMessage {}
+struct RawPostMessage {
+    ts: String,
+}
 
 #[derive(Debug, serde::Deserialize)]
 struct RawProfileResponse {
@@ -53,6 +53,22 @@ struct RawProfileResponse {
 #[derive(Debug, serde::Deserialize)]
 struct RawPresenceResponse {
     presence: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RawCallsRequest {
+    url: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RawUsergroupsList {
+    usergroups: Vec<RawUsergroup>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RawUsergroup {
+    id: String,
+    handle: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -76,21 +92,9 @@ struct StealthCreds {
 }
 
 #[derive(Clone)]
-enum Backend {
-    /// Uses slacko for all API calls (bot/oauth tokens).
-    Slacko(SlackClient),
-    /// Uses raw reqwest with workspace-specific URL (stealth/xoxc tokens).
-    Stealth {
-        http: reqwest::Client,
-        creds: StealthCreds,
-    },
-}
-
-#[derive(Clone)]
 pub struct Client {
-    backend: Backend,
-    /// Separate slacko client using the app-level token for Socket Mode.
-    app_token_client: Option<SlackClient>,
+    http: reqwest::Client,
+    creds: StealthCreds,
 }
 
 /// Public auth test result that both backends can produce.
@@ -105,57 +109,30 @@ pub struct AuthInfo {
 }
 
 impl Client {
-    /// Create a client using slacko (for bot/oauth tokens).
-    pub fn new_bot(auth: AuthConfig, app_token: Option<String>) -> Self {
-        let inner = SlackClient::new(auth).expect("Failed to create Slack client");
-        let app_token_client = app_token.map(|t| {
-            SlackClient::new(AuthConfig::bot(&t)).expect("Failed to create app token client")
-        });
+    pub fn new(xoxc_token: String, xoxd_cookie: String, workspace_url: Option<String>) -> Self {
         Self {
-            backend: Backend::Slacko(inner),
-            app_token_client,
-        }
-    }
-
-    /// Create a client using raw HTTP for stealth (xoxc/xoxd) auth.
-    pub fn new_stealth(xoxc_token: String, xoxd_cookie: String, workspace_url: Option<String>) -> Self {
-        let http = reqwest::Client::new();
-        Self {
-            backend: Backend::Stealth {
-                http,
-                creds: StealthCreds {
-                    xoxc_token,
-                    xoxd_cookie,
-                    workspace_url,
-                },
+            http: reqwest::Client::new(),
+            creds: StealthCreds {
+                xoxc_token,
+                xoxd_cookie,
+                workspace_url,
             },
-            app_token_client: None,
         }
     }
 
-    pub fn socket_mode_client(&self) -> Option<&SlackClient> {
-        self.app_token_client.as_ref()
-    }
-
-    /// Returns stealth credentials for RTM if using stealth backend.
-    /// Returns (http_client, xoxc_token, xoxd_cookie, workspace_url).
-    pub fn stealth_rtm_params(
-        &self,
-    ) -> Option<(reqwest::Client, String, String, Option<String>)> {
-        match &self.backend {
-            Backend::Stealth { http, creds } => Some((
-                http.clone(),
-                creds.xoxc_token.clone(),
-                creds.xoxd_cookie.clone(),
-                creds.workspace_url.clone(),
-            )),
-            _ => None,
-        }
+    /// Returns RTM connection parameters.
+    pub fn rtm_params(&self) -> (reqwest::Client, String, String, Option<String>) {
+        (
+            self.http.clone(),
+            self.creds.xoxc_token.clone(),
+            self.creds.xoxd_cookie.clone(),
+            self.creds.workspace_url.clone(),
+        )
     }
 
     /// Fetch image bytes with local disk caching.
     /// Cached files are stored under `~/.local/share/sludge/image_cache/`.
-    pub async fn fetch_image_bytes(&self, url: &str) -> Result<Vec<u8>, String> {
+    pub async fn fetch_image_bytes(&self, url: &str) -> Result<bytes::Bytes, String> {
         use std::hash::{Hash, Hasher};
 
         // Build a deterministic cache path from the URL
@@ -172,7 +149,7 @@ impl Client {
         // Return cached bytes if available
         if let Ok(bytes) = tokio::fs::read(&cache_path).await {
             tracing::debug!("Image cache HIT: {}", cache_path.display());
-            return Ok(bytes);
+            return Ok(bytes::Bytes::from(bytes));
         }
 
         // Fetch from network, then cache
@@ -187,7 +164,7 @@ impl Client {
     }
 
     /// Fetch raw bytes from a URL, adding auth headers for Slack-hosted private URLs.
-    async fn fetch_image_bytes_uncached(&self, url: &str) -> Result<Vec<u8>, String> {
+    async fn fetch_image_bytes_uncached(&self, url: &str) -> Result<bytes::Bytes, String> {
         let is_slack_url = url.contains("slack.com") || url.contains("slack-files.com");
 
         let http = reqwest::Client::builder()
@@ -196,16 +173,9 @@ impl Client {
             .map_err(|e| format!("HTTP client error: {e}"))?;
 
         let req = if is_slack_url {
-            match &self.backend {
-                Backend::Stealth { creds, .. } => {
-                    // File hosts (files.slack.com, files-origin.slack.com) need
-                    // Bearer auth rather than cookie + form token.
-                    http.get(url)
-                        .bearer_auth(&creds.xoxc_token)
-                        .headers(Self::stealth_headers(creds))
-                }
-                Backend::Slacko(_) => http.get(url),
-            }
+            http.get(url)
+                .bearer_auth(&self.creds.xoxc_token)
+                .headers(Self::stealth_headers(&self.creds))
         } else {
             http.get(url)
         };
@@ -216,7 +186,6 @@ impl Client {
         }
         resp.bytes()
             .await
-            .map(|b| b.to_vec())
             .map_err(|e| format!("Image read error: {e}"))
     }
 
@@ -286,117 +255,61 @@ impl Client {
 
     pub async fn auth_test(&mut self) -> Result<AuthInfo, String> {
         info!("Calling auth.test...");
-        match &mut self.backend {
-            Backend::Slacko(inner) => {
-                let r = inner.auth().test().await.map_err(|e| format!("Auth error: {e}"))?;
-                info!("auth.test OK — user: {}, team: {}, url: {}", r.user, r.team, r.url);
-                Ok(AuthInfo {
-                    url: r.url,
-                    team: r.team,
-                    user: r.user,
-                    team_id: r.team_id,
-                    user_id: r.user_id,
-                })
-            }
-            Backend::Stealth { http, creds } => {
-                let r: RawAuthTest =
-                    Self::stealth_post(http, creds, "auth.test", &[]).await?;
-                let url = r.url.unwrap_or_default();
-                let team = r.team.unwrap_or_default();
-                let user = r.user.unwrap_or_default();
-                let team_id = r.team_id.unwrap_or_default();
-                let user_id = r.user_id.unwrap_or_default();
+        let r: RawAuthTest =
+            Self::stealth_post(&self.http, &self.creds, "auth.test", &[]).await?;
+        let url = r.url.unwrap_or_default();
+        let team = r.team.unwrap_or_default();
+        let user = r.user.unwrap_or_default();
+        let team_id = r.team_id.unwrap_or_default();
+        let user_id = r.user_id.unwrap_or_default();
 
-                info!("auth.test OK — user: {user}, team: {team}, url: {url}");
+        info!("auth.test OK — user: {user}, team: {team}, url: {url}");
 
-                // Discover workspace URL for subsequent calls
-                if !url.is_empty() {
-                    let ws_url = url.trim_end_matches('/').to_string();
-                    info!("Setting workspace base URL to: {ws_url}");
-                    creds.workspace_url = Some(ws_url);
-                }
-
-                Ok(AuthInfo { url, team, user, team_id, user_id })
-            }
+        if !url.is_empty() {
+            let ws_url = url.trim_end_matches('/').to_string();
+            info!("Setting workspace base URL to: {ws_url}");
+            self.creds.workspace_url = Some(ws_url);
         }
+
+        Ok(AuthInfo { url, team, user, team_id, user_id })
     }
 
     // ── Conversations ──
 
     pub async fn conversations_list_all(&self) -> Result<Vec<Channel>, String> {
         info!("Calling conversations.list (paginated)...");
-        match &self.backend {
-            Backend::Slacko(inner) => {
-                let mut all = Vec::new();
-                let mut cursor: Option<String> = None;
-                let mut page = 0u32;
-                loop {
-                    page += 1;
-                    debug!("conversations.list page {page}");
-                    let req = ListConversationsRequest {
-                        types: Some("public_channel,private_channel,im,mpim".to_string()),
-                        exclude_archived: Some(true),
-                        limit: Some(200),
-                        cursor: cursor.clone(),
-                    };
-                    let data = inner
-                        .conversations()
-                        .list_with_options(req)
-                        .await
-                        .map_err(|e| {
-                            error!("conversations.list failed on page {page}: {e}");
-                            format!("API error: {e}")
-                        })?;
-                    let count = data.channels.len();
-                    debug!("conversations.list page {page} returned {count} channels");
-                    all.extend(data.channels);
-                    let next = data
-                        .response_metadata
-                        .and_then(|m| m.next_cursor)
-                        .filter(|c| !c.is_empty());
-                    if next.is_none() {
-                        break;
-                    }
-                    cursor = next;
-                }
-                info!("conversations.list complete: {} channels total", all.len());
-                Ok(all)
+        let mut all = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut page = 0u32;
+        loop {
+            page += 1;
+            debug!("conversations.list page {page}");
+            let mut fields = vec![
+                ("types", "public_channel,private_channel,im,mpim"),
+                ("exclude_archived", "true"),
+                ("limit", "200"),
+            ];
+            let cursor_val;
+            if let Some(c) = &cursor {
+                cursor_val = c.clone();
+                fields.push(("cursor", &cursor_val));
             }
-            Backend::Stealth { http, creds } => {
-                let mut all = Vec::new();
-                let mut cursor: Option<String> = None;
-                let mut page = 0u32;
-                loop {
-                    page += 1;
-                    debug!("conversations.list page {page}");
-                    let mut fields = vec![
-                        ("types", "public_channel,private_channel,im,mpim"),
-                        ("exclude_archived", "true"),
-                        ("limit", "200"),
-                    ];
-                    let cursor_val;
-                    if let Some(c) = &cursor {
-                        cursor_val = c.clone();
-                        fields.push(("cursor", &cursor_val));
-                    }
-                    let data: RawConversationsList =
-                        Self::stealth_post(http, creds, "conversations.list", &fields).await?;
-                    let count = data.channels.len();
-                    debug!("conversations.list page {page} returned {count} channels");
-                    all.extend(data.channels);
-                    let next = data
-                        .response_metadata
-                        .and_then(|m| m.next_cursor)
-                        .filter(|c| !c.is_empty());
-                    if next.is_none() {
-                        break;
-                    }
-                    cursor = next;
-                }
-                info!("conversations.list complete: {} channels total", all.len());
-                Ok(all)
+            let data: RawConversationsList =
+                Self::stealth_post(&self.http, &self.creds, "conversations.list", &fields).await?;
+            let count = data.channels.len();
+            debug!("conversations.list page {page} returned {count} channels");
+            all.extend(data.channels);
+            let next = data
+                .response_metadata
+                .and_then(|m| m.next_cursor)
+                .filter(|c| !c.is_empty());
+            if next.is_none() {
+                break;
             }
+            cursor = next;
         }
+        info!("conversations.list complete: {} channels total", all.len());
+        Ok(all)
     }
 
     pub async fn conversation_history(
@@ -405,36 +318,12 @@ impl Client {
         limit: u32,
     ) -> Result<Vec<Message>, String> {
         info!("Calling conversations.history for channel={channel}, limit={limit}");
-        match &self.backend {
-            Backend::Slacko(inner) => {
-                let req = ConversationHistoryRequest {
-                    channel: channel.to_string(),
-                    limit: Some(limit),
-                    cursor: None,
-                    oldest: None,
-                    latest: None,
-                    inclusive: None,
-                };
-                let data = inner
-                    .conversations()
-                    .history_with_options(req)
-                    .await
-                    .map_err(|e| {
-                        error!("conversations.history failed for {channel}: {e}");
-                        format!("API error: {e}")
-                    })?;
-                info!("conversations.history returned {} messages", data.messages.len());
-                Ok(data.messages)
-            }
-            Backend::Stealth { http, creds } => {
-                let limit_str = limit.to_string();
-                let fields = vec![("channel", channel), ("limit", &limit_str)];
-                let data: RawConversationHistory =
-                    Self::stealth_post(http, creds, "conversations.history", &fields).await?;
-                info!("conversations.history returned {} messages", data.messages.len());
-                Ok(data.messages)
-            }
-        }
+        let limit_str = limit.to_string();
+        let fields = vec![("channel", channel), ("limit", &limit_str)];
+        let data: RawConversationHistory =
+            Self::stealth_post(&self.http, &self.creds, "conversations.history", &fields).await?;
+        info!("conversations.history returned {} messages", data.messages.len());
+        Ok(data.messages)
     }
 
     /// Fetch messages older than `latest` (exclusive) from a channel.
@@ -445,36 +334,16 @@ impl Client {
         limit: u32,
     ) -> Result<Vec<Message>, String> {
         info!("Calling conversations.history for channel={channel}, latest={latest}, limit={limit}");
-        match &self.backend {
-            Backend::Slacko(inner) => {
-                let req = ConversationHistoryRequest {
-                    channel: channel.to_string(),
-                    limit: Some(limit),
-                    cursor: None,
-                    oldest: None,
-                    latest: Some(latest.to_string()),
-                    inclusive: Some(false),
-                };
-                let data = inner
-                    .conversations()
-                    .history_with_options(req)
-                    .await
-                    .map_err(|e| format!("API error: {e}"))?;
-                Ok(data.messages)
-            }
-            Backend::Stealth { http, creds } => {
-                let limit_str = limit.to_string();
-                let fields = vec![
-                    ("channel", channel),
-                    ("latest", latest),
-                    ("limit", &limit_str),
-                    ("inclusive", "false"),
-                ];
-                let data: RawConversationHistory =
-                    Self::stealth_post(http, creds, "conversations.history", &fields).await?;
-                Ok(data.messages)
-            }
-        }
+        let limit_str = limit.to_string();
+        let fields = vec![
+            ("channel", channel),
+            ("latest", latest),
+            ("limit", &limit_str),
+            ("inclusive", "false"),
+        ];
+        let data: RawConversationHistory =
+            Self::stealth_post(&self.http, &self.creds, "conversations.history", &fields).await?;
+        Ok(data.messages)
     }
 
     /// Fetch messages around a specific timestamp: up to `count` before and `count` after.
@@ -515,41 +384,19 @@ impl Client {
         latest: Option<&str>,
         limit: u32,
     ) -> Result<(Vec<Message>, bool), String> {
-        match &self.backend {
-            Backend::Slacko(inner) => {
-                let req = ConversationHistoryRequest {
-                    channel: channel.to_string(),
-                    limit: Some(limit),
-                    cursor: None,
-                    oldest: Some(oldest.to_string()),
-                    latest: latest.map(|s| s.to_string()),
-                    inclusive: Some(false),
-                };
-                let data = inner
-                    .conversations()
-                    .history_with_options(req)
-                    .await
-                    .map_err(|e| format!("API error: {e}"))?;
-                // slacko doesn't expose has_more, assume done when < limit
-                let has_more = data.messages.len() as u32 >= limit;
-                Ok((data.messages, has_more))
-            }
-            Backend::Stealth { http, creds } => {
-                let limit_str = limit.to_string();
-                let mut fields = vec![
-                    ("channel", channel),
-                    ("oldest", oldest),
-                    ("limit", &limit_str),
-                    ("inclusive", "false"),
-                ];
-                if let Some(l) = latest {
-                    fields.push(("latest", l));
-                }
-                let data: RawConversationHistory =
-                    Self::stealth_post(http, creds, "conversations.history", &fields).await?;
-                Ok((data.messages, data.has_more))
-            }
+        let limit_str = limit.to_string();
+        let mut fields = vec![
+            ("channel", channel),
+            ("oldest", oldest),
+            ("limit", &limit_str),
+            ("inclusive", "false"),
+        ];
+        if let Some(l) = latest {
+            fields.push(("latest", l));
         }
+        let data: RawConversationHistory =
+            Self::stealth_post(&self.http, &self.creds, "conversations.history", &fields).await?;
+        Ok((data.messages, data.has_more))
     }
 
     // ── Presence ──
@@ -557,43 +404,19 @@ impl Client {
     /// Get presence for a user. Returns "active" or "away".
     pub async fn get_presence(&self, user_id: &str) -> Result<String, String> {
         info!("Calling users.getPresence for user={user_id}");
-        match &self.backend {
-            Backend::Slacko(inner) => {
-                let resp = inner
-                    .users()
-                    .get_presence(user_id)
-                    .await
-                    .map_err(|e| format!("API error: {e}"))?;
-                Ok(resp.presence)
-            }
-            Backend::Stealth { http, creds } => {
-                let data: RawPresenceResponse =
-                    Self::stealth_post(http, creds, "users.getPresence", &[("user", user_id)])
-                        .await?;
-                Ok(data.presence.unwrap_or_else(|| "active".into()))
-            }
-        }
+        let data: RawPresenceResponse =
+            Self::stealth_post(&self.http, &self.creds, "users.getPresence", &[("user", user_id)])
+                .await?;
+        Ok(data.presence.unwrap_or_else(|| "active".into()))
     }
 
     /// Set presence: "auto" (active) or "away".
     pub async fn set_presence(&self, presence: &str) -> Result<(), String> {
         info!("Calling users.setPresence to {presence}");
-        match &self.backend {
-            Backend::Slacko(inner) => {
-                inner
-                    .users()
-                    .set_presence(presence)
-                    .await
-                    .map_err(|e| format!("API error: {e}"))?;
-                Ok(())
-            }
-            Backend::Stealth { http, creds } => {
-                let _: serde_json::Value =
-                    Self::stealth_post(http, creds, "users.setPresence", &[("presence", presence)])
-                        .await?;
-                Ok(())
-            }
-        }
+        let _: serde_json::Value =
+            Self::stealth_post(&self.http, &self.creds, "users.setPresence", &[("presence", presence)])
+                .await?;
+        Ok(())
     }
 
     // ── Reactions ──
@@ -605,26 +428,14 @@ impl Client {
         name: &str,
     ) -> Result<(), String> {
         info!("Calling reactions.add: {name} on {channel}/{timestamp}");
-        match &self.backend {
-            Backend::Slacko(inner) => {
-                inner
-                    .reactions()
-                    .add(channel, timestamp, name)
-                    .await
-                    .map_err(|e| format!("API error: {e}"))?;
-                Ok(())
-            }
-            Backend::Stealth { http, creds } => {
-                let _: serde_json::Value = Self::stealth_post(
-                    http,
-                    creds,
-                    "reactions.add",
-                    &[("channel", channel), ("timestamp", timestamp), ("name", name)],
-                )
-                .await?;
-                Ok(())
-            }
-        }
+        let _: serde_json::Value = Self::stealth_post(
+            &self.http,
+            &self.creds,
+            "reactions.add",
+            &[("channel", channel), ("timestamp", timestamp), ("name", name)],
+        )
+        .await?;
+        Ok(())
     }
 
     pub async fn remove_reaction(
@@ -634,88 +445,40 @@ impl Client {
         name: &str,
     ) -> Result<(), String> {
         info!("Calling reactions.remove: {name} on {channel}/{timestamp}");
-        match &self.backend {
-            Backend::Slacko(inner) => {
-                inner
-                    .reactions()
-                    .remove(channel, timestamp, name)
-                    .await
-                    .map_err(|e| format!("API error: {e}"))?;
-                Ok(())
-            }
-            Backend::Stealth { http, creds } => {
-                let _: serde_json::Value = Self::stealth_post(
-                    http,
-                    creds,
-                    "reactions.remove",
-                    &[("channel", channel), ("timestamp", timestamp), ("name", name)],
-                )
-                .await?;
-                Ok(())
-            }
-        }
+        let _: serde_json::Value = Self::stealth_post(
+            &self.http,
+            &self.creds,
+            "reactions.remove",
+            &[("channel", channel), ("timestamp", timestamp), ("name", name)],
+        )
+        .await?;
+        Ok(())
     }
 
     // ── Channel actions ──
 
     pub async fn leave_channel(&self, channel: &str) -> Result<(), String> {
         info!("Calling conversations.leave for channel={channel}");
-        match &self.backend {
-            Backend::Slacko(inner) => {
-                inner
-                    .conversations()
-                    .leave(channel)
-                    .await
-                    .map_err(|e| format!("API error: {e}"))?;
-                Ok(())
-            }
-            Backend::Stealth { http, creds } => {
-                let _: serde_json::Value =
-                    Self::stealth_post(http, creds, "conversations.leave", &[("channel", channel)])
-                        .await?;
-                Ok(())
-            }
-        }
+        let _: serde_json::Value =
+            Self::stealth_post(&self.http, &self.creds, "conversations.leave", &[("channel", channel)])
+                .await?;
+        Ok(())
     }
 
     pub async fn archive_channel(&self, channel: &str) -> Result<(), String> {
         info!("Calling conversations.archive for channel={channel}");
-        match &self.backend {
-            Backend::Slacko(inner) => {
-                inner
-                    .conversations()
-                    .archive(channel)
-                    .await
-                    .map_err(|e| format!("API error: {e}"))?;
-                Ok(())
-            }
-            Backend::Stealth { http, creds } => {
-                let _: serde_json::Value =
-                    Self::stealth_post(http, creds, "conversations.archive", &[("channel", channel)])
-                        .await?;
-                Ok(())
-            }
-        }
+        let _: serde_json::Value =
+            Self::stealth_post(&self.http, &self.creds, "conversations.archive", &[("channel", channel)])
+                .await?;
+        Ok(())
     }
 
     pub async fn close_conversation(&self, channel: &str) -> Result<(), String> {
         info!("Calling conversations.close for channel={channel}");
-        match &self.backend {
-            Backend::Slacko(inner) => {
-                inner
-                    .conversations()
-                    .close(channel)
-                    .await
-                    .map_err(|e| format!("API error: {e}"))?;
-                Ok(())
-            }
-            Backend::Stealth { http, creds } => {
-                let _: serde_json::Value =
-                    Self::stealth_post(http, creds, "conversations.close", &[("channel", channel)])
-                        .await?;
-                Ok(())
-            }
-        }
+        let _: serde_json::Value =
+            Self::stealth_post(&self.http, &self.creds, "conversations.close", &[("channel", channel)])
+                .await?;
+        Ok(())
     }
 
     // ── Chat ──
@@ -725,31 +488,15 @@ impl Client {
         channel: &str,
         text: &str,
         thread_ts: Option<&str>,
-    ) -> Result<(), String> {
+    ) -> Result<String, String> {
         info!("Calling chat.postMessage to channel={channel}");
-        match &self.backend {
-            Backend::Slacko(inner) => {
-                let mut req = PostMessageRequest::new(channel).text(text);
-                if let Some(ts) = thread_ts {
-                    req = req.thread_ts(ts);
-                }
-                inner
-                    .chat()
-                    .post_message_with_options(req)
-                    .await
-                    .map_err(|e| format!("API error: {e}"))?;
-                Ok(())
-            }
-            Backend::Stealth { http, creds } => {
-                let mut fields = vec![("channel", channel), ("text", text)];
-                if let Some(ts) = thread_ts {
-                    fields.push(("thread_ts", ts));
-                }
-                let _: RawPostMessage =
-                    Self::stealth_post(http, creds, "chat.postMessage", &fields).await?;
-                Ok(())
-            }
+        let mut fields = vec![("channel", channel), ("text", text)];
+        if let Some(ts) = thread_ts {
+            fields.push(("thread_ts", ts));
         }
+        let raw: RawPostMessage =
+            Self::stealth_post(&self.http, &self.creds, "chat.postMessage", &fields).await?;
+        Ok(raw.ts)
     }
 
     /// Upload a file to a channel using the v2 upload flow:
@@ -767,143 +514,69 @@ impl Client {
         let len = content.len() as u64;
         info!("Uploading file '{filename}' ({len} bytes) to channel={channel} (v2 flow)");
 
-        match &self.backend {
-            Backend::Slacko(inner) => {
-                // Step 1: Get upload URL
-                let upload_info = inner
-                    .files()
-                    .get_upload_url_external(filename, len, None, None)
-                    .await
-                    .map_err(|e| format!("getUploadURLExternal: {e}"))?;
+        // Step 1: Get upload URL
+        let len_str = len.to_string();
+        let get_url_resp: RawGetUploadUrl = Self::stealth_post(
+            &self.http, &self.creds,
+            "files.getUploadURLExternal",
+            &[("filename", filename), ("length", &len_str)],
+        ).await?;
 
-                // Step 2: PUT content to the upload URL
-                let http = reqwest::Client::new();
-                let resp = http
-                    .post(&upload_info.upload_url)
-                    .header("Content-Type", "application/octet-stream")
-                    .body(content)
-                    .send()
-                    .await
-                    .map_err(|e| format!("File PUT error: {e}"))?;
-                if !resp.status().is_success() {
-                    return Err(format!("File PUT failed: {}", resp.status()));
-                }
-
-                // Step 3: Complete upload
-                let file_info = slacko::api::files::UploadedFileInfo::new(&upload_info.file_id);
-                inner
-                    .files()
-                    .complete_upload_external(
-                        &[file_info],
-                        Some(channel),
-                        initial_comment,
-                        thread_ts,
-                    )
-                    .await
-                    .map_err(|e| format!("completeUploadExternal: {e}"))?;
-                Ok(())
-            }
-            Backend::Stealth { http, creds } => {
-                // Step 1: Get upload URL
-                let len_str = len.to_string();
-                let get_url_resp: RawGetUploadUrl = Self::stealth_post(
-                    http, creds,
-                    "files.getUploadURLExternal",
-                    &[("filename", filename), ("length", &len_str)],
-                ).await?;
-
-                // Step 2: PUT content to the upload URL
-                let put_resp = http
-                    .post(&get_url_resp.upload_url)
-                    .header("Content-Type", "application/octet-stream")
-                    .body(content)
-                    .send()
-                    .await
-                    .map_err(|e| format!("File PUT error: {e}"))?;
-                if !put_resp.status().is_success() {
-                    return Err(format!("File PUT failed: {}", put_resp.status()));
-                }
-
-                // Step 3: Complete upload
-                let files_json = serde_json::json!([{"id": get_url_resp.file_id}]).to_string();
-                let mut fields = vec![
-                    ("files", files_json.as_str()),
-                    ("channel_id", channel),
-                ];
-                if let Some(comment) = initial_comment {
-                    fields.push(("initial_comment", comment));
-                }
-                if let Some(ts) = thread_ts {
-                    fields.push(("thread_ts", ts));
-                }
-                let _: serde_json::Value = Self::stealth_post(
-                    http, creds,
-                    "files.completeUploadExternal",
-                    &fields,
-                ).await?;
-                Ok(())
-            }
+        // Step 2: PUT content to the upload URL
+        let put_resp = self.http
+            .post(&get_url_resp.upload_url)
+            .header("Content-Type", "application/octet-stream")
+            .body(content)
+            .send()
+            .await
+            .map_err(|e| format!("File PUT error: {e}"))?;
+        if !put_resp.status().is_success() {
+            return Err(format!("File PUT failed: {}", put_resp.status()));
         }
+
+        // Step 3: Complete upload
+        let files_json = serde_json::json!([{"id": get_url_resp.file_id}]).to_string();
+        let mut fields = vec![
+            ("files", files_json.as_str()),
+            ("channel_id", channel),
+        ];
+        if let Some(comment) = initial_comment {
+            fields.push(("initial_comment", comment));
+        }
+        if let Some(ts) = thread_ts {
+            fields.push(("thread_ts", ts));
+        }
+        let _: serde_json::Value = Self::stealth_post(
+            &self.http, &self.creds,
+            "files.completeUploadExternal",
+            &fields,
+        ).await?;
+        Ok(())
     }
 
     pub async fn delete_message(&self, channel: &str, ts: &str) -> Result<(), String> {
         info!("Calling chat.delete on channel={channel} ts={ts}");
-        match &self.backend {
-            Backend::Slacko(inner) => {
-                inner
-                    .chat()
-                    .delete_message(channel, ts)
-                    .await
-                    .map_err(|e| format!("API error: {e}"))?;
-                Ok(())
-            }
-            Backend::Stealth { http, creds } => {
-                let _: serde_json::Value =
-                    Self::stealth_post(http, creds, "chat.delete", &[("channel", channel), ("ts", ts)])
-                        .await?;
-                Ok(())
-            }
-        }
+        let _: serde_json::Value =
+            Self::stealth_post(&self.http, &self.creds, "chat.delete", &[("channel", channel), ("ts", ts)])
+                .await?;
+        Ok(())
     }
 
-    /// Fetch messages newer than `oldest` timestamp.
-    pub async fn conversation_history_since(
-        &self,
-        channel: &str,
-        oldest: &str,
-    ) -> Result<Vec<Message>, String> {
-        debug!("Calling conversations.history for channel={channel}, oldest={oldest}");
-        match &self.backend {
-            Backend::Slacko(inner) => {
-                let req = ConversationHistoryRequest {
-                    channel: channel.to_string(),
-                    limit: Some(100),
-                    cursor: None,
-                    oldest: Some(oldest.to_string()),
-                    latest: None,
-                    inclusive: None,
-                };
-                let data = inner
-                    .conversations()
-                    .history_with_options(req)
-                    .await
-                    .map_err(|e| {
-                        error!("conversations.history failed for {channel}: {e}");
-                        format!("API error: {e}")
-                    })?;
-                Ok(data.messages)
-            }
-            Backend::Stealth { http, creds } => {
-                let fields = vec![
-                    ("channel", channel),
-                    ("oldest", oldest),
-                    ("limit", "100"),
-                ];
-                let data: RawConversationHistory =
-                    Self::stealth_post(http, creds, "conversations.history", &fields).await?;
-                Ok(data.messages)
-            }
-        }
+    /// Request a Google Meet call link for a channel (stealth-only internal API).
+    pub async fn calls_request(&self, channel: &str) -> Result<String, String> {
+        info!("Calling calls.request for channel={channel}");
+        let raw: RawCallsRequest = Self::stealth_post(
+            &self.http,
+            &self.creds,
+            "calls.request",
+            &[
+                ("channel", channel),
+                ("app", "A0F7YS351"),
+                ("type", "video"),
+            ],
+        )
+        .await?;
+        Ok(raw.url)
     }
 
     // ── Thread replies ──
@@ -914,31 +587,15 @@ impl Client {
         thread_ts: &str,
     ) -> Result<Vec<Message>, String> {
         info!("Calling conversations.replies for channel={channel}, ts={thread_ts}");
-        match &self.backend {
-            Backend::Slacko(inner) => {
-                let data = inner
-                    .conversations()
-                    .replies(channel, thread_ts)
-                    .await
-                    .map_err(|e| {
-                        error!("conversations.replies failed: {e}");
-                        format!("API error: {e}")
-                    })?;
-                info!("conversations.replies returned {} messages", data.messages.len());
-                Ok(data.messages)
-            }
-            Backend::Stealth { http, creds } => {
-                let fields = vec![
-                    ("channel", channel),
-                    ("ts", thread_ts),
-                    ("limit", "100"),
-                ];
-                let data: RawConversationHistory =
-                    Self::stealth_post(http, creds, "conversations.replies", &fields).await?;
-                info!("conversations.replies returned {} messages", data.messages.len());
-                Ok(data.messages)
-            }
-        }
+        let fields = vec![
+            ("channel", channel),
+            ("ts", thread_ts),
+            ("limit", "100"),
+        ];
+        let data: RawConversationHistory =
+            Self::stealth_post(&self.http, &self.creds, "conversations.replies", &fields).await?;
+        info!("conversations.replies returned {} messages", data.messages.len());
+        Ok(data.messages)
     }
 
     // ── User profile ──
@@ -946,22 +603,10 @@ impl Client {
     /// Get a user's profile. Returns the profile as a JSON value.
     pub async fn get_user_profile(&self, user_id: &str) -> Result<serde_json::Value, String> {
         info!("Calling users.profile.get for user={user_id}");
-        match &self.backend {
-            Backend::Slacko(inner) => {
-                let resp = inner
-                    .users()
-                    .get_profile(user_id)
-                    .await
-                    .map_err(|e| format!("API error: {e}"))?;
-                Ok(resp.profile)
-            }
-            Backend::Stealth { http, creds } => {
-                let data: RawProfileResponse =
-                    Self::stealth_post(http, creds, "users.profile.get", &[("user", user_id)])
-                        .await?;
-                Ok(data.profile)
-            }
-        }
+        let data: RawProfileResponse =
+            Self::stealth_post(&self.http, &self.creds, "users.profile.get", &[("user", user_id)])
+                .await?;
+        Ok(data.profile)
     }
 
     /// Set the authenticated user's status text and emoji.
@@ -975,27 +620,15 @@ impl Client {
             "status_text": status_text,
             "status_emoji": status_emoji,
         });
-        match &self.backend {
-            Backend::Slacko(inner) => {
-                inner
-                    .users()
-                    .set_profile(profile)
-                    .await
-                    .map_err(|e| format!("API error: {e}"))?;
-                Ok(())
-            }
-            Backend::Stealth { http, creds } => {
-                let profile_str = serde_json::to_string(&profile).unwrap();
-                let _: RawProfileResponse = Self::stealth_post(
-                    http,
-                    creds,
-                    "users.profile.set",
-                    &[("profile", &profile_str)],
-                )
-                .await?;
-                Ok(())
-            }
-        }
+        let profile_str = serde_json::to_string(&profile).unwrap();
+        let _: RawProfileResponse = Self::stealth_post(
+            &self.http,
+            &self.creds,
+            "users.profile.set",
+            &[("profile", &profile_str)],
+        )
+        .await?;
+        Ok(())
     }
 
     // ── Users ──
@@ -1004,91 +637,53 @@ impl Client {
     /// Returns a map of emoji name -> URL (or "alias:other_name" for aliases).
     pub async fn emoji_list(&self) -> Result<std::collections::HashMap<String, String>, String> {
         info!("Calling emoji.list...");
-        match &self.backend {
-            Backend::Slacko(inner) => {
-                let resp = inner.emoji().list().await.map_err(|e| {
-                    error!("emoji.list failed: {e}");
-                    format!("API error: {e}")
-                })?;
-                info!("emoji.list returned {} emoji", resp.emoji.len());
-                Ok(resp.emoji)
-            }
-            Backend::Stealth { http, creds } => {
-                let data: RawEmojiList =
-                    Self::stealth_post(http, creds, "emoji.list", &[]).await?;
-                info!("emoji.list returned {} emoji", data.emoji.len());
-                Ok(data.emoji)
-            }
-        }
+        let data: RawEmojiList =
+            Self::stealth_post(&self.http, &self.creds, "emoji.list", &[]).await?;
+        info!("emoji.list returned {} emoji", data.emoji.len());
+        Ok(data.emoji)
+    }
+
+    /// Fetch all usergroups and return a map of subteam ID -> @handle.
+    pub async fn usergroups_list(&self) -> Result<HashMap<String, String>, String> {
+        info!("Calling usergroups.list...");
+        let data: RawUsergroupsList =
+            Self::stealth_post(&self.http, &self.creds, "usergroups.list", &[]).await?;
+        let map: HashMap<String, String> = data.usergroups.into_iter()
+            .map(|g| (g.id, format!("@{}", g.handle)))
+            .collect();
+        info!("usergroups.list returned {} groups", map.len());
+        Ok(map)
     }
 
     pub async fn users_list_all(&self) -> Result<Vec<User>, String> {
         info!("Calling users.list (paginated)...");
-        match &self.backend {
-            Backend::Slacko(inner) => {
-                let mut all = Vec::new();
-                let mut cursor: Option<String> = None;
-                let mut page = 0u32;
-                loop {
-                    page += 1;
-                    debug!("users.list page {page}");
-                    let req = slacko::api::users::UsersListRequest {
-                        limit: Some(200),
-                        cursor: cursor.clone(),
-                    };
-                    let data = inner
-                        .users()
-                        .list_with_options(req)
-                        .await
-                        .map_err(|e| {
-                            error!("users.list failed on page {page}: {e}");
-                            format!("API error: {e}")
-                        })?;
-                    let count = data.members.len();
-                    debug!("users.list page {page} returned {count} users");
-                    all.extend(data.members);
-                    let next = data
-                        .response_metadata
-                        .and_then(|m| m.next_cursor)
-                        .filter(|c| !c.is_empty());
-                    if next.is_none() {
-                        break;
-                    }
-                    cursor = next;
-                }
-                info!("users.list complete: {} users total", all.len());
-                Ok(all)
+        let mut all = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut page = 0u32;
+        loop {
+            page += 1;
+            debug!("users.list page {page}");
+            let mut fields: Vec<(&str, &str)> = vec![("limit", "200")];
+            let cursor_val;
+            if let Some(c) = &cursor {
+                cursor_val = c.clone();
+                fields.push(("cursor", &cursor_val));
             }
-            Backend::Stealth { http, creds } => {
-                let mut all = Vec::new();
-                let mut cursor: Option<String> = None;
-                let mut page = 0u32;
-                loop {
-                    page += 1;
-                    debug!("users.list page {page}");
-                    let mut fields: Vec<(&str, &str)> = vec![("limit", "200")];
-                    let cursor_val;
-                    if let Some(c) = &cursor {
-                        cursor_val = c.clone();
-                        fields.push(("cursor", &cursor_val));
-                    }
-                    let data: RawUsersList =
-                        Self::stealth_post(http, creds, "users.list", &fields).await?;
-                    let count = data.members.len();
-                    debug!("users.list page {page} returned {count} users");
-                    all.extend(data.members);
-                    let next = data
-                        .response_metadata
-                        .and_then(|m| m.next_cursor)
-                        .filter(|c| !c.is_empty());
-                    if next.is_none() {
-                        break;
-                    }
-                    cursor = next;
-                }
-                info!("users.list complete: {} users total", all.len());
-                Ok(all)
+            let data: RawUsersList =
+                Self::stealth_post(&self.http, &self.creds, "users.list", &fields).await?;
+            let count = data.members.len();
+            debug!("users.list page {page} returned {count} users");
+            all.extend(data.members);
+            let next = data
+                .response_metadata
+                .and_then(|m| m.next_cursor)
+                .filter(|c| !c.is_empty());
+            if next.is_none() {
+                break;
             }
+            cursor = next;
         }
+        info!("users.list complete: {} users total", all.len());
+        Ok(all)
     }
 }

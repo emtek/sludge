@@ -1,5 +1,5 @@
 use gtk4::prelude::*;
-use gtk4::{self as gtk, Label, ListBox, ListBoxRow, Picture, ScrolledWindow};
+use gtk4::{self as gtk, Button, Label, ListBox, ListBoxRow, Picture, ScrolledWindow};
 use slacko::types::Message;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -46,8 +46,11 @@ pub struct MessageView {
     reaction_boxes: Rc<RefCell<HashMap<String, gtk::FlowBox>>>,
     /// Typing indicator label in the channel header.
     pub typing_label: Label,
+    /// Button to start a Google Meet call.
+    pub call_button: Button,
     /// Generation counter; incremented on clear() so in-flight image loads detect staleness.
     image_generation: Rc<Cell<u64>>,
+    subteam_names: RefCell<Rc<HashMap<String, String>>>,
     /// Reaction picker cells — take + unparent on clear.
     picker_cells: Rc<RefCell<Vec<Rc<RefCell<Option<gtk::Popover>>>>>>,
     /// Whether a load-more request is in flight (prevents duplicate fetches).
@@ -85,6 +88,11 @@ impl MessageView {
         typing_label.set_visible(false);
         header.append(&typing_label);
 
+        let call_button = Button::from_icon_name("call-start-symbolic");
+        call_button.set_tooltip_text(Some("Start Google Meet call"));
+        call_button.add_css_class("flat");
+        header.append(&call_button);
+
         let spinner = gtk::Spinner::new();
         spinner.set_visible(false);
         spinner.set_size_request(16, 16);
@@ -98,6 +106,7 @@ impl MessageView {
         // Messages list
         let list_box = ListBox::new();
         list_box.set_selection_mode(gtk::SelectionMode::None);
+        list_box.set_focusable(false);
         list_box.add_css_class("boxed-list");
         list_box.set_margin_start(8);
         list_box.set_margin_end(8);
@@ -105,6 +114,8 @@ impl MessageView {
         let scrolled = ScrolledWindow::new();
         scrolled.set_vexpand(true);
         scrolled.set_hexpand(true);
+        scrolled.set_focusable(true);
+        scrolled.set_hscrollbar_policy(gtk::PolicyType::Never);
         scrolled.set_child(Some(&list_box));
 
         container.append(&scrolled);
@@ -143,7 +154,9 @@ impl MessageView {
             thread_labels: Rc::new(RefCell::new(HashMap::new())),
             reaction_boxes: Rc::new(RefCell::new(HashMap::new())),
             typing_label,
+            call_button,
             image_generation: Rc::new(Cell::new(0)),
+            subteam_names: RefCell::new(Rc::new(HashMap::new())),
             picker_cells: Rc::new(RefCell::new(Vec::new())),
             loading_more,
             has_more,
@@ -230,17 +243,13 @@ impl MessageView {
             self.has_more.set(false);
         }
 
-        let thread_cb = self.thread_callback.borrow().clone();
-        let mention_cb = self.mention_callback.borrow().clone();
-        let reaction_cb = self.reaction_callback.borrow().clone();
-        let delete_cb = self.delete_callback.borrow().clone();
-        let self_uid = self.self_user_id.borrow().clone();
-        let channel_id = self.channel_id.borrow().clone();
-        let tc = self.thread_counts.clone();
-        let tl = self.thread_labels.clone();
-        let rb = self.reaction_boxes.clone();
-        let img_gen = self.image_generation.clone();
-        let ecc = self.picker_cells.clone();
+        let thread_cb = self.thread_callback.borrow();
+        let mention_cb = self.mention_callback.borrow();
+        let reaction_cb = self.reaction_callback.borrow();
+        let delete_cb = self.delete_callback.borrow();
+        let self_uid = self.self_user_id.borrow();
+        let channel_id = self.channel_id.borrow();
+        let subteam_names = self.subteam_names.borrow();
 
         // Record current scroll height so we can restore position after prepend
         let adj = self.scrolled.vadjustment();
@@ -249,10 +258,10 @@ impl MessageView {
         // Messages from the API are newest-first; prepend oldest-first (i.e. iterate forward)
         for msg in messages.iter().rev() {
             let row = make_message_row(
-                msg, users, client, rt,
+                msg, users, &subteam_names, client, rt,
                 &thread_cb, &mention_cb, &reaction_cb, &delete_cb,
-                channel_id.as_deref(), &tc.borrow(), &tl, &rb, &self_uid,
-                &img_gen, &ecc,
+                channel_id.as_deref(), &self.thread_counts.borrow(), &self.thread_labels, &self.reaction_boxes, &self_uid,
+                &self.image_generation, &self.picker_cells,
             );
             self.list_box.prepend(&row);
         }
@@ -280,14 +289,6 @@ impl MessageView {
     /// Reset the loading_more flag (e.g. on error).
     pub fn reset_loading_more(&self) {
         self.loading_more.set(false);
-    }
-
-    /// Get the ts of the oldest (topmost) message, if any.
-    pub fn oldest_message_ts(&self) -> Option<String> {
-        self.list_box
-            .row_at_index(0)
-            .map(|row| row.widget_name().to_string())
-            .filter(|ts| !ts.is_empty())
     }
 
     /// Update the thread button label for a message after loading its replies.
@@ -350,8 +351,11 @@ impl MessageView {
         *self.channel_id.borrow_mut() = Some(id.to_string());
     }
 
+    pub fn set_subteam_names(&self, names: Rc<HashMap<String, String>>) {
+        *self.subteam_names.borrow_mut() = names;
+    }
+
     pub fn clear(&self) {
-        crate::mem::log_mem("MessageView::clear() START");
 
         // Bump generation so in-flight image downloads from the previous channel bail out
         self.image_generation.set(self.image_generation.get() + 1);
@@ -426,34 +430,27 @@ impl MessageView {
         self.has_more.set(true);
         self.loading_more.set(false);
         crate::mem::trim_heap();
-        crate::mem::log_mem("MessageView::clear() DONE (after trim)");
 
-        let thread_cb = self.thread_callback.borrow().clone();
-        let mention_cb = self.mention_callback.borrow().clone();
-        let reaction_cb = self.reaction_callback.borrow().clone();
-        let delete_cb = self.delete_callback.borrow().clone();
-        let self_uid = self.self_user_id.borrow().clone();
-        let channel_id = self.channel_id.borrow().clone();
-        let tc = self.thread_counts.clone();
-        let tl = self.thread_labels.clone();
-        let rb = self.reaction_boxes.clone();
-
-        let img_gen = self.image_generation.clone();
-        let ecc = self.picker_cells.clone();
+        let thread_cb = self.thread_callback.borrow();
+        let mention_cb = self.mention_callback.borrow();
+        let reaction_cb = self.reaction_callback.borrow();
+        let delete_cb = self.delete_callback.borrow();
+        let self_uid = self.self_user_id.borrow();
+        let channel_id = self.channel_id.borrow();
+        let subteam_names = self.subteam_names.borrow();
 
         // Slack returns newest-first; display oldest-first
         for msg in messages.iter().rev() {
             let row = make_message_row(
-                msg, users, client, rt,
+                msg, users, &subteam_names, client, rt,
                 &thread_cb, &mention_cb, &reaction_cb, &delete_cb,
-                channel_id.as_deref(), &tc.borrow(), &tl, &rb, &self_uid,
-                &img_gen, &ecc,
+                channel_id.as_deref(), &self.thread_counts.borrow(), &self.thread_labels, &self.reaction_boxes, &self_uid,
+                &self.image_generation, &self.picker_cells,
             );
             self.list_box.append(&row);
         }
 
         self.scroll_to_bottom();
-        crate::mem::log_mem("MessageView::set_messages() DONE");
     }
 
     /// Display full-text search results. Each row is clickable and navigates
@@ -470,17 +467,13 @@ impl MessageView {
         self.set_channel_name("Search Results");
         self.set_channel_id("");
 
-        let thread_cb = self.thread_callback.borrow().clone();
-        let mention_cb = self.mention_callback.borrow().clone();
-        let reaction_cb = self.reaction_callback.borrow().clone();
-        let delete_cb = self.delete_callback.borrow().clone();
-        let self_uid = self.self_user_id.borrow().clone();
-        let tc = self.thread_counts.clone();
-        let tl = self.thread_labels.clone();
-        let rb = self.reaction_boxes.clone();
-        let img_gen = self.image_generation.clone();
-        let ecc = self.picker_cells.clone();
-        let search_cb = self.search_result_callback.borrow().clone();
+        let thread_cb = self.thread_callback.borrow();
+        let mention_cb = self.mention_callback.borrow();
+        let reaction_cb = self.reaction_callback.borrow();
+        let delete_cb = self.delete_callback.borrow();
+        let self_uid = self.self_user_id.borrow();
+        let search_cb = self.search_result_callback.borrow();
+        let subteam_names = self.subteam_names.borrow();
 
         for (channel_id, msg) in results {
             // Build channel label
@@ -500,10 +493,10 @@ impl MessageView {
                 .unwrap_or_default();
 
             let row = make_message_row(
-                msg, users, client, rt,
+                msg, users, &subteam_names, client, rt,
                 &thread_cb, &mention_cb, &reaction_cb, &delete_cb,
-                Some(channel_id), &tc.borrow(), &tl, &rb, &self_uid,
-                &img_gen, &ecc,
+                Some(channel_id), &self.thread_counts.borrow(), &self.thread_labels, &self.reaction_boxes, &self_uid,
+                &self.image_generation, &self.picker_cells,
             );
 
             // Prepend a channel name label to the row
@@ -519,7 +512,7 @@ impl MessageView {
             }
 
             // Make the row clickable for navigation
-            if let Some(ref cb) = search_cb {
+            if let Some(ref cb) = *search_cb {
                 let cb = cb.clone();
                 let cid = channel_id.clone();
                 let ts = msg.ts.clone();
@@ -543,28 +536,24 @@ impl MessageView {
         client: &Client,
         rt: &tokio::runtime::Handle,
     ) {
-        let thread_cb = self.thread_callback.borrow().clone();
-        let mention_cb = self.mention_callback.borrow().clone();
-        let reaction_cb = self.reaction_callback.borrow().clone();
-        let delete_cb = self.delete_callback.borrow().clone();
-        let self_uid = self.self_user_id.borrow().clone();
-        let channel_id = self.channel_id.borrow().clone();
-        let tc = self.thread_counts.clone();
-        let tl = self.thread_labels.clone();
-        let rb = self.reaction_boxes.clone();
-        let img_gen = self.image_generation.clone();
-        let ecc = self.picker_cells.clone();
+        let thread_cb = self.thread_callback.borrow();
+        let mention_cb = self.mention_callback.borrow();
+        let reaction_cb = self.reaction_callback.borrow();
+        let delete_cb = self.delete_callback.borrow();
+        let self_uid = self.self_user_id.borrow();
+        let channel_id = self.channel_id.borrow();
+        let subteam_names = self.subteam_names.borrow();
         let row = make_message_row(
-            msg, users, client, rt,
+            msg, users, &subteam_names, client, rt,
             &thread_cb, &mention_cb, &reaction_cb, &delete_cb,
-            channel_id.as_deref(), &tc.borrow(), &tl, &rb, &self_uid,
-            &img_gen, &ecc,
+            channel_id.as_deref(), &self.thread_counts.borrow(), &self.thread_labels, &self.reaction_boxes, &self_uid,
+            &self.image_generation, &self.picker_cells,
         );
         self.list_box.append(&row);
         self.scroll_to_bottom();
     }
 
-    fn scroll_to_bottom(&self) {
+    pub fn scroll_to_bottom(&self) {
         let adj = self.scrolled.vadjustment();
         // Try immediately (works if layout is already done)
         adj.set_value(adj.upper() - adj.page_size());
@@ -615,9 +604,10 @@ impl MessageView {
     }
 }
 
-fn make_message_row(
+pub fn make_message_row(
     msg: &Message,
     users: &HashMap<String, String>,
+    subteam_names: &HashMap<String, String>,
     client: &Client,
     rt: &tokio::runtime::Handle,
     thread_cb: &Option<ThreadOpenCallback>,
@@ -752,7 +742,7 @@ fn make_message_row(
 
     // Message body with clickable @mentions and inline custom emoji
     if !msg.text.is_empty() {
-        let body = make_message_body(&msg.text, users, mention_cb);
+        let body = make_message_body(&msg.text, users, subteam_names, mention_cb);
         outer.append(&body);
     }
 
@@ -790,7 +780,7 @@ fn make_message_row(
 
             if !att_parts.is_empty() {
                 let att_text = att_parts.join("\n");
-                let markup = format_message_markup(&att_text, users);
+                let markup = format_message_markup(&att_text, users, subteam_names);
 
                 let att_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
 
@@ -820,7 +810,9 @@ fn make_message_row(
                 let att_label = Label::new(None);
                 att_label.set_markup(&markup);
                 att_label.set_wrap(true);
-                att_label.set_halign(gtk::Align::Start);
+                att_label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+                att_label.set_halign(gtk::Align::Fill);
+                att_label.set_hexpand(true);
                 att_label.set_selectable(true);
                 att_label.set_xalign(0.0);
                 att_label.set_margin_start(6);
@@ -892,6 +884,17 @@ fn make_message_row(
     }
 
     // Create placeholder pictures and load them asynchronously
+    let image_flow = gtk::FlowBox::new();
+    image_flow.set_selection_mode(gtk::SelectionMode::None);
+    image_flow.set_halign(gtk::Align::Start);
+    image_flow.set_homogeneous(false);
+    image_flow.set_row_spacing(4);
+    image_flow.set_column_spacing(4);
+    image_flow.set_max_children_per_line(10);
+    if !image_url_sets.is_empty() {
+        outer.append(&image_flow);
+    }
+
     for urls in image_url_sets {
         let picture = Picture::new();
         picture.set_halign(gtk::Align::Start);
@@ -899,7 +902,7 @@ fn make_message_row(
         picture.set_size_request(-1, 200);
         picture.set_can_shrink(true);
         picture.set_cursor_from_name(Some("pointer"));
-        outer.append(&picture);
+        image_flow.insert(&picture, -1);
 
         // Click to open fullscreen viewer (loads full resolution)
         let stored_texture: Rc<RefCell<Option<gtk4::gdk::Texture>>> = Rc::new(RefCell::new(None));
@@ -963,26 +966,26 @@ fn make_message_row(
 
             match bytes_result {
                 Ok(Ok(bytes)) => {
-                    let gbytes = gtk4::glib::Bytes::from(&bytes);
+                    let gbytes = gtk4::glib::Bytes::from_owned(bytes);
                     let stream = gtk4::gio::MemoryInputStream::from_bytes(&gbytes);
                     // Decode at display size (max 400px wide) to avoid holding
                     // full-resolution RGBA buffers (a 5712x4284 photo = 93 MiB).
                     match gtk4::gdk_pixbuf::Pixbuf::from_stream_at_scale(
                         &stream,
-                        400,  // max width
-                        -1,   // auto height (preserve aspect ratio)
+                        -1,   // auto width (preserve aspect ratio)
+                        200,  // max height
                         true, // preserve_aspect_ratio
                         gtk4::gio::Cancellable::NONE,
                     ) {
                         Ok(pixbuf) => {
                             let w = pixbuf.width();
                             let h = pixbuf.height();
-                            tracing::info!("[MEM] Image decoded (scaled): {w}x{h} = {:.2} MiB", (w as f64 * h as f64 * 4.0) / 1048576.0);
+                            tracing::debug!("Image decoded (scaled): {w}x{h}");
                             let texture = gtk4::gdk::Texture::for_pixbuf(&pixbuf);
                             picture.set_paintable(Some(&texture));
                             *stored_texture.borrow_mut() = Some(texture);
-                            if w > 0 && h > 0 {
-                                picture.set_size_request(w, h);
+                            if h > 0 {
+                                picture.set_size_request(-1, h.min(200));
                             }
                         }
                         Err(e) => {
@@ -1020,34 +1023,33 @@ fn make_message_row(
         }
 
         // Add reaction button with emoji autocomplete popover
-        if let (Some(rcb), Some(cid)) = (reaction_cb.clone(), channel_id) {
+        if let (Some(rcb), Some(cid)) = (reaction_cb, channel_id) {
             let add_btn = gtk::Button::from_icon_name("list-add-symbolic");
             add_btn.add_css_class("flat");
             add_btn.add_css_class("reaction-add-btn");
 
-            let rcb2 = rcb.clone();
-            let cid2 = cid.to_string();
-            let ts2 = msg.ts.clone();
+            let rcb = rcb.clone();
+            let cid = cid.to_string();
+            let ts = msg.ts.clone();
             let picker_cell: Rc<RefCell<Option<gtk::Popover>>> = Rc::new(RefCell::new(None));
             picker_cells.borrow_mut().push(picker_cell.clone());
 
-            let cell_click = picker_cell.clone();
             let btn_weak = add_btn.downgrade();
             add_btn.connect_clicked(move |_| {
                 let Some(btn) = btn_weak.upgrade() else { return };
-                let first_show = cell_click.borrow().is_none();
+                let first_show = picker_cell.borrow().is_none();
                 if first_show {
-                    let rcb3 = rcb2.clone();
-                    let cid3 = cid2.clone();
-                    let ts3 = ts2.clone();
+                    let rcb = rcb.clone();
+                    let cid = cid.clone();
+                    let ts = ts.clone();
                     let on_react: Rc<dyn Fn(&str)> = Rc::new(move |shortcode: &str| {
                         let dummy = gtk::Button::new();
-                        rcb3(&cid3, &ts3, shortcode, &dummy);
+                        rcb(&cid, &ts, shortcode, &dummy);
                     });
                     let picker = crate::ui::autocomplete::build_reaction_popover(&btn, on_react);
-                    *cell_click.borrow_mut() = Some(picker);
+                    *picker_cell.borrow_mut() = Some(picker);
                 }
-                if let Some(picker) = cell_click.borrow().as_ref() {
+                if let Some(picker) = picker_cell.borrow().as_ref() {
                     if first_show {
                         // Defer popup so the popover widget tree is realized first
                         let p = picker.clone();
@@ -1127,7 +1129,8 @@ pub fn make_reaction_button(
     btn.set_child(Some(&content));
 
     // Left-click toggles the reaction
-    if let (Some(rcb), Some(cid)) = (reaction_cb.clone(), channel_id) {
+    if let (Some(rcb), Some(cid)) = (reaction_cb, channel_id) {
+        let rcb = rcb.clone();
         let name = reaction.name.clone();
         let ts = msg_ts.to_string();
         let cid = cid.to_string();
@@ -1311,6 +1314,7 @@ pub fn make_file_attachment_chip(
 pub fn make_message_body(
     text: &str,
     users: &HashMap<String, String>,
+    subteam_names: &HashMap<String, String>,
     mention_cb: &Option<MentionCallback>,
 ) -> gtk::Widget {
     use crate::slack::helpers::{extract_custom_emoji, get_custom_emoji_path};
@@ -1319,11 +1323,12 @@ pub fn make_message_body(
 
     if custom_emoji.is_empty() {
         // No custom emoji — use a simple Label with Pango markup
-        let markup = format_message_markup(text, users);
+        let markup = format_message_markup(text, users, subteam_names);
         let body = Label::new(None);
         body.set_markup(&markup);
         body.set_wrap(true);
-        body.set_halign(gtk::Align::Start);
+        body.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+        body.set_halign(gtk::Align::Fill);
         body.set_selectable(true);
         body.set_xalign(0.0);
 
@@ -1349,7 +1354,7 @@ pub fn make_message_body(
         let buffer = text_view.buffer();
 
         // Build plain text (with U+FFFC placeholders for custom emoji) and insert paintables
-        let plain = crate::slack::helpers::format_message_plain(text, users);
+        let plain = crate::slack::helpers::format_message_plain(text, users, subteam_names);
         let custom_emoji_reextracted = extract_custom_emoji(text);
 
         // Split plain text at U+FFFC boundaries and insert paintables

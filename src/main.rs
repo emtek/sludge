@@ -43,7 +43,6 @@ fn parse_startup_action() -> Option<StartupAction> {
 
 fn main() {
     tracing_subscriber::fmt::init();
-    mem::log_mem("startup");
 
     // Run as headless D-Bus search provider if requested
     if std::env::args().any(|a| a == "--search-provider") {
@@ -78,10 +77,9 @@ fn main() {
         .flags(gtk4::gio::ApplicationFlags::HANDLES_COMMAND_LINE)
         .build();
 
-    // Periodic memory reporter — logs RSS every 10 seconds (with heap trim)
+    // Periodic heap trim every 10 seconds
     gtk4::glib::timeout_add_seconds_local(10, || {
         mem::trim_heap();
-        mem::log_mem("periodic (trimmed)");
         gtk4::glib::ControlFlow::Continue
     });
 
@@ -218,27 +216,12 @@ fn main() {
                 let rt2 = rt.clone();
                 let result = rt2
                     .spawn(async move {
-                        let mut client = match creds_clone.auth_mode.as_str() {
-                            "stealth" => {
-                                let xoxc = creds_clone.xoxc_token.unwrap_or_default();
-                                let xoxd = creds_clone.xoxd_cookie.unwrap_or_default();
-                                if xoxc.is_empty() || xoxd.is_empty() {
-                                    return Err("incomplete stealth credentials".into());
-                                }
-                                slack::client::Client::new_stealth(xoxc, xoxd, creds_clone.workspace_url)
-                            }
-                            "bot" => {
-                                let token = creds_clone.bot_token.unwrap_or_default();
-                                if token.is_empty() {
-                                    return Err("empty bot token".into());
-                                }
-                                slack::client::Client::new_bot(
-                                    slacko::AuthConfig::bot(&token),
-                                    creds_clone.app_token,
-                                )
-                            }
-                            other => return Err(format!("unknown auth mode: {other}")),
-                        };
+                        let xoxc = creds_clone.xoxc_token.unwrap_or_default();
+                        let xoxd = creds_clone.xoxd_cookie.unwrap_or_default();
+                        if xoxc.is_empty() || xoxd.is_empty() {
+                            return Err("incomplete credentials".into());
+                        }
+                        let mut client = slack::client::Client::new(xoxc, xoxd, creds_clone.workspace_url);
                         let info = client.auth_test().await?;
                         Ok::<(slack::client::Client, slack::client::AuthInfo), String>((client, info))
                     })
@@ -251,15 +234,10 @@ fn main() {
 
                         let (event_tx, event_rx) = mpsc::unbounded_channel::<SlackEvent>();
                         let (presence_tx, presence_rx) = mpsc::unbounded_channel::<Vec<String>>();
-                        if let Some(sm_client) = client.socket_mode_client().cloned() {
-                            rt.spawn(slack::socket::run_socket_mode(sm_client, event_tx));
-                        } else if let Some((http, xoxc, xoxd, ws_url)) =
-                            client.stealth_rtm_params()
-                        {
-                            rt.spawn(slack::socket::run_rtm_stealth(
-                                http, xoxc, xoxd, ws_url, event_tx, presence_rx,
-                            ));
-                        }
+                        let (http, xoxc, xoxd, ws_url) = client.rtm_params();
+                        rt.spawn(slack::socket::run_rtm_stealth(
+                            http, xoxc, xoxd, ws_url, event_tx, presence_rx,
+                        ));
 
                         ui::app::build_app(&app, client, rt, event_rx, db, info.user_id, presence_tx, startup_action.clone());
                     }

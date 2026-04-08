@@ -1,5 +1,5 @@
 use gtk4::prelude::*;
-use gtk4::{self as gtk, Application, ApplicationWindow, DropDown, Label, PasswordEntry, Stack};
+use gtk4::{self as gtk, Application, ApplicationWindow, Label, PasswordEntry};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -31,64 +31,28 @@ pub fn show_login(app: &Application, rt: tokio::runtime::Handle, db: Arc<Databas
     title.add_css_class("title-1");
     outer.append(&title);
 
-    let mode_model = gtk::StringList::new(&["Stealth (browser session)", "Bot token"]);
-    let mode_dropdown = DropDown::new(Some(mode_model), gtk::Expression::NONE);
-    mode_dropdown.set_selected(0);
-    outer.append(&mode_dropdown);
-
-    let stack = Stack::new();
-    stack.set_transition_type(gtk::StackTransitionType::Crossfade);
-
-    // Stealth page
-    let stealth_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    let fields_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
     let xoxc_label = Label::new(Some("xoxc Token"));
     xoxc_label.set_halign(gtk::Align::Start);
-    stealth_box.append(&xoxc_label);
+    fields_box.append(&xoxc_label);
     let xoxc_entry = PasswordEntry::new();
     xoxc_entry.set_show_peek_icon(true);
     xoxc_entry.set_placeholder_text(Some("xoxc-..."));
-    stealth_box.append(&xoxc_entry);
+    fields_box.append(&xoxc_entry);
     let xoxd_label = Label::new(Some("xoxd Cookie"));
     xoxd_label.set_halign(gtk::Align::Start);
-    stealth_box.append(&xoxd_label);
+    fields_box.append(&xoxd_label);
     let xoxd_entry = PasswordEntry::new();
     xoxd_entry.set_show_peek_icon(true);
     xoxd_entry.set_placeholder_text(Some("xoxd-..."));
-    stealth_box.append(&xoxd_entry);
+    fields_box.append(&xoxd_entry);
     let ws_label = Label::new(Some("Workspace"));
     ws_label.set_halign(gtk::Align::Start);
-    stealth_box.append(&ws_label);
+    fields_box.append(&ws_label);
     let ws_entry = gtk::Entry::new();
     ws_entry.set_placeholder_text(Some("myteam.slack.com"));
-    stealth_box.append(&ws_entry);
-    stack.add_named(&stealth_box, Some("stealth"));
-
-    // Bot page
-    let bot_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    let bot_label = Label::new(Some("Bot Token"));
-    bot_label.set_halign(gtk::Align::Start);
-    bot_box.append(&bot_label);
-    let bot_entry = PasswordEntry::new();
-    bot_entry.set_show_peek_icon(true);
-    bot_entry.set_placeholder_text(Some("xoxb-..."));
-    bot_box.append(&bot_entry);
-    let app_label = Label::new(Some("App Token (optional, for real-time events)"));
-    app_label.set_halign(gtk::Align::Start);
-    bot_box.append(&app_label);
-    let app_entry = PasswordEntry::new();
-    app_entry.set_show_peek_icon(true);
-    app_entry.set_placeholder_text(Some("xapp-..."));
-    bot_box.append(&app_entry);
-    stack.add_named(&bot_box, Some("bot"));
-    stack.set_visible_child_name("stealth");
-
-    outer.append(&stack);
-
-    let stack_ref = stack.clone();
-    mode_dropdown.connect_selected_notify(move |dd| {
-        let name = if dd.selected() == 0 { "stealth" } else { "bot" };
-        stack_ref.set_visible_child_name(name);
-    });
+    fields_box.append(&ws_entry);
+    outer.append(&fields_box);
 
     let error_label = Label::new(None);
     error_label.add_css_class("error");
@@ -116,57 +80,26 @@ pub fn show_login(app: &Application, rt: tokio::runtime::Handle, db: Arc<Databas
             return;
         }
 
-        let mode = mode_dropdown.selected();
-
-        // Collect credentials for both client creation and DB storage
-        let (saved_creds, client) = if mode == 0 {
-            let xoxc = xoxc_entry.text().to_string();
-            let xoxd = xoxd_entry.text().to_string();
-            if xoxc.is_empty() || xoxd.is_empty() {
-                error_label.set_text("Both xoxc token and xoxd cookie are required.");
-                error_label.set_visible(true);
-                return;
-            }
-            let ws = ws_entry.text().to_string();
-            let ws_url = if ws.is_empty() {
-                None
-            } else {
-                let ws = ws.trim_start_matches("https://").trim_end_matches('/');
-                Some(format!("https://{ws}"))
-            };
-            let creds = SavedCredentials {
-                auth_mode: "stealth".into(),
-                xoxc_token: Some(xoxc.clone()),
-                xoxd_cookie: Some(xoxd.clone()),
-                bot_token: None,
-                app_token: None,
-                workspace_url: ws_url.clone(),
-            };
-            (creds, Client::new_stealth(xoxc, xoxd, ws_url))
+        let xoxc = xoxc_entry.text().to_string();
+        let xoxd = xoxd_entry.text().to_string();
+        if xoxc.is_empty() || xoxd.is_empty() {
+            error_label.set_text("Both xoxc token and xoxd cookie are required.");
+            error_label.set_visible(true);
+            return;
+        }
+        let ws = ws_entry.text().to_string();
+        let ws_url = if ws.is_empty() {
+            None
         } else {
-            let bot = bot_entry.text().to_string();
-            if bot.is_empty() {
-                error_label.set_text("Bot token is required.");
-                error_label.set_visible(true);
-                return;
-            }
-            let app_tok = {
-                let t = app_entry.text().to_string();
-                if t.is_empty() { None } else { Some(t) }
-            };
-            let creds = SavedCredentials {
-                auth_mode: "bot".into(),
-                xoxc_token: None,
-                xoxd_cookie: None,
-                bot_token: Some(bot.clone()),
-                app_token: app_tok.clone(),
-                workspace_url: None,
-            };
-            (
-                creds,
-                Client::new_bot(slacko::AuthConfig::bot(&bot), app_tok),
-            )
+            let ws = ws.trim_start_matches("https://").trim_end_matches('/');
+            Some(format!("https://{ws}"))
         };
+        let saved_creds = SavedCredentials {
+            xoxc_token: Some(xoxc.clone()),
+            xoxd_cookie: Some(xoxd.clone()),
+            workspace_url: ws_url.clone(),
+        };
+        let client = Client::new(xoxc, xoxd, ws_url);
 
         *connecting.borrow_mut() = true;
         error_label.set_visible(false);
@@ -225,15 +158,10 @@ pub fn show_login(app: &Application, rt: tokio::runtime::Handle, db: Arc<Databas
 
                     let (event_tx, event_rx) = mpsc::unbounded_channel::<SlackEvent>();
                     let (presence_tx, presence_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<String>>();
-                    if let Some(sm_client) = client.socket_mode_client().cloned() {
-                        rt.spawn(crate::slack::socket::run_socket_mode(sm_client, event_tx));
-                    } else if let Some((http, xoxc, xoxd, ws_url)) =
-                        client.stealth_rtm_params()
-                    {
-                        rt.spawn(crate::slack::socket::run_rtm_stealth(
-                            http, xoxc, xoxd, ws_url, event_tx, presence_rx,
-                        ));
-                    }
+                    let (http, xoxc, xoxd, ws_url) = client.rtm_params();
+                    rt.spawn(crate::slack::socket::run_rtm_stealth(
+                        http, xoxc, xoxd, ws_url, event_tx, presence_rx,
+                    ));
 
                     build_app(&app_ref, client, rt, event_rx, db, info.user_id, presence_tx, None);
                     window_ref.close();

@@ -59,8 +59,8 @@ impl ListHost {
 /// Supports `@mention` (user names) and `:emoji:` (shortcode) completion.
 pub struct Autocomplete {
     users: Rc<RefCell<HashMap<String, String>>>,
-    host: ListHost,
-    list: ListBox,
+    _host: ListHost,
+    _list: ListBox,
     on_emoji_picked: Rc<RefCell<Option<Rc<dyn Fn(&str)>>>>,
 }
 
@@ -423,15 +423,10 @@ impl Autocomplete {
 
         Self {
             users,
-            host,
-            list,
+            _host: host,
+            _list: list,
             on_emoji_picked,
         }
-    }
-
-    /// Dismiss the autocomplete immediately.
-    pub fn dismiss(&self) {
-        self.host.hide();
     }
 
     pub fn set_users(&self, users: &HashMap<String, String>) {

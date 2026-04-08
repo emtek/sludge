@@ -1,6 +1,4 @@
 use futures_util::{SinkExt, StreamExt};
-use slacko::api::socket_mode::{SocketModeEvent, SocketModePayload};
-use slacko::SlackClient;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{debug, error, info, warn};
@@ -15,6 +13,7 @@ pub enum SlackEvent {
         text: String,
         ts: String,
         thread_ts: Option<String>,
+        files: Option<Vec<slacko::types::File>>,
     },
     /// A user's presence changed (active/away).
     PresenceChange {
@@ -38,7 +37,6 @@ pub enum SlackEvent {
     UserTyping {
         channel: String,
         user: String,
-        thread_ts: Option<String>,
     },
     /// A channel was marked as read (from another client).
     ChannelMarked {
@@ -57,46 +55,7 @@ pub enum SlackEvent {
     Disconnected,
 }
 
-// ── Socket Mode (bot tokens with app-level token) ──
-
-/// Run Socket Mode using slacko's built-in WebSocket management with auto-reconnect.
-pub async fn run_socket_mode(client: SlackClient, tx: mpsc::UnboundedSender<SlackEvent>) {
-    let result = client
-        .socket_mode()
-        .start_with_reconnect(move |event: SocketModeEvent| {
-            handle_socket_mode_event(&event, &tx);
-            None
-        })
-        .await;
-
-    if let Err(e) = result {
-        error!("Socket Mode exited with error: {e}");
-    }
-}
-
-fn handle_socket_mode_event(
-    event: &SocketModeEvent,
-    tx: &mpsc::UnboundedSender<SlackEvent>,
-) {
-    match &event.payload {
-        SocketModePayload::EventsApi(payload) => {
-            if let Some(evt) = &payload.event {
-                dispatch_event(evt, tx);
-            }
-        }
-        SocketModePayload::Hello => {
-            info!("Socket Mode connected");
-            let _ = tx.send(SlackEvent::Connected);
-        }
-        SocketModePayload::Disconnect { .. } => {
-            info!("Socket Mode disconnect requested");
-            let _ = tx.send(SlackEvent::Disconnected);
-        }
-        _ => {}
-    }
-}
-
-// ── RTM (stealth/xoxc tokens) ──
+// ── RTM ──
 
 /// Run RTM WebSocket for stealth mode with auto-reconnect.
 /// `presence_rx` receives batches of user IDs to subscribe to for presence updates.
@@ -287,9 +246,9 @@ fn dispatch_event(evt: &serde_json::Value, tx: &mpsc::UnboundedSender<SlackEvent
                 return;
             }
 
-            // Skip subtypes we can't handle (allow thread_broadcast and bot_message)
+            // Skip subtypes we can't handle (allow thread_broadcast, bot_message, file_share)
             if let Some(st) = subtype {
-                if st != "thread_broadcast" && st != "bot_message" {
+                if st != "thread_broadcast" && st != "bot_message" && st != "file_share" {
                     debug!("Skipping message subtype: {st}");
                     return;
                 }
@@ -322,6 +281,10 @@ fn dispatch_event(evt: &serde_json::Value, tx: &mpsc::UnboundedSender<SlackEvent
                 .and_then(|v| v.as_str())
                 .map(String::from);
 
+            let files: Option<Vec<slacko::types::File>> = evt
+                .get("files")
+                .and_then(|v| serde_json::from_value(v.clone()).ok());
+
             if !channel.is_empty() && !ts.is_empty() {
                 let _ = tx.send(SlackEvent::MessageReceived {
                     channel,
@@ -329,6 +292,7 @@ fn dispatch_event(evt: &serde_json::Value, tx: &mpsc::UnboundedSender<SlackEvent
                     text,
                     ts,
                     thread_ts,
+                    files,
                 });
             }
         }
@@ -382,9 +346,8 @@ fn dispatch_event(evt: &serde_json::Value, tx: &mpsc::UnboundedSender<SlackEvent
         "user_typing" => {
             let channel = evt.get("channel").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let user = evt.get("user").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let thread_ts = evt.get("thread_ts").and_then(|v| v.as_str()).map(String::from);
             if !channel.is_empty() && !user.is_empty() {
-                let _ = tx.send(SlackEvent::UserTyping { channel, user, thread_ts });
+                let _ = tx.send(SlackEvent::UserTyping { channel, user });
             }
         }
         "im_marked" | "channel_marked" | "group_marked" | "mpim_marked" => {

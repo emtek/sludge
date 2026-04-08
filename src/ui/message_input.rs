@@ -58,7 +58,7 @@ pub struct MessageInput {
     pub widget: gtk::Box,
     pub text_view: TextView,
     pub send_button: SendButton,
-    pub attach_button: Button,
+    _attach_button: Button,
     files: Rc<RefCell<Vec<PathBuf>>>,
     file_preview_box: gtk::Box,
     autocomplete: Autocomplete,
@@ -94,6 +94,7 @@ impl MessageInput {
         text_view.set_left_margin(8);
         text_view.set_right_margin(8);
         text_view.add_css_class("card");
+        text_view.set_extra_menu(None::<&gtk::gio::MenuModel>);
 
         // Limit height
         text_view.set_height_request(40);
@@ -156,7 +157,7 @@ impl MessageInput {
             widget: container,
             text_view,
             send_button,
-            attach_button,
+            _attach_button: attach_button,
             files,
             file_preview_box,
             autocomplete,
@@ -192,9 +193,6 @@ impl MessageInput {
         files
     }
 
-    pub fn has_files(&self) -> bool {
-        !self.files.borrow().is_empty()
-    }
 }
 
 pub fn rebuild_file_preview(preview_box: &gtk::Box, files: &Rc<RefCell<Vec<PathBuf>>>) {

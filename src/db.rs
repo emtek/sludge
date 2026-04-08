@@ -12,11 +12,8 @@ type Db = Surreal<surrealdb::engine::local::Db>;
 /// Stored login credentials.
 #[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
 pub struct SavedCredentials {
-    pub auth_mode: String, // "stealth" or "bot"
     pub xoxc_token: Option<String>,
     pub xoxd_cookie: Option<String>,
-    pub bot_token: Option<String>,
-    pub app_token: Option<String>,
     pub workspace_url: Option<String>,
 }
 
@@ -141,7 +138,7 @@ impl Database {
             .await
         {
             Ok(Some(creds)) => {
-                info!("Loaded saved credentials (mode: {})", creds.auth_mode);
+                info!("Loaded saved credentials");
                 Some(creds)
             }
             Ok(None) => {

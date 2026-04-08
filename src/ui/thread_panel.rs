@@ -1,13 +1,12 @@
 use gtk4::prelude::*;
-use gtk4::{self as gtk, Button, Label, ListBox, ListBoxRow, Picture, ScrolledWindow, TextView};
+use gtk4::{self as gtk, Button, Label, ListBox, ScrolledWindow, TextView};
 use slacko::types::Message;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 
 use crate::slack::client::Client;
-use crate::slack::helpers::format_message_markup;
 use crate::ui::autocomplete::Autocomplete;
 use crate::ui::message_input::{attach_image_paste, rebuild_file_preview};
 use crate::ui::message_view::ReactionCallback;
@@ -20,8 +19,9 @@ pub struct ThreadPanel {
     pub send_button: SendButton,
     pub text_view: TextView,
     pub separator: gtk::Separator,
-    header_label: Label,
+    _header_label: Label,
     scrolled: ScrolledWindow,
+    mention_callback: RefCell<Option<crate::ui::message_view::MentionCallback>>,
     reaction_callback: RefCell<Option<ReactionCallback>>,
     delete_callback: RefCell<Option<crate::ui::message_view::DeleteCallback>>,
     self_user_id: RefCell<String>,
@@ -33,6 +33,10 @@ pub struct ThreadPanel {
     files: Rc<RefCell<Vec<PathBuf>>>,
     file_preview_box: gtk::Box,
     reaction_boxes: Rc<RefCell<HashMap<String, gtk::FlowBox>>>,
+    image_generation: Rc<Cell<u64>>,
+    thread_labels: Rc<RefCell<HashMap<String, Label>>>,
+    thread_counts: Rc<RefCell<HashMap<String, usize>>>,
+    subteam_names: RefCell<Rc<HashMap<String, String>>>,
 }
 
 impl ThreadPanel {
@@ -75,6 +79,8 @@ impl ThreadPanel {
         let scrolled = ScrolledWindow::new();
         scrolled.set_vexpand(true);
         scrolled.set_hexpand(true);
+        scrolled.set_focusable(true);
+        scrolled.set_hscrollbar_policy(gtk::PolicyType::Never);
         scrolled.set_child(Some(&list_box));
 
         container.append(&scrolled);
@@ -111,6 +117,7 @@ impl ThreadPanel {
         text_view.set_right_margin(6);
         text_view.add_css_class("card");
         text_view.set_height_request(36);
+        text_view.set_extra_menu(None::<&gtk::gio::MenuModel>);
 
         let frame = gtk::Frame::new(None);
         frame.set_hexpand(true);
@@ -177,8 +184,9 @@ impl ThreadPanel {
             send_button,
             text_view,
             separator,
-            header_label,
+            _header_label: header_label,
             scrolled,
+            mention_callback: RefCell::new(None),
             reaction_callback: RefCell::new(None),
             delete_callback: RefCell::new(None),
             self_user_id: RefCell::new(String::new()),
@@ -189,6 +197,10 @@ impl ThreadPanel {
             files,
             file_preview_box,
             reaction_boxes: Rc::new(RefCell::new(HashMap::new())),
+            image_generation: Rc::new(Cell::new(0)),
+            thread_labels: Rc::new(RefCell::new(HashMap::new())),
+            thread_counts: Rc::new(RefCell::new(HashMap::new())),
+            subteam_names: RefCell::new(Rc::new(HashMap::new())),
         }
     }
 
@@ -200,6 +212,10 @@ impl ThreadPanel {
     /// Set a callback invoked when an emoji is picked via autocomplete.
     pub fn set_on_emoji_picked(&self, f: Rc<dyn Fn(&str)>) {
         self.autocomplete.set_on_emoji_picked(f);
+    }
+
+    pub fn set_mention_callback(&self, cb: crate::ui::message_view::MentionCallback) {
+        *self.mention_callback.borrow_mut() = Some(cb);
     }
 
     pub fn set_reaction_callback(&self, cb: ReactionCallback) {
@@ -216,6 +232,10 @@ impl ThreadPanel {
 
     pub fn set_channel_id(&self, id: &str) {
         *self.channel_id.borrow_mut() = Some(id.to_string());
+    }
+
+    pub fn set_subteam_names(&self, names: Rc<HashMap<String, String>>) {
+        *self.subteam_names.borrow_mut() = names;
     }
 
     pub fn show(&self) {
@@ -256,14 +276,19 @@ impl ThreadPanel {
     ) {
         self.clear();
 
-        let rcb = self.reaction_callback.borrow().clone();
-        let dcb = self.delete_callback.borrow().clone();
-        let self_uid = self.self_user_id.borrow().clone();
-        let cid = self.channel_id.borrow().clone();
+        let mcb = self.mention_callback.borrow();
+        let rcb = self.reaction_callback.borrow();
+        let dcb = self.delete_callback.borrow();
+        let self_uid = self.self_user_id.borrow();
+        let cid = self.channel_id.borrow();
+        let subteam_names = self.subteam_names.borrow();
         self.reaction_boxes.borrow_mut().clear();
         for msg in messages {
-            let row = make_thread_message_row(
-                msg, users, client, rt, &rcb, &dcb, cid.as_deref(), &self_uid, &self.picker_cells, &self.reaction_boxes,
+            let row = crate::ui::message_view::make_message_row(
+                msg, users, &subteam_names, client, rt,
+                &None, &mcb, &rcb, &dcb,
+                cid.as_deref(), &self.thread_counts.borrow(), &self.thread_labels, &self.reaction_boxes, &self_uid,
+                &self.image_generation, &self.picker_cells,
             );
             self.list_box.append(&row);
         }
@@ -278,12 +303,17 @@ impl ThreadPanel {
         client: &Client,
         rt: &tokio::runtime::Handle,
     ) {
-        let rcb = self.reaction_callback.borrow().clone();
-        let dcb = self.delete_callback.borrow().clone();
-        let self_uid = self.self_user_id.borrow().clone();
-        let cid = self.channel_id.borrow().clone();
-        let row = make_thread_message_row(
-            msg, users, client, rt, &rcb, &dcb, cid.as_deref(), &self_uid, &self.picker_cells, &self.reaction_boxes,
+        let mcb = self.mention_callback.borrow();
+        let rcb = self.reaction_callback.borrow();
+        let dcb = self.delete_callback.borrow();
+        let self_uid = self.self_user_id.borrow();
+        let cid = self.channel_id.borrow();
+        let subteam_names = self.subteam_names.borrow();
+        let row = crate::ui::message_view::make_message_row(
+            msg, users, &subteam_names, client, rt,
+            &None, &mcb, &rcb, &dcb,
+            cid.as_deref(), &self.thread_counts.borrow(), &self.thread_labels, &self.reaction_boxes, &self_uid,
+            &self.image_generation, &self.picker_cells,
         );
         self.list_box.append(&row);
         self.scroll_to_bottom();
@@ -387,378 +417,4 @@ impl ThreadPanel {
             }
         });
     }
-}
-
-fn make_thread_message_row(
-    msg: &Message,
-    users: &HashMap<String, String>,
-    client: &Client,
-    rt: &tokio::runtime::Handle,
-    reaction_cb: &Option<ReactionCallback>,
-    delete_cb: &Option<crate::ui::message_view::DeleteCallback>,
-    channel_id: Option<&str>,
-    self_user_id: &str,
-    picker_cells: &Rc<RefCell<Vec<Rc<RefCell<Option<gtk::Popover>>>>>>,
-    reaction_boxes: &Rc<RefCell<HashMap<String, gtk::FlowBox>>>,
-) -> ListBoxRow {
-    let row = ListBoxRow::new();
-
-    let outer = gtk::Box::new(gtk::Orientation::Vertical, 2);
-    outer.set_margin_top(6);
-    outer.set_margin_bottom(6);
-    outer.set_margin_start(8);
-    outer.set_margin_end(8);
-
-    let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-
-    let user_id = msg.user.as_deref()
-        .or(msg.bot_id.as_deref())
-        .unwrap_or("unknown");
-    let display_name = users
-        .get(user_id)
-        .cloned()
-        .unwrap_or_else(|| user_id.to_string());
-
-    let name_label = Label::new(Some(&display_name));
-    name_label.add_css_class("heading");
-    name_label.set_halign(gtk::Align::Start);
-    header.append(&name_label);
-
-    let time_str = format_timestamp(&msg.ts);
-    let time_label = Label::new(Some(&time_str));
-    time_label.add_css_class("dim-label");
-    time_label.add_css_class("caption");
-    time_label.set_halign(gtk::Align::Start);
-    time_label.set_hexpand(true);
-    header.append(&time_label);
-
-    // Delete button for own messages
-    let is_own = msg.user.as_deref() == Some(self_user_id) && !self_user_id.is_empty();
-    if is_own {
-        if let (Some(dcb), Some(cid)) = (delete_cb, channel_id) {
-            let del_btn = gtk::Button::from_icon_name("user-trash-symbolic");
-            del_btn.add_css_class("flat");
-            del_btn.add_css_class("delete-btn");
-            del_btn.set_halign(gtk::Align::End);
-            del_btn.set_tooltip_text(Some("Delete message"));
-
-            let dcb = dcb.clone();
-            let cid = cid.to_string();
-            let ts = msg.ts.clone();
-            let row_weak = row.downgrade();
-            del_btn.connect_clicked(move |_| {
-                if let Some(row) = row_weak.upgrade() {
-                    dcb(&cid, &ts, &row);
-                }
-            });
-
-            header.append(&del_btn);
-        }
-    }
-
-    outer.append(&header);
-
-    if !msg.text.is_empty() {
-        let body = crate::ui::message_view::make_message_body(&msg.text, users, &None);
-        outer.append(&body);
-    }
-
-    // Render attachment text content (title, pretext, text, fallback)
-    if let Some(attachments) = &msg.attachments {
-        for att in attachments {
-            let mut att_parts: Vec<String> = Vec::new();
-            if let Some(pretext) = &att.pretext {
-                if !pretext.is_empty() {
-                    att_parts.push(pretext.clone());
-                }
-            }
-            if let Some(title) = &att.title {
-                if !title.is_empty() {
-                    if let Some(link) = &att.title_link {
-                        att_parts.push(format!("<{link}|{title}>"));
-                    } else {
-                        att_parts.push(format!("*{title}*"));
-                    }
-                }
-            }
-            if let Some(text) = &att.text {
-                if !text.is_empty() {
-                    att_parts.push(text.clone());
-                }
-            }
-            if att_parts.is_empty() {
-                if let Some(fallback) = &att.fallback {
-                    if !fallback.is_empty() {
-                        att_parts.push(fallback.clone());
-                    }
-                }
-            }
-
-            if !att_parts.is_empty() {
-                let att_text = att_parts.join("\n");
-                let markup = format_message_markup(&att_text, users);
-
-                let att_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-
-                if let Some(color) = &att.color {
-                    let bar = gtk::DrawingArea::new();
-                    bar.set_size_request(3, -1);
-                    bar.set_vexpand(true);
-                    let color = color.clone();
-                    bar.set_draw_func(move |_, cr, _w, h| {
-                        let hex = color.trim_start_matches('#');
-                        if hex.len() == 6 {
-                            if let (Ok(r), Ok(g), Ok(b)) = (
-                                u8::from_str_radix(&hex[0..2], 16),
-                                u8::from_str_radix(&hex[2..4], 16),
-                                u8::from_str_radix(&hex[4..6], 16),
-                            ) {
-                                cr.set_source_rgb(r as f64 / 255.0, g as f64 / 255.0, b as f64 / 255.0);
-                                cr.rectangle(0.0, 0.0, 3.0, h as f64);
-                                let _ = cr.fill();
-                            }
-                        }
-                    });
-                    att_box.append(&bar);
-                }
-
-                let att_label = Label::new(None);
-                att_label.set_markup(&markup);
-                att_label.set_wrap(true);
-                att_label.set_halign(gtk::Align::Start);
-                att_label.set_selectable(true);
-                att_label.set_xalign(0.0);
-                att_label.set_margin_start(6);
-
-                att_box.append(&att_label);
-                outer.append(&att_box);
-            }
-        }
-    }
-
-    // File attachments
-    let mut image_url_sets: Vec<Vec<String>> = Vec::new();
-    if let Some(files) = &msg.files {
-        for file in files {
-            let is_image = file
-                .mimetype
-                .as_deref()
-                .is_some_and(|m| m.starts_with("image/"));
-            if is_image {
-                let mut candidates = Vec::new();
-                if let Some(url) = &file.url_private_download {
-                    candidates.push(url.clone());
-                }
-                if let Some(url) = &file.url_private {
-                    candidates.push(url.clone());
-                }
-                if let Some(url) = &file.permalink {
-                    candidates.push(url.clone());
-                }
-                if !candidates.is_empty() {
-                    image_url_sets.push(candidates);
-                }
-            } else {
-                // Non-image file: show download chip
-                let download_url = file.url_private_download.clone()
-                    .or_else(|| file.url_private.clone());
-                let chip = crate::ui::message_view::make_file_attachment_chip(
-                    file, download_url.as_deref(), client, rt,
-                );
-                outer.append(&chip);
-            }
-        }
-    }
-    if let Some(attachments) = &msg.attachments {
-        for att in attachments {
-            let mut candidates = Vec::new();
-            if let Some(url) = &att.image_url {
-                candidates.push(url.clone());
-            }
-            if let Some(url) = &att.thumb_url {
-                candidates.push(url.clone());
-            }
-            if !candidates.is_empty() {
-                image_url_sets.push(candidates);
-            }
-        }
-    }
-
-    for urls in image_url_sets {
-        let picture = Picture::new();
-        picture.set_halign(gtk::Align::Start);
-        picture.set_content_fit(gtk::ContentFit::ScaleDown);
-        picture.set_size_request(-1, 150);
-        picture.set_can_shrink(true);
-        picture.set_cursor_from_name(Some("pointer"));
-        outer.append(&picture);
-
-        // Click to open fullscreen viewer (loads full resolution)
-        let stored_texture: Rc<RefCell<Option<gtk4::gdk::Texture>>> = Rc::new(RefCell::new(None));
-        {
-            let click = gtk::GestureClick::new();
-            click.set_button(1);
-            let tex = stored_texture.clone();
-            let click_urls = urls.clone();
-            let click_client = client.clone();
-            let click_rt = rt.clone();
-            let picture_weak = picture.downgrade();
-            click.connect_released(move |_, _, _, _| {
-                let Some(picture) = picture_weak.upgrade() else { return };
-                if let Some(texture) = tex.borrow().as_ref() {
-                    if let Some(root) = picture.root() {
-                        if let Some(win) = root.downcast_ref::<gtk::Window>() {
-                            crate::ui::image_viewer::show(
-                                texture,
-                                win,
-                                Some(click_urls.clone()),
-                                Some(click_client.clone()),
-                                Some(click_rt.clone()),
-                            );
-                        }
-                    }
-                }
-            });
-            picture.add_controller(click);
-        }
-
-        let client = client.clone();
-        let rt = rt.clone();
-        let picture_weak = picture.downgrade();
-        let stored_texture_weak = Rc::downgrade(&stored_texture);
-        gtk4::glib::spawn_future_local(async move {
-            let c = client.clone();
-            let urls2 = urls.clone();
-            let bytes_result = rt.spawn(async move {
-                for url in &urls2 {
-                    match c.fetch_image_bytes(url).await {
-                        Ok(b) => return Ok(b),
-                        Err(e) => {
-                            tracing::debug!("Image URL failed ({url}): {e}");
-                        }
-                    }
-                }
-                Err("all URLs failed".to_string())
-            }).await;
-
-            let Some(picture) = picture_weak.upgrade() else { return; };
-            let Some(stored_texture) = stored_texture_weak.upgrade() else { return; };
-
-            match bytes_result {
-                Ok(Ok(bytes)) => {
-                    let gbytes = gtk4::glib::Bytes::from(&bytes);
-                    let stream = gtk4::gio::MemoryInputStream::from_bytes(&gbytes);
-                    match gtk4::gdk_pixbuf::Pixbuf::from_stream_at_scale(
-                        &stream,
-                        300,  // max width for thread panel
-                        -1,
-                        true,
-                        gtk4::gio::Cancellable::NONE,
-                    ) {
-                        Ok(pixbuf) => {
-                            let texture = gtk4::gdk::Texture::for_pixbuf(&pixbuf);
-                            picture.set_paintable(Some(&texture));
-                            *stored_texture.borrow_mut() = Some(texture);
-                            let w = pixbuf.width();
-                            let h = pixbuf.height();
-                            if w > 0 && h > 0 {
-                                let display_w = 300.min(w);
-                                let display_h = (h as f64 * display_w as f64 / w as f64) as i32;
-                                picture.set_size_request(display_w, display_h);
-                            }
-                        }
-                        Err(e) => {
-                            tracing::debug!("Failed to decode image: {e}");
-                            picture.set_visible(false);
-                        }
-                    }
-                }
-                _ => {
-                    picture.set_visible(false);
-                }
-            }
-        });
-    }
-
-    // ── Reactions ──
-    {
-        let reactions_box = gtk::FlowBox::new();
-        reactions_box.set_selection_mode(gtk::SelectionMode::None);
-        reactions_box.set_halign(gtk::Align::Start);
-        reactions_box.set_max_children_per_line(20);
-        reactions_box.set_homogeneous(false);
-        reactions_box.set_row_spacing(2);
-        reactions_box.set_column_spacing(4);
-
-        if let Some(reactions) = &msg.reactions {
-            for reaction in reactions {
-                let btn = crate::ui::message_view::make_reaction_button(
-                    reaction, users, &msg.ts,
-                    reaction_cb, channel_id,
-                );
-                reactions_box.insert(&btn, -1);
-            }
-        }
-
-        if let (Some(rcb), Some(cid)) = (reaction_cb.clone(), channel_id) {
-            let add_btn = gtk::Button::from_icon_name("list-add-symbolic");
-            add_btn.add_css_class("flat");
-            add_btn.add_css_class("reaction-add-btn");
-
-            let rcb2 = rcb.clone();
-            let cid2 = cid.to_string();
-            let ts2 = msg.ts.clone();
-            let chooser_cell: Rc<RefCell<Option<gtk::Popover>>> =
-                Rc::new(RefCell::new(None));
-            picker_cells.borrow_mut().push(chooser_cell.clone());
-
-            let cell_click = chooser_cell.clone();
-            let btn_weak = add_btn.downgrade();
-            add_btn.connect_clicked(move |_| {
-                let Some(btn) = btn_weak.upgrade() else { return };
-                let first_show = cell_click.borrow().is_none();
-                if first_show {
-                    let rcb3 = rcb2.clone();
-                    let cid3 = cid2.clone();
-                    let ts3 = ts2.clone();
-                    let on_react: Rc<dyn Fn(&str)> = Rc::new(move |shortcode: &str| {
-                        let dummy = gtk::Button::new();
-                        rcb3(&cid3, &ts3, shortcode, &dummy);
-                    });
-                    let picker = crate::ui::autocomplete::build_reaction_popover(&btn, on_react);
-                    *cell_click.borrow_mut() = Some(picker);
-                }
-                if let Some(picker) = cell_click.borrow().as_ref() {
-                    if first_show {
-                        let p = picker.clone();
-                        gtk4::glib::idle_add_local_once(move || p.popup());
-                    } else {
-                        picker.popup();
-                    }
-                }
-            });
-
-            reactions_box.insert(&add_btn, -1);
-        }
-
-        reaction_boxes.borrow_mut().insert(msg.ts.clone(), reactions_box.clone());
-        outer.append(&reactions_box);
-    }
-
-    row.set_child(Some(&outer));
-    row.set_widget_name(&msg.ts);
-    row
-}
-
-fn format_timestamp(ts: &str) -> String {
-    let epoch_str = ts.split('.').next().unwrap_or(ts);
-    if let Ok(epoch) = epoch_str.parse::<i64>() {
-        if let Some(dt) = chrono::DateTime::from_timestamp(epoch, 0) {
-            return dt
-                .with_timezone(&chrono::Local)
-                .format("%d %b %Y %H:%M")
-                .to_string();
-        }
-    }
-    ts.to_string()
 }

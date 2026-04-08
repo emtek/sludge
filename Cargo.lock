@@ -4690,6 +4690,7 @@ dependencies = [
 name = "sludge"
 version = "0.2.0"
 dependencies = [
+ "bytes",
  "chrono",
  "dirs",
  "emoji",

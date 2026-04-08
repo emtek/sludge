@@ -75,7 +75,7 @@ pub fn user_display_name(user: &User) -> String {
 /// Format a Slack message as plain text for notifications.
 /// Replaces `<@UXXXX>` with @Name, `<#CXXXX|name>` with #name,
 /// `<url|label>` with label, `<url>` with url, and emoji shortcodes with unicode.
-pub fn format_message_plain(text: &str, user_names: &HashMap<String, String>) -> String {
+pub fn format_message_plain(text: &str, user_names: &HashMap<String, String>, subteam_names: &HashMap<String, String>) -> String {
     let mut result = String::with_capacity(text.len());
     let mut rest = text;
 
@@ -94,6 +94,16 @@ pub fn format_message_plain(text: &str, user_names: &HashMap<String, String>) ->
                     .unwrap_or_else(|| user_id.to_string());
                 result.push('@');
                 result.push_str(&name);
+            } else if let Some(rest) = inner.strip_prefix("!subteam^") {
+                let (id, label) = rest.split_once('|').unzip();
+                let subteam_id = id.unwrap_or(rest);
+                if let Some(label) = label {
+                    result.push_str(label);
+                } else if let Some(handle) = subteam_names.get(subteam_id) {
+                    result.push_str(handle);
+                } else {
+                    result.push_str("@group");
+                }
             } else if inner.starts_with('#') {
                 if let Some((_id, name)) = inner[1..].split_once('|') {
                     result.push('#');
@@ -119,9 +129,9 @@ pub fn format_message_plain(text: &str, user_names: &HashMap<String, String>) ->
 
 /// Format a Slack message as Pango markup with emoji, clickable @mentions, links, and markdown.
 /// The returned string is safe for `Label::set_markup`.
-pub fn format_message_markup(text: &str, user_names: &HashMap<String, String>) -> String {
+pub fn format_message_markup(text: &str, user_names: &HashMap<String, String>, subteam_names: &HashMap<String, String>) -> String {
     // 1. Process Slack <...> constructs (mentions, links) — also XML-escapes text
-    let with_links = replace_slack_brackets(text, user_names);
+    let with_links = replace_slack_brackets(text, user_names, subteam_names);
     // 2. Apply Slack markdown (bold, italic, strikethrough, code)
     let with_md = apply_slack_markdown(&with_links);
     // 3. Replace emoji shortcodes
@@ -309,7 +319,7 @@ fn replace_blockquotes(text: &str) -> String {
 /// - `<url>` → clickable link
 /// - `<url|label>` → clickable link with label
 /// Surrounding text is XML-escaped.
-fn replace_slack_brackets(text: &str, user_names: &HashMap<String, String>) -> String {
+fn replace_slack_brackets(text: &str, user_names: &HashMap<String, String>, subteam_names: &HashMap<String, String>) -> String {
     let mut result = String::with_capacity(text.len());
     let mut rest = text;
 
@@ -332,6 +342,19 @@ fn replace_slack_brackets(text: &str, user_names: &HashMap<String, String>) -> S
                 result.push_str(&format!(
                     "<a href=\"mention:{user_id}\">@{escaped}</a>"
                 ));
+            } else if let Some(rest) = inner.strip_prefix("!subteam^") {
+                // Subteam/usergroup mention: <!subteam^SXXXX> or <!subteam^SXXXX|@label>
+                let (id, label) = rest.split_once('|').unzip();
+                let subteam_id = id.unwrap_or(rest);
+                let display = if let Some(label) = label {
+                    label.to_string()
+                } else if let Some(handle) = subteam_names.get(subteam_id) {
+                    handle.clone()
+                } else {
+                    "@group".to_string()
+                };
+                let escaped = glib::markup_escape_text(&display);
+                result.push_str(&format!("<b>{escaped}</b>"));
             } else if inner.starts_with('#') {
                 // Channel link: <#CXXXX|name>
                 if let Some((_id, name)) = inner[1..].split_once('|') {
