@@ -364,70 +364,126 @@ impl Database {
 
     // ── Messages ──
 
-    /// Save messages for a channel (replaces existing cache and updates FTS index).
+    /// Index messages for a channel (FTS + channel metadata).
     pub async fn save_messages(&self, channel_id: &str, messages: &[Message]) -> Result<(), String> {
-        let json =
-            serde_json::to_string(messages).map_err(|e| format!("JSON serialize error: {e}"))?;
-        let cache = JsonCache { data: json };
-        let key = format!("messages_{channel_id}");
-        let _: Result<Option<JsonCache>, _> = self.db.delete(("cache", &*key)).await;
-        let _: Option<JsonCache> = self
-            .db
-            .create(("cache", &*key))
-            .content(cache)
-            .await
-            .map_err(|e| format!("DB save messages error: {e}"))?;
-
-        // Index each message for full-text search and update channel metadata
         self.index_messages(channel_id, messages).await;
         self.update_channel_meta(channel_id, messages).await;
-
-        tracing::debug!("Saved {} messages for channel {channel_id}", messages.len());
+        tracing::debug!("Indexed {} messages for channel {channel_id}", messages.len());
         Ok(())
     }
 
-    /// Load cached messages for a channel.
+    /// Load recent messages for a channel from the FTS index.
     pub async fn load_messages(&self, channel_id: &str) -> Option<Vec<Message>> {
-        let key = format!("messages_{channel_id}");
-        match self
+        let result = self
             .db
-            .select::<Option<JsonCache>>(("cache", &*key))
-            .await
-        {
-            Ok(Some(cache)) => match serde_json::from_str(&cache.data) {
-                Ok(messages) => {
-                    let messages: Vec<Message> = messages;
-                    tracing::debug!(
-                        "Loaded {} cached messages for channel {channel_id}",
-                        messages.len()
-                    );
-                    Some(messages)
+            .query("SELECT ts, data FROM message WHERE channel = $channel AND (thread_ts IS NONE OR thread_ts = ts) ORDER BY ts DESC LIMIT 10")
+            .bind(("channel", channel_id.to_string()))
+            .await;
+
+        match result {
+            Ok(mut response) => {
+                let rows: Result<Vec<serde_json::Value>, _> = response.take(0);
+                match rows {
+                    Ok(rows) if rows.is_empty() => None,
+                    Ok(rows) => {
+                        let messages: Vec<Message> = rows
+                            .into_iter()
+                            .filter_map(|row| {
+                                let data = row.get("data")?.as_str()?;
+                                serde_json::from_str(data).ok()
+                            })
+                            .collect();
+                        tracing::debug!(
+                            "Loaded {} messages for channel {channel_id}",
+                            messages.len()
+                        );
+                        if messages.is_empty() { None } else { Some(messages) }
+                    }
+                    Err(e) => {
+                        error!("DB load messages error: {e}");
+                        None
+                    }
                 }
-                Err(e) => {
-                    error!("Failed to deserialize cached messages: {e}");
-                    None
-                }
-            },
-            Ok(None) => None,
+            }
             Err(e) => {
-                error!("DB load messages error: {e}");
+                error!("DB load messages query error: {e}");
                 None
             }
         }
     }
 
-    /// Append a single message to the cached messages for a channel.
+    /// Index a single message for a channel.
     pub async fn append_message(&self, channel_id: &str, message: &Message) {
-        let mut messages = self.load_messages(channel_id).await.unwrap_or_default();
-        messages.push(message.clone());
-        // Keep only the last 100 messages
-        if messages.len() > 100 {
-            messages.drain(..messages.len() - 100);
-        }
-        let _ = self.save_messages(channel_id, &messages).await;
+        self.index_messages(channel_id, &[message.clone()]).await;
     }
 
-    /// Update a reaction on a cached message. Returns the updated reactions list if found.
+    /// Load messages newer than `after_ts` for a channel from the FTS index.
+    pub async fn load_messages_after(&self, channel_id: &str, after_ts: &str, limit: u32) -> Vec<Message> {
+        let result = self
+            .db
+            .query("SELECT ts, data FROM message WHERE channel = $channel AND ts > $after_ts AND (thread_ts IS NONE OR thread_ts = ts) ORDER BY ts ASC LIMIT $limit")
+            .bind(("channel", channel_id.to_string()))
+            .bind(("after_ts", after_ts.to_string()))
+            .bind(("limit", limit as i64))
+            .await;
+
+        match result {
+            Ok(mut response) => {
+                let rows: Result<Vec<serde_json::Value>, _> = response.take(0);
+                match rows {
+                    Ok(rows) => rows
+                        .into_iter()
+                        .filter_map(|row| {
+                            let data = row.get("data")?.as_str()?;
+                            serde_json::from_str(data).ok()
+                        })
+                        .collect(),
+                    Err(e) => {
+                        error!("DB load_messages_after error: {e}");
+                        Vec::new()
+                    }
+                }
+            }
+            Err(e) => {
+                error!("DB load_messages_after query error: {e}");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Delete an indexed message by channel and timestamp.
+    pub async fn delete_indexed_message(&self, channel_id: &str, ts: &str) {
+        if let Err(e) = self
+            .db
+            .query("DELETE FROM message WHERE channel = $channel AND ts = $ts")
+            .bind(("channel", channel_id.to_string()))
+            .bind(("ts", ts.to_string()))
+            .await
+        {
+            tracing::warn!("Failed to delete indexed message {ts} in {channel_id}: {e}");
+        }
+    }
+
+    /// Update the text of an indexed message and re-serialize its data blob.
+    pub async fn update_indexed_message_text(&self, channel_id: &str, ts: &str, new_text: &str) {
+        if let Some(mut msg) = self.get_indexed_message(channel_id, ts).await {
+            msg.text = new_text.to_string();
+            let data = serde_json::to_string(&msg).unwrap_or_default();
+            if let Err(e) = self
+                .db
+                .query("UPDATE message SET text = $text, data = $data WHERE channel = $channel AND ts = $ts")
+                .bind(("channel", channel_id.to_string()))
+                .bind(("ts", ts.to_string()))
+                .bind(("text", new_text.to_string()))
+                .bind(("data", data))
+                .await
+            {
+                tracing::warn!("Failed to update indexed message {ts} in {channel_id}: {e}");
+            }
+        }
+    }
+
+    /// Update a reaction on an indexed message. Returns the updated reactions list if found.
     pub async fn update_reaction(
         &self,
         channel_id: &str,
@@ -436,8 +492,7 @@ impl Database {
         user_id: &str,
         added: bool,
     ) -> Option<Vec<slacko::types::Reaction>> {
-        let mut messages = self.load_messages(channel_id).await?;
-        let msg = messages.iter_mut().find(|m| m.ts == message_ts)?;
+        let mut msg = self.get_indexed_message(channel_id, message_ts).await?;
 
         let reactions = msg.reactions.get_or_insert_with(Vec::new);
 
@@ -463,7 +518,8 @@ impl Database {
         reactions.retain(|r| r.count > 0);
 
         let updated = msg.reactions.clone();
-        let _ = self.save_messages(channel_id, &messages).await;
+        // Re-index with updated data
+        self.index_messages(channel_id, &[msg]).await;
         updated
     }
 
@@ -506,10 +562,8 @@ impl Database {
             tracing::warn!("Failed to delete messages for {channel_id}: {e}");
         }
 
-        // Delete cached message list and activity
-        let cache_key = format!("messages_{channel_id}");
+        // Delete activity cache
         let activity_key = format!("activity_{channel_id}");
-        let _: Result<Option<serde_json::Value>, _> = self.db.delete(("cache", &*cache_key)).await;
         let _: Result<Option<serde_json::Value>, _> = self.db.delete(("cache", &*activity_key)).await;
 
         // Delete channel metadata
@@ -538,6 +592,65 @@ impl Database {
         {
             tracing::warn!("Failed to mark backfill checked for {channel_id}: {e}");
         }
+    }
+
+    /// Get the newest cached message timestamp for a channel.
+    pub async fn get_newest_ts(&self, channel_id: &str) -> Option<String> {
+        let result = self
+            .db
+            .query("SELECT newest_ts FROM channel_meta WHERE channel = $channel LIMIT 1")
+            .bind(("channel", channel_id.to_string()))
+            .await;
+        match result {
+            Ok(mut response) => {
+                let rows: Result<Vec<serde_json::Value>, _> = response.take(0);
+                rows.ok()?.into_iter().next()
+                    .and_then(|row| row.get("newest_ts")?.as_str().map(String::from))
+                    .filter(|s| !s.is_empty())
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// Load messages around a timestamp from the DB (for navigating to a specific message).
+    pub async fn load_messages_around(&self, channel_id: &str, ts: &str, count: u32) -> Vec<Message> {
+        // Get `count` messages before (inclusive) and `count` after
+        let before_result = self
+            .db
+            .query("SELECT ts, data FROM message WHERE channel = $channel AND ts <= $ts AND (thread_ts IS NONE OR thread_ts = ts) ORDER BY ts DESC LIMIT $limit")
+            .bind(("channel", channel_id.to_string()))
+            .bind(("ts", ts.to_string()))
+            .bind(("limit", count as i64))
+            .await;
+        let after_result = self
+            .db
+            .query("SELECT ts, data FROM message WHERE channel = $channel AND ts > $ts AND (thread_ts IS NONE OR thread_ts = ts) ORDER BY ts ASC LIMIT $limit")
+            .bind(("channel", channel_id.to_string()))
+            .bind(("ts", ts.to_string()))
+            .bind(("limit", count as i64))
+            .await;
+
+        let mut messages = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for result in [before_result, after_result] {
+            if let Ok(mut response) = result {
+                let rows: Result<Vec<serde_json::Value>, _> = response.take(0);
+                if let Ok(rows) = rows {
+                    for row in rows {
+                        if let Some(data) = row.get("data").and_then(|v| v.as_str()) {
+                            if let Ok(msg) = serde_json::from_str::<Message>(data) {
+                                if seen.insert(msg.ts.clone()) {
+                                    messages.push(msg);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Sort newest first (matches convention of load_messages)
+        messages.sort_by(|a, b| b.ts.cmp(&a.ts));
+        messages
     }
 
     /// Load all channel metadata. Returns map of channel_id -> (oldest_ts, newest_ts, backfill_checked_at).
@@ -717,6 +830,62 @@ impl Database {
             }
             Err(e) => {
                 error!("FTS search query error for {query:?}: {e}");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Search messages in a specific channel, returning highlighted text.
+    /// Returns (Message, highlighted_text) pairs sorted by relevance.
+    pub async fn search_channel_messages(
+        &self,
+        channel_id: &str,
+        query: &str,
+    ) -> Vec<(Message, String)> {
+        let result = self
+            .db
+            .query(
+                "SELECT ts, data, search::score(0) AS score,
+                        search::highlight('<b>', '</b>', 0) AS highlighted
+                 FROM message
+                 WHERE channel = $channel AND text @0@ $query
+                 ORDER BY ts ASC
+                 LIMIT 50",
+            )
+            .bind(("channel", channel_id.to_string()))
+            .bind(("query", query.to_string()))
+            .await;
+
+        match result {
+            Ok(mut response) => {
+                let rows: Result<Vec<serde_json::Value>, _> = response.take(0);
+                match rows {
+                    Ok(rows) => {
+                        tracing::debug!(
+                            "Channel FTS returned {} rows for {query:?} in {channel_id}",
+                            rows.len()
+                        );
+                        rows.into_iter()
+                            .filter_map(|row| {
+                                let data = row.get("data")?.as_str()?;
+                                let msg: Message = serde_json::from_str(data).ok()?;
+                                let highlighted = row
+                                    .get("highlighted")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or(&msg.text)
+                                    .to_string();
+                                Some((msg, highlighted))
+                            })
+                            .collect()
+                    }
+                    Err(e) => {
+                        error!("Channel FTS statement error for {query:?}: {e}");
+                        Vec::new()
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Channel FTS query error for {query:?}: {e}");
                 Vec::new()
             }
         }

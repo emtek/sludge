@@ -562,6 +562,13 @@ impl Client {
         Ok(())
     }
 
+    pub async fn mark_channel(&self, channel: &str, ts: &str) -> Result<(), String> {
+        let _: serde_json::Value =
+            Self::stealth_post(&self.http, &self.creds, "conversations.mark", &[("channel", channel), ("ts", ts)])
+                .await?;
+        Ok(())
+    }
+
     pub async fn update_message(&self, channel: &str, ts: &str, text: &str) -> Result<(), String> {
         info!("Calling chat.update on channel={channel} ts={ts}");
         let _: serde_json::Value =

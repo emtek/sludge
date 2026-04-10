@@ -120,7 +120,9 @@ fn search_emoji(query: &str) -> Vec<(String, String, Option<String>)> {
         return m;
     }
 
-    // Second pass: standard emoji search
+    // Second pass: standard emoji search (by name AND shortcode)
+    // The emoji crate only searches by CLDR name (e.g. "folded hands"),
+    // so we also need to match by shortcode (e.g. "pray") from the emojis crate.
     for e in emoji::search::search_name(query) {
         if m.len() >= 8 {
             break;
@@ -139,6 +141,20 @@ fn search_emoji(query: &str) -> Vec<(String, String, Option<String>)> {
             continue;
         }
         m.push((sc.clone(), format!("{} :{sc}:", e.glyph), None));
+    }
+
+    // Shortcode search: find emoji whose shortcode matches but CLDR name didn't
+    if m.len() < 8 {
+        for e in emojis::iter() {
+            if m.len() >= 8 {
+                break;
+            }
+            if let Some(sc) = e.shortcode() {
+                if sc.to_lowercase().contains(query) && seen.insert(sc.to_string()) {
+                    m.push((sc.to_string(), format!("{} :{sc}:", e.as_str()), None));
+                }
+            }
+        }
     }
 
     // Third pass: custom emoji

@@ -65,12 +65,18 @@ impl ChannelSidebar {
         container.add_css_class("sidebar");
 
         let search_entry = SearchEntry::new();
-        search_entry.set_placeholder_text(Some("Channel"));
+        search_entry.set_placeholder_text(Some("Filter channels..."));
+        search_entry.set_margin_start(8);
+        search_entry.set_margin_end(8);
+        search_entry.set_margin_top(4);
+        search_entry.set_margin_bottom(4);
+        search_entry.set_visible(false);
 
         let scrolled = ScrolledWindow::new();
         scrolled.set_vexpand(true);
 
         let inner = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        inner.append(&search_entry);
 
         // DM section
         let dm_header = Label::new(Some("Direct Messages"));

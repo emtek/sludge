@@ -27,6 +27,9 @@ pub type EditCallback = Rc<dyn Fn(&str, &str, &str, &gtk::Box)>;
 /// Callback for loading older messages: called with channel_id and oldest message ts.
 pub type LoadMoreCallback = Rc<dyn Fn(&str, &str)>;
 
+/// Callback for loading newer messages: called with channel_id and newest message ts.
+pub type LoadNewerCallback = Rc<dyn Fn(&str, &str)>;
+
 /// Callback for clicking a search result: (channel_id, message_ts)
 pub type SearchResultCallback = Rc<dyn Fn(&str, &str)>;
 
@@ -34,7 +37,8 @@ pub struct MessageView {
     pub widget: gtk::Box,
     pub list_box: ListBox,
     scrolled: ScrolledWindow,
-    header_label: Label,
+    pub header_label: Label,
+    pub search_entry: gtk::SearchEntry,
     pub spinner: gtk::Spinner,
     thread_callback: RefCell<Option<ThreadOpenCallback>>,
     mention_callback: RefCell<Option<MentionCallback>>,
@@ -63,7 +67,12 @@ pub struct MessageView {
     /// Set to false when the server returns fewer messages than requested (no more history).
     has_more: Rc<Cell<bool>>,
     load_more_callback: RefCell<Option<LoadMoreCallback>>,
+    load_newer_callback: RefCell<Option<LoadNewerCallback>>,
+    /// Whether there are newer messages to load when scrolling to the bottom.
+    pub has_more_newer: Rc<Cell<bool>>,
     search_result_callback: RefCell<Option<SearchResultCallback>>,
+    /// Active search query — when set, scroll-to-top loads more search results.
+    pub search_query: Rc<RefCell<Option<String>>>,
 }
 
 impl MessageView {
@@ -84,7 +93,17 @@ impl MessageView {
         header_label.add_css_class("title-3");
         header_label.set_halign(gtk::Align::Start);
         header_label.set_hexpand(true);
-        header.append(&header_label);
+
+        let search_entry = gtk::SearchEntry::new();
+        search_entry.set_placeholder_text(Some("Search messages..."));
+        search_entry.set_hexpand(true);
+        search_entry.set_visible(false);
+
+        let header_stack = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        header_stack.set_hexpand(true);
+        header_stack.append(&header_label);
+        header_stack.append(&search_entry);
+        header.append(&header_stack);
 
         let typing_label = Label::new(None);
         typing_label.add_css_class("dim-label");
@@ -110,11 +129,12 @@ impl MessageView {
 
         // Messages list
         let list_box = ListBox::new();
-        list_box.set_selection_mode(gtk::SelectionMode::None);
-        list_box.set_focusable(false);
+        list_box.set_selection_mode(gtk::SelectionMode::Single);
+        list_box.set_focusable(true);
         list_box.add_css_class("boxed-list");
         list_box.set_margin_start(8);
         list_box.set_margin_end(8);
+        list_box.set_margin_bottom(8);
 
         let scrolled = ScrolledWindow::new();
         scrolled.set_vexpand(true);
@@ -148,6 +168,7 @@ impl MessageView {
             list_box,
             scrolled,
             header_label,
+            search_entry,
             spinner,
             thread_callback: RefCell::new(None),
             mention_callback: RefCell::new(None),
@@ -167,7 +188,10 @@ impl MessageView {
             loading_more,
             has_more,
             load_more_callback,
+            load_newer_callback: RefCell::new(None),
+            has_more_newer: Rc::new(Cell::new(false)),
             search_result_callback: RefCell::new(None),
+            search_query: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -209,28 +233,72 @@ impl MessageView {
     /// Set the callback for loading older messages.
     /// Called with (channel_id, oldest_message_ts).
     pub fn set_load_more_callback(&self, cb: LoadMoreCallback) {
-        *self.load_more_callback.borrow_mut() = Some(cb.clone());
+        *self.load_more_callback.borrow_mut() = Some(cb);
+    }
 
-        // Detect scroll to top via edge-reached signal
+    /// Set the callback for loading newer messages from the DB.
+    /// Called with (channel_id, newest_message_ts).
+    pub fn set_load_newer_callback(&self, cb: LoadNewerCallback) {
+        *self.load_newer_callback.borrow_mut() = Some(cb);
+    }
+
+    /// Connect the edge-reached handler for both top (older) and bottom (newer).
+    /// Must be called after setting both callbacks.
+    pub fn connect_edge_loading(&self) {
         let loading_more = self.loading_more.clone();
         let has_more = self.has_more.clone();
+        let has_more_newer = self.has_more_newer.clone();
         let channel_id = self.channel_id.clone();
         let list_box = self.list_box.clone();
+        let load_older = self.load_more_callback.borrow().clone();
+        let load_newer = self.load_newer_callback.borrow().clone();
+        let search_query = self.search_query.clone();
         self.scrolled.connect_edge_reached(move |_, pos| {
-            if pos != gtk::PositionType::Top {
+            if loading_more.get() {
                 return;
             }
-            if loading_more.get() || !has_more.get() {
+            // Don't load more during search
+            if search_query.borrow().is_some() {
                 return;
             }
             let Some(cid) = channel_id.borrow().clone() else { return };
-            let oldest_ts = list_box
-                .row_at_index(0)
-                .map(|r| r.widget_name().to_string())
-                .filter(|ts| !ts.is_empty());
-            let Some(ts) = oldest_ts else { return };
-            loading_more.set(true);
-            cb(&cid, &ts);
+            match pos {
+                gtk::PositionType::Top => {
+                    if !has_more.get() {
+                        return;
+                    }
+                    let oldest_ts = list_box
+                        .row_at_index(0)
+                        .map(|r| r.widget_name().to_string())
+                        .filter(|ts| !ts.is_empty());
+                    let Some(ts) = oldest_ts else { return };
+                    loading_more.set(true);
+                    if let Some(ref cb) = load_older {
+                        cb(&cid, &ts);
+                    }
+                }
+                gtk::PositionType::Bottom => {
+                    if !has_more_newer.get() {
+                        return;
+                    }
+                    // Find the newest (last) row's ts
+                    let mut last_ts = None;
+                    let mut idx = 0;
+                    while let Some(row) = list_box.row_at_index(idx) {
+                        let name = row.widget_name().to_string();
+                        if !name.is_empty() {
+                            last_ts = Some(name);
+                        }
+                        idx += 1;
+                    }
+                    let Some(ts) = last_ts else { return };
+                    loading_more.set(true);
+                    if let Some(ref cb) = load_newer {
+                        cb(&cid, &ts);
+                    }
+                }
+                _ => {}
+            }
         });
     }
 
@@ -295,6 +363,48 @@ impl MessageView {
             }
         });
         *signal_id.borrow_mut() = Some(id);
+    }
+
+    /// Append newer messages at the bottom.
+    /// If fewer than `fetched_count` arrived, there are no more newer messages.
+    pub fn append_newer_messages(
+        &self,
+        messages: &[Message],
+        users: &HashMap<String, String>,
+        client: &Client,
+        rt: &tokio::runtime::Handle,
+        fetched_count: usize,
+    ) {
+        if messages.is_empty() {
+            self.has_more_newer.set(false);
+            self.loading_more.set(false);
+            return;
+        }
+        if messages.len() < fetched_count {
+            self.has_more_newer.set(false);
+        }
+
+        let thread_cb = self.thread_callback.borrow();
+        let mention_cb = self.mention_callback.borrow();
+        let reaction_cb = self.reaction_callback.borrow();
+        let delete_cb = self.delete_callback.borrow();
+        let edit_cb = self.edit_callback.borrow();
+        let self_uid = self.self_user_id.borrow();
+        let channel_id = self.channel_id.borrow();
+        let subteam_names = self.subteam_names.borrow();
+
+        // Messages are already in ASC order from the DB query
+        for msg in messages {
+            let row = make_message_row(
+                msg, users, &subteam_names, client, rt,
+                &thread_cb, &mention_cb, &reaction_cb, &delete_cb, &edit_cb,
+                channel_id.as_deref(), &self.thread_counts.borrow(), &self.thread_labels, &self.reaction_boxes, &self_uid,
+                &self.image_generation, &self.picker_cells,
+            );
+            self.list_box.append(&row);
+        }
+
+        self.loading_more.set(false);
     }
 
     /// Reset the loading_more flag (e.g. on error).
@@ -439,7 +549,9 @@ impl MessageView {
     ) {
         self.clear();
         self.has_more.set(true);
+        self.has_more_newer.set(false);
         self.loading_more.set(false);
+        *self.search_query.borrow_mut() = None;
         crate::mem::trim_heap();
 
         let thread_cb = self.thread_callback.borrow();
@@ -542,6 +654,74 @@ impl MessageView {
         self.scroll_to_bottom();
     }
 
+    /// Display search results within the current channel, with highlighted matching text.
+    pub fn set_channel_search_results(
+        &self,
+        query: &str,
+        results: &[(Message, String)],
+        users: &HashMap<String, String>,
+        client: &Client,
+        rt: &tokio::runtime::Handle,
+    ) {
+        self.clear();
+        *self.search_query.borrow_mut() = Some(query.to_string());
+        self.has_more.set(false); // no scroll-to-top pagination for search yet
+
+        let thread_cb = self.thread_callback.borrow();
+        let mention_cb = self.mention_callback.borrow();
+        let reaction_cb = self.reaction_callback.borrow();
+        let delete_cb = self.delete_callback.borrow();
+        let edit_cb = self.edit_callback.borrow();
+        let self_uid = self.self_user_id.borrow();
+        let channel_id = self.channel_id.borrow();
+        let search_cb = self.search_result_callback.borrow();
+        let subteam_names = self.subteam_names.borrow();
+
+        for (msg, highlighted) in results {
+            let row = make_message_row(
+                msg, users, &subteam_names, client, rt,
+                &thread_cb, &mention_cb, &reaction_cb, &delete_cb, &edit_cb,
+                channel_id.as_deref(), &self.thread_counts.borrow(), &self.thread_labels, &self.reaction_boxes, &self_uid,
+                &self.image_generation, &self.picker_cells,
+            );
+
+            // Replace the body widget with a highlighted version
+            if !highlighted.is_empty() {
+                if let Some(child) = row.child() {
+                    if let Some(outer) = child.downcast_ref::<gtk::Box>() {
+                        if let Some(header) = outer.first_child() {
+                            if let Some(old_body) = header.next_sibling() {
+                                if old_body.downcast_ref::<Label>().is_some()
+                                    || old_body.downcast_ref::<gtk::TextView>().is_some()
+                                {
+                                    let body = make_highlighted_body(highlighted);
+                                    outer.insert_child_after(&body, Some(&header));
+                                    outer.remove(&old_body);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Make the row clickable for navigation
+            if let Some(ref cb) = *search_cb {
+                let cb = cb.clone();
+                let cid = channel_id.clone().unwrap_or_default();
+                let ts = msg.ts.clone();
+                let gesture = gtk::GestureClick::new();
+                gesture.connect_released(move |_, _, _, _| {
+                    cb(&cid, &ts);
+                });
+                row.add_controller(gesture);
+            }
+
+            self.list_box.append(&row);
+        }
+
+        self.scroll_to_bottom();
+    }
+
     pub fn append_message(
         &self,
         msg: &Message,
@@ -564,17 +744,30 @@ impl MessageView {
             &self.image_generation, &self.picker_cells,
         );
         self.list_box.append(&row);
-        self.scroll_to_bottom();
+        self.scroll_to_bottom_after(&row);
     }
 
     pub fn scroll_to_bottom(&self) {
         let adj = self.scrolled.vadjustment();
-        // Try immediately (works if layout is already done)
         adj.set_value(adj.upper() - adj.page_size());
-        // Also defer to catch layout that hasn't completed yet
+        // Defer once more for pending layout
         let adj2 = adj.clone();
         gtk4::glib::idle_add_local_once(move || {
             adj2.set_value(adj2.upper() - adj2.page_size());
+        });
+    }
+
+    /// Scroll to bottom after a row finishes its layout using double-idle.
+    /// The first idle runs after the current event, the second runs after
+    /// GTK's layout pass has completed.
+    fn scroll_to_bottom_after(&self, _row: &ListBoxRow) {
+        let scrolled = self.scrolled.clone();
+        gtk4::glib::idle_add_local_once(move || {
+            let scrolled = scrolled.clone();
+            gtk4::glib::idle_add_local_once(move || {
+                let adj = scrolled.vadjustment();
+                adj.set_value(adj.upper() - adj.page_size());
+            });
         });
     }
 
@@ -591,6 +784,9 @@ impl MessageView {
             let mut idx = 0;
             while let Some(row) = list_box.row_at_index(idx) {
                 if row.widget_name() == ts {
+                    // Select the row
+                    list_box.select_row(Some(&row));
+
                     let adj = scrolled.vadjustment();
                     if let Some(bounds) = row.compute_bounds(&list_box) {
                         let y = bounds.y() as f64;
@@ -678,7 +874,54 @@ pub fn make_message_row(
     time_label.set_hexpand(true);
     header.append(&time_label);
 
-    // Thread button in the header (right-aligned)
+    // Edit & delete buttons (only for own messages)
+    let is_own = msg.user.as_deref() == Some(self_user_id) && !self_user_id.is_empty();
+    if is_own {
+        if let Some(cid) = channel_id {
+            // Edit button
+            if let Some(ecb) = edit_cb {
+                let edit_btn = gtk::Button::from_icon_name("document-edit-symbolic");
+                edit_btn.add_css_class("flat");
+                edit_btn.add_css_class("edit-btn");
+                edit_btn.set_halign(gtk::Align::End);
+                edit_btn.set_tooltip_text(Some("Edit message"));
+
+                let ecb = ecb.clone();
+                let cid_e = cid.to_string();
+                let ts = msg.ts.clone();
+                let text = msg.text.clone();
+                let outer_ref = outer.clone();
+                edit_btn.connect_clicked(move |_| {
+                    ecb(&cid_e, &ts, &text, &outer_ref);
+                });
+
+                header.append(&edit_btn);
+            }
+
+            // Delete button
+            if let Some(dcb) = delete_cb {
+                let del_btn = gtk::Button::from_icon_name("user-trash-symbolic");
+                del_btn.add_css_class("flat");
+                del_btn.add_css_class("delete-btn");
+                del_btn.set_halign(gtk::Align::End);
+                del_btn.set_tooltip_text(Some("Delete message"));
+
+                let dcb = dcb.clone();
+                let cid_d = cid.to_string();
+                let ts = msg.ts.clone();
+                let row_weak = row.downgrade();
+                del_btn.connect_clicked(move |_| {
+                    if let Some(row) = row_weak.upgrade() {
+                        dcb(&cid_d, &ts, &row);
+                    }
+                });
+
+                header.append(&del_btn);
+            }
+        }
+    }
+
+    // Thread button in the header (right-most)
     if let (Some(cb), Some(cid)) = (thread_cb, channel_id) {
         let has_thread = msg
             .thread_ts
@@ -727,53 +970,6 @@ pub fn make_message_row(
         });
 
         header.append(&thread_btn);
-    }
-
-    // Edit & delete buttons (only for own messages)
-    let is_own = msg.user.as_deref() == Some(self_user_id) && !self_user_id.is_empty();
-    if is_own {
-        if let Some(cid) = channel_id {
-            // Edit button
-            if let Some(ecb) = edit_cb {
-                let edit_btn = gtk::Button::from_icon_name("document-edit-symbolic");
-                edit_btn.add_css_class("flat");
-                edit_btn.add_css_class("edit-btn");
-                edit_btn.set_halign(gtk::Align::End);
-                edit_btn.set_tooltip_text(Some("Edit message"));
-
-                let ecb = ecb.clone();
-                let cid_e = cid.to_string();
-                let ts = msg.ts.clone();
-                let text = msg.text.clone();
-                let outer_ref = outer.clone();
-                edit_btn.connect_clicked(move |_| {
-                    ecb(&cid_e, &ts, &text, &outer_ref);
-                });
-
-                header.append(&edit_btn);
-            }
-
-            // Delete button
-            if let Some(dcb) = delete_cb {
-                let del_btn = gtk::Button::from_icon_name("user-trash-symbolic");
-                del_btn.add_css_class("flat");
-                del_btn.add_css_class("delete-btn");
-                del_btn.set_halign(gtk::Align::End);
-                del_btn.set_tooltip_text(Some("Delete message"));
-
-                let dcb = dcb.clone();
-                let cid_d = cid.to_string();
-                let ts = msg.ts.clone();
-                let row_weak = row.downgrade();
-                del_btn.connect_clicked(move |_| {
-                    if let Some(row) = row_weak.upgrade() {
-                        dcb(&cid_d, &ts, &row);
-                    }
-                });
-
-                header.append(&del_btn);
-            }
-        }
     }
 
     outer.append(&header);
@@ -937,7 +1133,8 @@ pub fn make_message_row(
         let picture = Picture::new();
         picture.set_halign(gtk::Align::Start);
         picture.set_content_fit(gtk::ContentFit::ScaleDown);
-        picture.set_size_request(-1, 200);
+        // Fixed size placeholder so layout is stable before image loads
+        picture.set_size_request(300, 200);
         picture.set_can_shrink(true);
         picture.set_cursor_from_name(Some("pointer"));
         image_flow.insert(&picture, -1);
@@ -1022,9 +1219,6 @@ pub fn make_message_row(
                             let texture = gtk4::gdk::Texture::for_pixbuf(&pixbuf);
                             picture.set_paintable(Some(&texture));
                             *stored_texture.borrow_mut() = Some(texture);
-                            if h > 0 {
-                                picture.set_size_request(-1, h.min(200));
-                            }
                         }
                         Err(e) => {
                             tracing::debug!("Failed to decode image: {e}");
@@ -1447,4 +1641,42 @@ fn format_file_size(bytes: u64) -> String {
     } else {
         format!("{bytes} B")
     }
+}
+
+/// Build a body label from text with `<b>...</b>` highlight markers.
+/// Escapes everything except the bold tags for safe Pango markup.
+fn make_highlighted_body(highlighted: &str) -> gtk::Widget {
+    // Split on <b> and </b> tags, escape each segment, then reassemble
+    let mut markup = String::new();
+    let mut rest = highlighted;
+    while let Some(start) = rest.find("<b>") {
+        // Escape text before the tag
+        markup.push_str(&gtk4::glib::markup_escape_text(&rest[..start]));
+        rest = &rest[start + 3..];
+        // Find closing </b>
+        if let Some(end) = rest.find("</b>") {
+            markup.push_str("<span background=\"yellow\" foreground=\"black\">");
+            markup.push_str(&gtk4::glib::markup_escape_text(&rest[..end]));
+            markup.push_str("</span>");
+            rest = &rest[end + 4..];
+        } else {
+            // No closing tag — escape the rest and break
+            markup.push_str(&gtk4::glib::markup_escape_text(rest));
+            rest = "";
+            break;
+        }
+    }
+    // Escape remaining text after the last tag
+    if !rest.is_empty() {
+        markup.push_str(&gtk4::glib::markup_escape_text(rest));
+    }
+
+    let body = Label::new(None);
+    body.set_markup(&markup);
+    body.set_wrap(true);
+    body.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    body.set_halign(gtk::Align::Fill);
+    body.set_selectable(true);
+    body.set_xalign(0.0);
+    body.upcast()
 }

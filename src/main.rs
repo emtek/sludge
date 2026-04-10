@@ -112,28 +112,45 @@ fn main() {
                 std::fs::write(icon_dir.join("sludge.png"), bytes).ok();
             }
 
-            // Ensure index.theme lists all our icon directories so gtk4-update-icon-cache works
+            // Merge our icon directories into the existing index.theme (don't overwrite it —
+            // clobbering hicolor/index.theme breaks system icons for all GTK apps).
             let index_path = base.join("index.theme");
-            let needs_update = match std::fs::read_to_string(&index_path) {
-                Ok(content) => sizes.iter().any(|s| !content.contains(&format!("{s}/apps"))),
-                Err(_) => true,
-            };
+            let existing = std::fs::read_to_string(&index_path).unwrap_or_default();
+            let needs_update = sizes.iter().any(|s| !existing.contains(&format!("{s}/apps")));
             if needs_update {
-                let dirs_list = sizes.iter().map(|s| format!("{s}/apps")).collect::<Vec<_>>().join(",");
-                let index_content = format!(
-                    "[Icon Theme]\nName=hicolor\nDirectories={dirs_list}\n\n{}\n",
-                    sizes.iter().map(|s| {
-                        let num: u32 = s.split('x').next().unwrap().parse().unwrap();
-                        format!("[{s}/apps]\nSize={num}\nType=Fixed\n")
-                    }).collect::<Vec<_>>().join("\n")
-                );
-                std::fs::write(&index_path, index_content).ok();
+                if existing.contains("[Icon Theme]") {
+                    // Append our directories to the existing Directories= line and add sections
+                    let mut content = existing.clone();
+                    for size in &sizes {
+                        let dir_entry = format!("{size}/apps");
+                        if !content.contains(&dir_entry) {
+                            // Append to Directories= line
+                            if let Some(pos) = content.find("Directories=") {
+                                if let Some(eol) = content[pos..].find('\n') {
+                                    let insert_at = pos + eol;
+                                    content.insert_str(insert_at, &format!(",{dir_entry}"));
+                                }
+                            }
+                            // Append section
+                            let num: u32 = size.split('x').next().unwrap().parse().unwrap();
+                            content.push_str(&format!("\n[{dir_entry}]\nSize={num}\nType=Fixed\n"));
+                        }
+                    }
+                    std::fs::write(&index_path, content).ok();
+                } else {
+                    // No existing index.theme — create a minimal one
+                    let dirs_list = sizes.iter().map(|s| format!("{s}/apps")).collect::<Vec<_>>().join(",");
+                    let index_content = format!(
+                        "[Icon Theme]\nName=hicolor\nDirectories={dirs_list}\n\n{}\n",
+                        sizes.iter().map(|s| {
+                            let num: u32 = s.split('x').next().unwrap().parse().unwrap();
+                            format!("[{s}/apps]\nSize={num}\nType=Fixed\n")
+                        }).collect::<Vec<_>>().join("\n")
+                    );
+                    std::fs::write(&index_path, index_content).ok();
+                }
             }
 
-            let _ = std::process::Command::new("gtk4-update-icon-cache")
-                .arg("--force")
-                .arg(&base)
-                .status();
             gtk4::Window::set_default_icon_name("sludge");
         }
 

@@ -126,14 +126,7 @@ impl SearchProvider {
                 }
             } else if let Some(rest) = id.strip_prefix("msg:") {
                 if let Some((channel_id, ts)) = rest.split_once(':') {
-                    // Try the JSON cache first, fall back to the FTS index
-                    let msg = {
-                        let cached = self.db.load_messages(channel_id).await.unwrap_or_default();
-                        match cached.into_iter().find(|m| m.ts == ts) {
-                            Some(m) => Some(m),
-                            None => self.db.get_indexed_message(channel_id, ts).await,
-                        }
-                    };
+                    let msg = self.db.get_indexed_message(channel_id, ts).await;
                     if let Some(msg) = msg {
                         let channel_name = channels
                             .iter()

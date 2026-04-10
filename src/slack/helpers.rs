@@ -152,7 +152,25 @@ fn apply_slack_markdown(text: &str) -> String {
     replace_blockquotes(&with_formatting)
 }
 
-/// Replace ``` ... ``` with `<tt>...</tt>`, preserving content verbatim.
+/// Strip XML/Pango tags from text, leaving only the plain text content.
+fn strip_tags(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find('<') {
+        result.push_str(&rest[..start]);
+        if let Some(end) = rest[start..].find('>') {
+            rest = &rest[start + end + 1..];
+        } else {
+            result.push_str(&rest[start..]);
+            rest = "";
+            break;
+        }
+    }
+    result.push_str(rest);
+    result
+}
+
+/// Replace ``` ... ``` with `<tt>...</tt>`, stripping any inner markup tags.
 fn replace_code_blocks(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let mut rest = text;
@@ -165,8 +183,9 @@ fn replace_code_blocks(text: &str) -> String {
             let code = &after[..end];
             // Strip leading newline if present
             let code = code.strip_prefix('\n').unwrap_or(code);
+            let clean = strip_tags(code);
             result.push_str("<tt>");
-            result.push_str(code);
+            result.push_str(&clean);
             result.push_str("</tt>");
             rest = &after[end + 3..];
         } else {
@@ -201,8 +220,9 @@ fn replace_inline_code(text: &str) -> String {
         if let Some(end) = after.find('`') {
             let code = &after[..end];
             if !code.is_empty() && !code.contains('\n') {
+                let clean = strip_tags(code);
                 result.push_str("<tt>");
-                result.push_str(code);
+                result.push_str(&clean);
                 result.push_str("</tt>");
                 rest = &after[end + 1..];
                 continue;

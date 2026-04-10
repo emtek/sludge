@@ -72,7 +72,8 @@ impl ThreadPanel {
 
         // Thread messages list
         let list_box = ListBox::new();
-        list_box.set_selection_mode(gtk::SelectionMode::None);
+        list_box.set_selection_mode(gtk::SelectionMode::Single);
+        list_box.set_focusable(true);
         list_box.add_css_class("boxed-list");
         list_box.set_margin_start(8);
         list_box.set_margin_end(8);
@@ -403,11 +404,15 @@ impl ThreadPanel {
             let mut idx = 0;
             while let Some(row) = list_box.row_at_index(idx) {
                 if row.widget_name() == ts {
+                    list_box.select_row(Some(&row));
+
                     let adj = scrolled.vadjustment();
                     if let Some(bounds) = row.compute_bounds(&list_box) {
                         let y = bounds.y() as f64;
+                        let row_h = bounds.height() as f64;
                         let page = adj.page_size();
-                        let target = (y - page / 2.0).max(0.0);
+                        // Position the message at the bottom of the visible area
+                        let target = (y + row_h - page).max(0.0);
                         adj.set_value(target);
                     }
 

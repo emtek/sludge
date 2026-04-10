@@ -91,22 +91,14 @@ pub fn build_app(
     // ── Header bar with profile button ──
     let header_bar = gtk::HeaderBar::new();
 
-    // Title widget: logo + app name
-    {
-        let title_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        title_box.set_halign(gtk::Align::Center);
-        let logo_bytes: &[u8] = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/hicolor/64x64/apps/sludge.png"));
-        let logo_texture = gtk4::gdk::Texture::from_bytes(&gtk4::glib::Bytes::from_static(logo_bytes)).ok();
-        if let Some(texture) = logo_texture {
-            let logo_img = gtk::Image::from_paintable(Some(&texture));
-            logo_img.set_pixel_size(20);
-            title_box.append(&logo_img);
-        }
-        let title_label = gtk::Label::new(Some("Sludge"));
-        title_label.add_css_class("title");
-        title_box.append(&title_label);
-        header_bar.set_title_widget(Some(&title_box));
-    }
+    // Empty title — channel name is shown in the message view header
+    header_bar.set_title_widget(Some(&gtk::Label::new(None)));
+
+    // Search button to toggle channel filter in the sidebar
+    let channel_search_btn = gtk::ToggleButton::new();
+    channel_search_btn.set_icon_name("system-search-symbolic");
+    channel_search_btn.add_css_class("flat");
+    header_bar.pack_start(&channel_search_btn);
 
     let avatar_size = 32;
     let avatar_texture: Rc<RefCell<Option<gtk4::gdk::Texture>>> = Rc::new(RefCell::new(None));
@@ -391,16 +383,21 @@ pub fn build_app(
     main_box.append(&thread_panel.separator);
     main_box.append(&thread_panel.widget);
 
-    // ── Search entries in the header bar ──
-    sidebar.search_entry.set_hexpand(false);
-    sidebar.search_entry.set_width_request(240);
-    header_bar.pack_start(&sidebar.search_entry);
-
-    let msg_search_entry = gtk::SearchEntry::new();
-    msg_search_entry.set_placeholder_text(Some("Search messages..."));
-    msg_search_entry.set_hexpand(false);
-    msg_search_entry.set_width_chars(30);
-    header_bar.pack_start(&msg_search_entry);
+    // ── Toggle channel search from header button ──
+    {
+        let search_entry = sidebar.search_entry.clone();
+        search_entry.set_visible(false);
+        let btn = channel_search_btn.clone();
+        btn.connect_toggled(move |btn| {
+            let active = btn.is_active();
+            search_entry.set_visible(active);
+            if active {
+                search_entry.grab_focus();
+            } else {
+                search_entry.set_text("");
+            }
+        });
+    }
 
     window.set_child(Some(&main_box));
 
@@ -566,6 +563,24 @@ pub fn build_app(
                     tracing::error!("Failed to set presence: {e}");
                 }
             });
+        });
+    }
+
+    // ── Periodic presence heartbeat: keep us "active" on Slack's server ──
+    {
+        let client_hb = client.clone();
+        let rt_hb = rt.clone();
+        let presence_active_hb = presence_active.clone();
+        gtk4::glib::timeout_add_seconds_local(300, move || {
+            if *presence_active_hb.borrow() {
+                let c = client_hb.clone();
+                rt_hb.spawn(async move {
+                    if let Err(e) = c.set_presence("auto").await {
+                        tracing::error!("Presence heartbeat failed: {e}");
+                    }
+                });
+            }
+            gtk4::glib::ControlFlow::Continue
         });
     }
 
@@ -1028,7 +1043,7 @@ pub fn build_app(
                             if let Some(list) = &list_box {
                                 list.remove(&row);
                             }
-                            // Delete via API and update DB cache
+                            // Delete via API and remove from index
                             let c = c.clone();
                             let db2 = db2.clone();
                             let cid = cid.clone();
@@ -1037,11 +1052,7 @@ pub fn build_app(
                                 if let Err(e) = c.delete_message(&cid, &ts).await {
                                     tracing::error!("Failed to delete message: {e}");
                                 }
-                                // Remove from cached messages
-                                if let Some(mut msgs) = db2.load_messages(&cid).await {
-                                    msgs.retain(|m| m.ts != ts);
-                                    let _ = db2.save_messages(&cid, &msgs).await;
-                                }
+                                db2.delete_indexed_message(&cid, &ts).await;
                             });
                         }
                     },
@@ -1135,51 +1146,55 @@ pub fn build_app(
                     let outer = outer.clone();
                     let state2 = state2.clone();
                     let dialog_weak = dialog_weak.clone();
-                    rt2.spawn(async move {
-                        match c.update_message(&cid, &ts, &new_text2).await {
-                            Ok(()) => {
-                                // Update DB cache
-                                if let Some(mut msgs) = db2.load_messages(&cid).await {
-                                    if let Some(m) = msgs.iter_mut().find(|m| m.ts == ts) {
-                                        m.text = new_text2.clone();
-                                    }
-                                    let _ = db2.save_messages(&cid, &msgs).await;
+                    let rt3 = rt2.clone();
+                    gtk4::glib::spawn_future_local(async move {
+                        let c2 = c.clone();
+                        let db3 = db2.clone();
+                        let cid2 = cid.clone();
+                        let ts2 = ts.clone();
+                        let text = new_text2.clone();
+                        let result = rt3.spawn(async move {
+                            let r = c2.update_message(&cid2, &ts2, &text).await;
+                            if r.is_ok() {
+                                db3.update_indexed_message_text(&cid2, &ts2, &text).await;
+                            }
+                            r
+                        }).await;
+
+                        match result {
+                            Ok(Ok(())) => {
+                                if let Some(d) = dialog_weak.upgrade() {
+                                    d.close();
                                 }
-                                // Update UI on main thread
-                                let new_text_ui = new_text2;
-                                gtk4::glib::idle_add_local_once(move || {
-                                    // Close dialog
-                                    if let Some(d) = dialog_weak.upgrade() {
-                                        d.close();
-                                    }
-                                    // Replace the body widget in the outer box
-                                    let st = state2.borrow();
-                                    let users = &st.user_names;
-                                    let subteam_names = &st.subteam_names;
-                                    // Find and remove the old body (second child, after header)
-                                    if let Some(header) = outer.first_child() {
-                                        if let Some(old_body) = header.next_sibling() {
-                                            // Only replace if it's the text body (Label or TextView), not attachments
-                                            if old_body.downcast_ref::<gtk::Label>().is_some()
-                                                || old_body.downcast_ref::<gtk::TextView>().is_some()
-                                            {
-                                                let new_body = crate::ui::message_view::make_message_body(
-                                                    &new_text_ui, users, subteam_names, &None,
-                                                );
-                                                outer.insert_child_after(&new_body, Some(&header));
-                                                outer.remove(&old_body);
-                                            }
+                                // Replace the body widget in the outer box
+                                let st = state2.borrow();
+                                let users = &st.user_names;
+                                let subteam_names = &st.subteam_names;
+                                if let Some(header) = outer.first_child() {
+                                    if let Some(old_body) = header.next_sibling() {
+                                        if old_body.downcast_ref::<gtk::Label>().is_some()
+                                            || old_body.downcast_ref::<gtk::TextView>().is_some()
+                                        {
+                                            let new_body = crate::ui::message_view::make_message_body(
+                                                &new_text2, users, subteam_names, &None,
+                                            );
+                                            outer.insert_child_after(&new_body, Some(&header));
+                                            outer.remove(&old_body);
                                         }
                                     }
-                                });
+                                }
+                            }
+                            Ok(Err(e)) => {
+                                tracing::error!("Failed to edit message: {e}");
+                                if let Some(d) = dialog_weak.upgrade() {
+                                    d.close();
+                                }
                             }
                             Err(e) => {
-                                tracing::error!("Failed to edit message: {e}");
-                                gtk4::glib::idle_add_local_once(move || {
-                                    if let Some(d) = dialog_weak.upgrade() {
-                                        d.close();
-                                    }
-                                });
+                                tracing::error!("Edit task panicked: {e}");
+                                if let Some(d) = dialog_weak.upgrade() {
+                                    d.close();
+                                }
                             }
                         }
                     });
@@ -1227,7 +1242,7 @@ pub fn build_app(
         });
     }
 
-    // ── Infinite scroll: load older messages when scrolling to top ──
+    // ── Infinite scroll: load older messages (top) and newer messages (bottom) ──
     {
         let mv = message_view.clone();
         let state = state.clone();
@@ -1263,6 +1278,41 @@ pub fn build_app(
                 }
             });
         }));
+    }
+    {
+        let mv = message_view.clone();
+        let state = state.clone();
+        let db = db.clone();
+        let rt = rt.clone();
+        let client = client.clone();
+        message_view.set_load_newer_callback(Rc::new(move |channel_id: &str, newest_ts: &str| {
+            let mv = mv.clone();
+            let state = state.clone();
+            let db = db.clone();
+            let rt = rt.clone();
+            let client = client.clone();
+            let cid = channel_id.to_string();
+            let ts = newest_ts.to_string();
+            gtk4::glib::spawn_future_local(async move {
+                let db2 = db.clone();
+                let cid2 = cid.clone();
+                let ts2 = ts.clone();
+                let result = rt
+                    .spawn(async move { db2.load_messages_after(&cid2, &ts2, 25).await })
+                    .await;
+                match result {
+                    Ok(messages) => {
+                        let users = state.borrow().user_names.clone();
+                        mv.append_newer_messages(&messages, &users, &client, &rt, 25);
+                    }
+                    Err(e) => {
+                        tracing::error!("Load newer task error: {e}");
+                        mv.reset_loading_more();
+                    }
+                }
+            });
+        }));
+        message_view.connect_edge_loading();
     }
 
     // ── Emoji pick persistence: record to DB when emoji is selected via autocomplete ──
@@ -1732,6 +1782,64 @@ pub fn build_app(
                     backfill_history(client, db, channel_ids).await;
                 });
             }
+
+            // ── Periodic user list refresh (every 30 minutes) ──
+            {
+                let state = state.clone();
+                let client = client.clone();
+                let db = db.clone();
+                let rt = rt.clone();
+                let sidebar = sidebar.clone();
+                let message_input = message_input.clone();
+                let thread_panel = thread_panel.clone();
+                gtk4::glib::spawn_future_local(async move {
+                    loop {
+                        gtk4::glib::timeout_future(std::time::Duration::from_secs(30 * 60)).await;
+                        tracing::info!("Periodic user list refresh...");
+                        let client2 = client.clone();
+                        let rt2 = rt.clone();
+                        let result = rt2
+                            .spawn(async move { client2.users_list_all().await })
+                            .await;
+                        let Ok(Ok(users)) = result else {
+                            tracing::error!("Periodic user refresh failed");
+                            continue;
+                        };
+                        let db2 = db.clone();
+                        let rt2 = rt.clone();
+                        let to_cache = users.clone();
+                        rt2.spawn(async move {
+                            if let Err(e) = db2.save_users(&to_cache).await {
+                                tracing::error!("Failed to cache users: {e}");
+                            }
+                        });
+                        let mut names = HashMap::new();
+                        let mut status_emoji_map = HashMap::new();
+                        let mut status_text_map = HashMap::new();
+                        for u in &users {
+                            names.insert(u.id.clone(), user_display_name(&u));
+                            if let Some(emoji) = u.profile.as_ref()
+                                .and_then(|p| p.status_emoji.as_deref())
+                                .filter(|e| !e.is_empty())
+                            {
+                                status_emoji_map.insert(u.id.clone(), emoji.to_string());
+                            }
+                            if let Some(text) = u.profile.as_ref()
+                                .and_then(|p| p.status_text.as_deref())
+                                .filter(|t| !t.is_empty())
+                            {
+                                status_text_map.insert(u.id.clone(), text.to_string());
+                            }
+                        }
+                        sidebar.set_user_names(&names);
+                        sidebar.set_all_status(status_emoji_map, status_text_map);
+                        message_input.set_mention_users(&names);
+                        thread_panel.set_mention_users(&names);
+                        state.borrow_mut().user_names = Rc::new(names);
+                        tracing::info!("Periodic user refresh complete: {} users", users.len());
+                    }
+                });
+            }
         });
     }
 
@@ -1747,6 +1855,7 @@ pub fn build_app(
             let db = db.clone();
             let message_input = message_input.clone();
             let search_entry = sidebar.search_entry.clone();
+            let window = window.clone();
             Rc::new(move |row: &gtk::ListBoxRow| {
                 let channel_id = row.widget_name().to_string();
                 if channel_id.is_empty() {
@@ -1790,10 +1899,16 @@ pub fn build_app(
                             channel_display_name(ch)
                         };
                         message_view.set_channel_name(&name);
+                        window.set_title(Some(&format!("{name} — Sludge")));
                     }
                 }
 
-                // Show cached messages immediately, then fetch fresh in background
+                // Hide search entry when switching channels
+                message_view.search_entry.set_text("");
+                message_view.search_entry.set_visible(false);
+                message_view.header_label.set_visible(true);
+
+                // Backfill from API since last cached message, then load from DB
                 let mv = message_view.clone();
                 let tp = thread_panel.clone();
                 let state2 = state.clone();
@@ -1810,34 +1925,83 @@ pub fn build_app(
                 gtk4::glib::spawn_future_local(async move {
                     let cid = channel_id.clone();
 
-                    // Show cached messages first
-                    let db_load = db2.clone();
-                    let cid_load = cid.clone();
-                    let cached = rt2
-                        .spawn(async move { db_load.load_messages(&cid_load).await })
+                    // Check if we need to navigate to a specific message
+                    let pending_ts = state2.borrow().pending_scroll.clone()
+                        .or_else(|| state2.borrow().pending_thread.as_ref().map(|(tts, _)| tts.clone()));
+
+                    // Backfill: fetch messages from API since the last cached message
+                    let db_meta = db2.clone();
+                    let cid_meta = cid.clone();
+                    let newest_ts = rt2
+                        .spawn(async move { db_meta.get_newest_ts(&cid_meta).await })
                         .await
                         .unwrap();
-                    if let Some(ref messages) = cached {
-                        let users = state2.borrow().user_names.clone();
-                        mv.set_messages(messages, &users, &client_img, &rt3);
+
+                    let c = client_fetch.clone();
+                    let cid_fetch = cid.clone();
+                    if let Some(ref newest) = newest_ts {
+                        // Fetch only messages newer than what we have
+                        let oldest = newest.clone();
+                        let backfill = rt2
+                            .spawn(async move {
+                                c.conversation_history_page(&cid_fetch, &oldest, None, 200).await
+                            })
+                            .await
+                            .unwrap();
+                        if let Ok((messages, _)) = backfill {
+                            if !messages.is_empty() {
+                                let db_save = db2.clone();
+                                let cid_save = cid.clone();
+                                let _ = rt2
+                                    .spawn(async move { db_save.save_messages(&cid_save, &messages).await })
+                                    .await;
+                            }
+                        }
+                    } else {
+                        // No cached messages at all — seed from API
+                        let seed = rt2
+                            .spawn(async move { c.conversation_history(&cid_fetch, 50).await })
+                            .await
+                            .unwrap();
+                        if let Ok(messages) = seed {
+                            if !messages.is_empty() {
+                                let db_save = db2.clone();
+                                let cid_save = cid.clone();
+                                let _ = rt2
+                                    .spawn(async move { db_save.save_messages(&cid_save, &messages).await })
+                                    .await;
+                            }
+                        }
                     }
 
-                    // Fetch fresh from Slack
-                    let cid_fetch = cid.clone();
-                    let c = client_fetch.clone();
-                    let result = rt2
-                        .spawn(async move { c.conversation_history(&cid_fetch, 25).await })
+                    // Load messages from DB
+                    let db_load = db2.clone();
+                    let cid_load = cid.clone();
+                    let pending_ts_load = pending_ts.clone();
+                    let messages = rt2
+                        .spawn(async move {
+                            if let Some(ref ts) = pending_ts_load {
+                                let around = db_load.load_messages_around(&cid_load, ts, 25).await;
+                                if around.is_empty() { None } else { Some(around) }
+                            } else {
+                                db_load.load_messages(&cid_load).await
+                            }
+                        })
                         .await
                         .unwrap();
 
                     mv.spinner.stop();
                     mv.spinner.set_visible(false);
 
-                    if let Ok(messages) = result {
+                    if let Some(messages) = messages {
                         let users = state2.borrow().user_names.clone();
                         mv.set_messages(&messages, &users, &client_img, &rt3);
 
-                        // Scroll to pending message if set by notification click
+                        if pending_ts.is_some() {
+                            mv.has_more_newer.set(true);
+                        }
+
+                        // Scroll to and select pending message
                         let pending = state2.borrow_mut().pending_scroll.take();
                         if let Some(ts) = pending {
                             mv.scroll_to_message(&ts);
@@ -1846,24 +2010,23 @@ pub fn build_app(
                         // Open pending thread if set by notification click
                         let pending_thread = state2.borrow_mut().pending_thread.take();
                         if let Some((thread_ts, reply_ts)) = pending_thread {
+                            mv.scroll_to_message(&thread_ts);
                             tp.pending_scroll.replace(Some(reply_ts));
                             mv.open_thread(&thread_ts, &cid);
                         }
 
-                        // Cache the fresh messages and update activity
+                        // Update activity and mark as read
                         let last_ts = messages.first().map(|m| m.ts.clone());
                         if let Some(ref ts) = last_ts {
                             sidebar2.update_activity(&cid, ts);
                         }
-                        let db_save = db2.clone();
-                        let to_save = messages.clone();
-                        let cid_save = cid.clone();
+                        let db_mark = db2.clone();
+                        let client_mark = client_fetch.clone();
+                        let cid_mark = cid.clone();
                         rt2.spawn(async move {
-                            if let Err(e) = db_save.save_messages(&cid_save, &to_save).await {
-                                tracing::error!("Failed to cache messages: {e}");
-                            }
-                            if let Some(ts) = last_ts {
-                                db_save.update_channel_activity(&cid_save, &ts).await;
+                            if let Some(ref ts) = last_ts {
+                                db_mark.update_channel_activity(&cid_mark, ts).await;
+                                let _ = client_mark.mark_channel(&cid_mark, ts).await;
                             }
                         });
                     }
@@ -1902,6 +2065,9 @@ pub fn build_app(
         let message_view = message_view.clone();
         let thread_panel = thread_panel.clone();
         let window = window.clone();
+        let client = client.clone();
+        let rt = rt.clone();
+        let db = db.clone();
         action.connect_activate(move |_, param| {
             let Some(param) = param.and_then(|p| p.get::<String>()) else { return };
 
@@ -1946,6 +2112,35 @@ pub fn build_app(
             // Raise the window
             window.present();
 
+            // If no explicit thread_ts, check if the message is a thread reply
+            let (message_ts, thread_ts) = if thread_ts.is_none() {
+                if let Some(ref mts) = message_ts {
+                    let db2 = db.clone();
+                    let cid = channel_id.clone();
+                    let ts = mts.clone();
+                    // Quick synchronous-ish lookup from DB
+                    let msg = rt.block_on(db2.get_indexed_message(&cid, &ts));
+                    if let Some(ref m) = msg {
+                        if let Some(ref tts) = m.thread_ts {
+                            if *tts != m.ts {
+                                // It's a thread reply — treat thread_ts as the parent
+                                (message_ts, Some(tts.clone()))
+                            } else {
+                                (message_ts, None)
+                            }
+                        } else {
+                            (message_ts, None)
+                        }
+                    } else {
+                        (message_ts, None)
+                    }
+                } else {
+                    (message_ts, thread_ts)
+                }
+            } else {
+                (message_ts, thread_ts)
+            };
+
             let current = state.borrow().current_channel.clone();
             let needs_channel_switch = current.as_deref() != Some(&channel_id);
 
@@ -1960,13 +2155,54 @@ pub fn build_app(
                 }
                 sidebar.select_channel_by_id(&channel_id);
             } else if let Some(ref tts) = thread_ts {
-                // Already on the channel — open thread and scroll to the reply
+                // Already on the channel — scroll to parent, open thread, scroll to reply
                 if let Some(ref mts) = message_ts {
+                    message_view.scroll_to_message(tts);
+                    thread_panel.pending_scroll.replace(Some(mts.clone()));
                     message_view.open_thread(tts, &channel_id);
-                    thread_panel.scroll_to_message(mts);
                 }
             } else if let Some(ref mts) = message_ts {
-                message_view.scroll_to_message(mts);
+                // Check if the message is already loaded; if not, fetch around it
+                let mut found = false;
+                let mut idx = 0;
+                while let Some(row) = message_view.list_box.row_at_index(idx) {
+                    if row.widget_name() == *mts {
+                        found = true;
+                        break;
+                    }
+                    idx += 1;
+                }
+                if found {
+                    message_view.scroll_to_message(mts);
+                } else {
+                    let mv = message_view.clone();
+                    let client2 = client.clone();
+                    let rt2 = rt.clone();
+                    let db2 = db.clone();
+                    let cid = channel_id.clone();
+                    let ts = mts.clone();
+                    let state2 = state.clone();
+                    gtk4::glib::spawn_future_local(async move {
+                        let c = client2.clone();
+                        let cid2 = cid.clone();
+                        let ts2 = ts.clone();
+                        let result = rt2.spawn(async move {
+                            c.conversation_history_around(&cid2, &ts2, 25).await
+                        }).await;
+                        if let Ok(Ok(messages)) = result {
+                            let users = state2.borrow().user_names.clone();
+                            mv.set_messages(&messages, &users, &client2, &rt2);
+                            mv.has_more_newer.set(true);
+                            mv.scroll_to_message(&ts);
+                            let db3 = db2.clone();
+                            let to_save = messages.clone();
+                            let cid3 = cid.clone();
+                            rt2.spawn(async move {
+                                let _ = db3.save_messages(&cid3, &to_save).await;
+                            });
+                        }
+                    });
+                }
             }
         });
         app.add_action(action);
@@ -1987,18 +2223,21 @@ pub fn build_app(
         sidebar.widget.add_controller(key_controller);
     }
 
-    // ── Ctrl+P focuses the channel search, Ctrl+F focuses message search ──
+    // ── Ctrl+P toggles channel search, Ctrl+F toggles message search ──
     {
-        let ch_entry = sidebar.search_entry.clone();
-        let msg_entry = msg_search_entry.clone();
+        let ch_search_btn = channel_search_btn.clone();
+        let msg_entry = message_view.search_entry.clone();
+        let header_label = message_view.header_label.clone();
         let key_controller = gtk::EventControllerKey::new();
         key_controller.set_propagation_phase(gtk::PropagationPhase::Capture);
         key_controller.connect_key_pressed(move |_, key, _, modifier| {
             if modifier.contains(gtk4::gdk::ModifierType::CONTROL_MASK) {
                 if key == gtk4::gdk::Key::p {
-                    ch_entry.grab_focus();
+                    ch_search_btn.set_active(!ch_search_btn.is_active());
                     return gtk4::glib::Propagation::Stop;
                 } else if key == gtk4::gdk::Key::f {
+                    msg_entry.set_visible(true);
+                    header_label.set_visible(false);
                     msg_entry.grab_focus();
                     return gtk4::glib::Propagation::Stop;
                 }
@@ -2006,6 +2245,45 @@ pub fn build_app(
             gtk4::glib::Propagation::Proceed
         });
         window.add_controller(key_controller);
+    }
+
+    // ── Press : on selected message to open reaction picker ──
+    {
+        let open_reaction_picker = |list_box: &gtk::ListBox| {
+            let list_box = list_box.clone();
+            let key_controller = gtk::EventControllerKey::new();
+            key_controller.connect_key_pressed(move |_, key, _, _| {
+                if key == gtk4::gdk::Key::colon {
+                    if let Some(row) = list_box.selected_row() {
+                        // Walk the row's widget tree to find the reaction-add button
+                        fn find_reaction_btn(widget: &gtk::Widget) -> Option<gtk::Button> {
+                            if let Some(btn) = widget.downcast_ref::<gtk::Button>() {
+                                if btn.has_css_class("reaction-add-btn") {
+                                    return Some(btn.clone());
+                                }
+                            }
+                            let mut child = widget.first_child();
+                            while let Some(c) = child {
+                                if let Some(btn) = find_reaction_btn(&c) {
+                                    return Some(btn);
+                                }
+                                child = c.next_sibling();
+                            }
+                            None
+                        }
+                        if let Some(btn) = find_reaction_btn(row.upcast_ref()) {
+                            btn.emit_clicked();
+                            return gtk4::glib::Propagation::Stop;
+                        }
+                    }
+                }
+                gtk4::glib::Propagation::Proceed
+            });
+            key_controller
+        };
+
+        message_view.list_box.add_controller(open_reaction_picker(&message_view.list_box));
+        thread_panel.list_box.add_controller(open_reaction_picker(&thread_panel.list_box));
     }
 
     // ── Message search: navigate to channel + scroll to message on click ──
@@ -2055,27 +2333,55 @@ pub fn build_app(
                 if let Ok(messages) = result {
                     let users = state2.borrow().user_names.clone();
                     mv.set_messages(&messages, &users, &c_img, &rt3);
+                    mv.has_more_newer.set(true);
                     mv.scroll_to_message(&target_ts);
                 }
             });
         }));
     }
 
-    // ── Message search: query on Enter ──
+    // ── Message search: query on Enter (searches current channel) ──
     {
         let db_search = db.clone();
         let rt_search = rt.clone();
         let state_search = state.clone();
         let mv_search = message_view.clone();
         let client_search = client.clone();
-        let channel_filter_entry = sidebar.search_entry.clone();
-        msg_search_entry.connect_activate(move |entry| {
+        message_view.search_entry.connect_activate(move |entry| {
             let query = entry.text().to_string();
             if query.trim().is_empty() {
+                // Empty query — restore latest messages and hide search
+                let current_channel = state_search.borrow().current_channel.clone();
+                let Some(channel_id) = current_channel else { return };
+                entry.set_visible(false);
+                mv_search.header_label.set_visible(true);
+                if mv_search.search_query.borrow().is_none() {
+                    return; // already showing normal messages
+                }
+                let rt = rt_search.clone();
+                let state = state_search.clone();
+                let mv = mv_search.clone();
+                let client = client_search.clone();
+                gtk4::glib::spawn_future_local(async move {
+                    let c = client.clone();
+                    let cid = channel_id.clone();
+                    let result = rt
+                        .spawn(async move { c.conversation_history(&cid, 25).await })
+                        .await;
+                    if let Ok(Ok(messages)) = result {
+                        let users = state.borrow().user_names.clone();
+                        mv.set_messages(&messages, &users, &client, &rt);
+                        mv.scroll_to_bottom();
+                    }
+                });
                 return;
             }
 
-            let channel_filter = channel_filter_entry.text().to_string();
+            let current_channel = state_search.borrow().current_channel.clone();
+            let Some(channel_id) = current_channel else {
+                return;
+            };
+
             let db = db_search.clone();
             let rt = rt_search.clone();
             let state = state_search.clone();
@@ -2083,35 +2389,51 @@ pub fn build_app(
             let client = client_search.clone();
             gtk4::glib::spawn_future_local(async move {
                 let q = query.clone();
+                let cid = channel_id.clone();
                 let results = rt
-                    .spawn(async move { db.search_messages(&q).await })
+                    .spawn(async move { db.search_channel_messages(&cid, &q).await })
                     .await
                     .unwrap();
 
-                let st = state.borrow();
-                let users = st.user_names.clone();
-                let channels = st.channels.clone();
-                drop(st);
+                let users = state.borrow().user_names.clone();
+                mv.set_channel_search_results(&query, &results, &users, &client, &rt);
+            });
+        });
+    }
 
-                // Filter to channels matching the channel search box text
-                let results = if channel_filter.trim().is_empty() {
-                    results
-                } else {
-                    let filter_lower = channel_filter.to_lowercase();
-                    results
-                        .into_iter()
-                        .filter(|(cid, _)| {
-                            channels
-                                .iter()
-                                .find(|c| c.id == *cid)
-                                .and_then(|c| c.name.as_deref())
-                                .map(|name| name.to_lowercase().contains(&filter_lower))
-                                .unwrap_or(false)
-                        })
-                        .collect()
-                };
-
-                mv.set_search_results(&results, &users, &channels, &client, &rt);
+    // ── Clear search when text is emptied (e.g. pressing X or Escape) ──
+    {
+        let state_clear = state.clone();
+        let mv_clear = message_view.clone();
+        let client_clear = client.clone();
+        let rt_clear = rt.clone();
+        message_view.search_entry.connect_search_changed(move |entry| {
+            if !entry.text().is_empty() {
+                return;
+            }
+            // Text was cleared — restore latest messages and hide search
+            let current_channel = state_clear.borrow().current_channel.clone();
+            let Some(channel_id) = current_channel else { return };
+            entry.set_visible(false);
+            mv_clear.header_label.set_visible(true);
+            if mv_clear.search_query.borrow().is_none() {
+                return;
+            }
+            let c = client_clear.clone();
+            let rt = rt_clear.clone();
+            let state = state_clear.clone();
+            let mv = mv_clear.clone();
+            let client = client_clear.clone();
+            gtk4::glib::spawn_future_local(async move {
+                let cid = channel_id.clone();
+                let result = rt
+                    .spawn(async move { c.conversation_history(&cid, 25).await })
+                    .await;
+                if let Ok(Ok(messages)) = result {
+                    let users = state.borrow().user_names.clone();
+                    mv.set_messages(&messages, &users, &client, &rt);
+                    mv.scroll_to_bottom();
+                }
             });
         });
     }
@@ -2309,7 +2631,6 @@ pub fn build_app(
                             let ts = msg.ts.clone();
                             rt_rt.spawn(async move {
                                 db2.append_message(&cid, &msg2).await;
-                                db2.index_messages(&cid, &[msg2]).await;
                                 db2.update_channel_activity(&cid, &ts).await;
                             });
                             continue;
@@ -2379,17 +2700,21 @@ pub fn build_app(
                             sidebar.set_unread(&channel, count);
                         }
 
-                        // Cache the incoming message, index for search, and update activity
+                        // Cache the incoming message, index for search, update activity, mark read
                         {
                             sidebar.update_activity(&channel, &msg.ts);
                             let db2 = db.clone();
+                            let client_mark = client_rt.clone();
                             let msg2 = msg.clone();
                             let cid = channel.clone();
                             let ts = msg.ts.clone();
+                            let mark_read = is_current;
                             rt_rt.spawn(async move {
                                 db2.append_message(&cid, &msg2).await;
-                                db2.index_messages(&cid, &[msg2]).await;
                                 db2.update_channel_activity(&cid, &ts).await;
+                                if mark_read {
+                                    let _ = client_mark.mark_channel(&cid, &ts).await;
+                                }
                             });
                         }
 
@@ -2721,16 +3046,6 @@ pub fn build_app(
         window.connect_is_active_notify(move |win| {
             if win.is_active() {
                 input.grab_focus();
-            }
-        });
-    }
-
-    // Focus channel search when window gains focus
-    {
-        let search_entry = sidebar.search_entry.clone();
-        window.connect_is_active_notify(move |win| {
-            if win.is_active() {
-                search_entry.grab_focus();
             }
         });
     }

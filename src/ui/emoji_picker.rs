@@ -186,10 +186,37 @@ fn get_category(cat_idx: usize) -> Vec<(String, String)> {
 }
 
 fn search_emojis(query: &str) -> Vec<(String, String)> {
-    emoji::search::search_name(query)
-        .into_iter()
-        .filter(|e| e.status == emoji::Status::FullyQualified && !e.is_variant)
-        .take(MAX_RESULTS)
-        .map(|e| (shortcode_for(e), e.glyph.to_string()))
-        .collect()
+    let query_lower = query.to_lowercase();
+    let mut seen = std::collections::HashSet::new();
+    let mut results: Vec<(String, String)> = Vec::new();
+
+    // Search by CLDR name
+    for e in emoji::search::search_name(query) {
+        if results.len() >= MAX_RESULTS {
+            break;
+        }
+        if e.status != emoji::Status::FullyQualified || e.is_variant {
+            continue;
+        }
+        let sc = shortcode_for(e);
+        if seen.insert(sc.clone()) {
+            results.push((sc, e.glyph.to_string()));
+        }
+    }
+
+    // Also search by shortcode (e.g. "pray" -> "folded hands" won't match by name)
+    if results.len() < MAX_RESULTS {
+        for e in emojis::iter() {
+            if results.len() >= MAX_RESULTS {
+                break;
+            }
+            if let Some(sc) = e.shortcode() {
+                if sc.to_lowercase().contains(&query_lower) && seen.insert(sc.to_string()) {
+                    results.push((sc.to_string(), e.as_str().to_string()));
+                }
+            }
+        }
+    }
+
+    results
 }
