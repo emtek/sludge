@@ -1,0 +1,6 @@
+sludge (0.2.3-1) unstable; urgency=medium
+
+  * Release 0.2.3: inline threads, reply UX, fuzzy emoji search, search
+    result navigation to thread replies, reliable scroll-to-row, and more.
+
+ -- Emlyn Revell-Nash <noreply@example.com>  Mon, 13 Apr 2026 00:00:00 +0000

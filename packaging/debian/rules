@@ -1,0 +1,35 @@
+#!/usr/bin/make -f
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+export CARGO_HOME = $(CURDIR)/debian/cargo-home
+export RUSTFLAGS = -C link-arg=-Wl,--as-needed
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	cargo build --release --locked
+
+override_dh_auto_test:
+	# no tests in release packaging
+
+override_dh_auto_install:
+	install -Dpm755 target/release/sludge debian/sludge/usr/bin/sludge
+	install -d debian/sludge/usr/share/applications
+	sed 's|^Exec=.*|Exec=/usr/bin/sludge|' assets/dev.sludge.app.desktop \
+	    > debian/sludge/usr/share/applications/dev.sludge.app.desktop
+	chmod 644 debian/sludge/usr/share/applications/dev.sludge.app.desktop
+	for size in 48 64 128 256; do \
+	    install -Dpm644 "assets/hicolor/$${size}x$${size}/apps/sludge.png" \
+	        "debian/sludge/usr/share/icons/hicolor/$${size}x$${size}/apps/sludge.png"; \
+	done
+	install -Dpm644 assets/dev.sludge.app.search-provider.ini \
+	    debian/sludge/usr/share/gnome-shell/search-providers/dev.sludge.app.search-provider.ini
+	install -d debian/sludge/usr/share/dbus-1/services
+	sed 's|^Exec=.*|Exec=/usr/bin/sludge|' assets/dev.sludge.app.service \
+	    > debian/sludge/usr/share/dbus-1/services/dev.sludge.app.service
+	chmod 644 debian/sludge/usr/share/dbus-1/services/dev.sludge.app.service
+
+override_dh_auto_clean:
+	cargo clean || true
+	rm -rf debian/cargo-home

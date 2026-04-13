@@ -1,0 +1,33 @@
+Source: sludge
+Section: net
+Priority: optional
+Maintainer: Emlyn Revell-Nash <noreply@example.com>
+Build-Depends:
+ debhelper-compat (= 13),
+ cargo,
+ rustc (>= 1.85),
+ pkg-config,
+ libgtk-4-dev (>= 4.14),
+ libadwaita-1-dev (>= 1.4),
+ libglib2.0-dev,
+ libcairo2-dev,
+ libpango1.0-dev,
+Standards-Version: 4.7.0
+Homepage: https://github.com/emtek/sludge
+Rules-Requires-Root: no
+
+Package: sludge
+Architecture: any
+Depends:
+ ${shlibs:Depends},
+ ${misc:Depends},
+ libgtk-4-1 (>= 4.14),
+ libadwaita-1-0 (>= 1.4),
+ hicolor-icon-theme,
+Recommends:
+ libcanberra-gtk3-0,
+ libnotify-bin,
+Description: Native GTK4/libadwaita Slack client for the Linux desktop
+ Sludge is a native GTK4/libadwaita Slack client. Features include real-time
+ messaging via Socket Mode, inline threads, reactions, file uploads, desktop
+ notifications, a GNOME Shell search provider, and fuzzy emoji autocomplete.
