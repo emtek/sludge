@@ -55,6 +55,8 @@ pub struct MessageView {
     reaction_boxes: Rc<RefCell<HashMap<String, gtk::FlowBox>>>,
     /// Typing indicator label in the channel header.
     pub typing_label: Label,
+    /// Button to show channel members / invite users.
+    pub members_button: Button,
     /// Button to start a Google Meet call.
     pub call_button: Button,
     /// Generation counter; incremented on clear() so in-flight image loads detect staleness.
@@ -114,6 +116,11 @@ impl MessageView {
         typing_label.set_halign(gtk::Align::End);
         typing_label.set_visible(false);
         header.append(&typing_label);
+
+        let members_button = Button::from_icon_name("system-users-symbolic");
+        members_button.set_tooltip_text(Some("Channel members"));
+        members_button.add_css_class("flat");
+        header.append(&members_button);
 
         let call_button = Button::from_icon_name("call-start-symbolic");
         call_button.set_tooltip_text(Some("Start Google Meet call"));
@@ -190,6 +197,7 @@ impl MessageView {
             thread_labels: Rc::new(RefCell::new(HashMap::new())),
             reaction_boxes: Rc::new(RefCell::new(HashMap::new())),
             typing_label,
+            members_button,
             call_button,
             image_generation: Rc::new(Cell::new(0)),
             subteam_names: RefCell::new(Rc::new(HashMap::new())),

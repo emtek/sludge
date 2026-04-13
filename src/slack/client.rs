@@ -82,6 +82,12 @@ struct RawEmojiList {
 }
 
 #[derive(Debug, serde::Deserialize)]
+struct RawConversationMembers {
+    members: Vec<String>,
+    response_metadata: Option<slacko::types::ResponseMetadata>,
+}
+
+#[derive(Debug, serde::Deserialize)]
 struct RawGetUploadUrl {
     upload_url: String,
     file_id: String,
@@ -516,6 +522,52 @@ impl Client {
         )
         .await?;
         Ok(data.channel)
+    }
+
+    /// List member user IDs of a conversation (paginated).
+    pub async fn conversations_members(&self, channel: &str) -> Result<Vec<String>, String> {
+        info!("Calling conversations.members for channel={channel}");
+        let mut all = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut fields: Vec<(&str, &str)> = vec![("channel", channel), ("limit", "200")];
+            let cursor_val;
+            if let Some(c) = &cursor {
+                cursor_val = c.clone();
+                fields.push(("cursor", &cursor_val));
+            }
+            let data: RawConversationMembers =
+                Self::stealth_post(&self.http, &self.creds, "conversations.members", &fields)
+                    .await?;
+            all.extend(data.members);
+            let next = data
+                .response_metadata
+                .and_then(|m| m.next_cursor)
+                .filter(|c| !c.is_empty());
+            if next.is_none() {
+                break;
+            }
+            cursor = next;
+        }
+        Ok(all)
+    }
+
+    /// Invite users to a channel.
+    pub async fn conversations_invite(
+        &self,
+        channel: &str,
+        user_ids: &[String],
+    ) -> Result<(), String> {
+        let users_str = user_ids.join(",");
+        info!("Calling conversations.invite channel={channel} users={users_str}");
+        let _: serde_json::Value = Self::stealth_post(
+            &self.http,
+            &self.creds,
+            "conversations.invite",
+            &[("channel", channel), ("users", &users_str)],
+        )
+        .await?;
+        Ok(())
     }
 
     pub async fn close_conversation(&self, channel: &str) -> Result<(), String> {

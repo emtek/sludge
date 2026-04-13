@@ -71,7 +71,8 @@ pub struct ChannelSidebar {
 impl ChannelSidebar {
     pub fn new() -> Self {
         let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        container.set_width_request(240);
+        container.set_size_request(240, -1);
+        container.set_hexpand(false);
         container.add_css_class("sidebar");
 
         let search_entry = SearchEntry::new();

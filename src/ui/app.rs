@@ -1565,6 +1565,244 @@ pub fn build_app(
         });
     }
 
+    // ── Channel members button ──
+    {
+        let state = state.clone();
+        let client = client.clone();
+        let rt = rt.clone();
+        let window = window.clone();
+        message_view.members_button.connect_clicked(move |_| {
+            let channel_id = match state.borrow().current_channel.clone() {
+                Some(c) => c,
+                None => return,
+            };
+            let user_names = state.borrow().user_names.clone();
+            let self_uid = state.borrow().self_user_id.clone();
+            let client2 = client.clone();
+            let rt2 = rt.clone();
+            let window2 = window.clone();
+
+            // Fetch members async, then show dialog
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let cid = channel_id.clone();
+            let c = client.clone();
+            rt.spawn(async move {
+                let result = c.conversations_members(&cid).await;
+                let _ = tx.send(result);
+            });
+
+            gtk4::glib::spawn_future_local(async move {
+                let member_ids = match rx.await {
+                    Ok(Ok(ids)) => ids,
+                    Ok(Err(e)) => {
+                        tracing::error!("Failed to fetch members: {e}");
+                        return;
+                    }
+                    Err(_) => return,
+                };
+
+                let dialog = gtk::Window::builder()
+                    .title("Channel Members")
+                    .transient_for(&window2)
+                    .modal(true)
+                    .default_width(400)
+                    .default_height(500)
+                    .build();
+
+                let vbox = gtk::Box::new(gtk::Orientation::Vertical, 8);
+                vbox.set_margin_top(12);
+                vbox.set_margin_bottom(12);
+                vbox.set_margin_start(12);
+                vbox.set_margin_end(12);
+
+                // Current members section
+                let members_label = Label::new(Some(&format!(
+                    "Members ({})",
+                    member_ids.len()
+                )));
+                members_label.add_css_class("heading");
+                members_label.set_halign(gtk::Align::Start);
+                vbox.append(&members_label);
+
+                let members_scrolled = gtk::ScrolledWindow::new();
+                members_scrolled.set_vexpand(true);
+                members_scrolled.set_min_content_height(150);
+                let members_list = gtk::ListBox::new();
+                members_list.set_selection_mode(gtk::SelectionMode::None);
+                members_list.add_css_class("boxed-list");
+
+                // Sort members: show display name, mark self
+                let mut sorted_members: Vec<(String, String)> = member_ids
+                    .iter()
+                    .map(|uid| {
+                        let name = user_names
+                            .get(uid)
+                            .cloned()
+                            .unwrap_or_else(|| uid.clone());
+                        (uid.clone(), name)
+                    })
+                    .collect();
+                sorted_members.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+
+                for (uid, name) in &sorted_members {
+                    let row = gtk::ListBoxRow::new();
+                    let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+                    hbox.set_margin_top(4);
+                    hbox.set_margin_bottom(4);
+                    hbox.set_margin_start(8);
+                    hbox.set_margin_end(8);
+
+                    let display = if *uid == self_uid {
+                        format!("{name} (you)")
+                    } else {
+                        name.clone()
+                    };
+                    let label = Label::new(Some(&display));
+                    label.set_halign(gtk::Align::Start);
+                    label.set_hexpand(true);
+                    hbox.append(&label);
+
+                    row.set_child(Some(&hbox));
+                    members_list.append(&row);
+                }
+                members_scrolled.set_child(Some(&members_list));
+                vbox.append(&members_scrolled);
+
+                // Add members section
+                let sep = gtk::Separator::new(gtk::Orientation::Horizontal);
+                sep.set_margin_top(8);
+                sep.set_margin_bottom(4);
+                vbox.append(&sep);
+
+                let add_label = Label::new(Some("Add people"));
+                add_label.add_css_class("heading");
+                add_label.set_halign(gtk::Align::Start);
+                vbox.append(&add_label);
+
+                let search = gtk::SearchEntry::new();
+                search.set_placeholder_text(Some("Search people..."));
+                vbox.append(&search);
+
+                let add_scrolled = gtk::ScrolledWindow::new();
+                add_scrolled.set_vexpand(true);
+                add_scrolled.set_min_content_height(150);
+                let add_list = gtk::ListBox::new();
+                add_list.set_selection_mode(gtk::SelectionMode::None);
+                add_list.add_css_class("boxed-list");
+
+                let member_set: std::collections::HashSet<&str> =
+                    member_ids.iter().map(|s| s.as_str()).collect();
+
+                // Build list of non-member users
+                let mut non_members: Vec<(String, String)> = user_names
+                    .iter()
+                    .filter(|(uid, _)| !member_set.contains(uid.as_str()))
+                    .map(|(uid, name)| (uid.clone(), name.clone()))
+                    .collect();
+                non_members.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+
+                let selected_users: Rc<RefCell<Vec<String>>> =
+                    Rc::new(RefCell::new(Vec::new()));
+
+                for (uid, name) in &non_members {
+                    let row = gtk::ListBoxRow::new();
+                    row.set_widget_name(uid);
+                    let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+                    hbox.set_margin_top(4);
+                    hbox.set_margin_bottom(4);
+                    hbox.set_margin_start(8);
+                    hbox.set_margin_end(8);
+
+                    let check = gtk::CheckButton::new();
+                    hbox.append(&check);
+
+                    let label = Label::new(Some(name));
+                    label.set_halign(gtk::Align::Start);
+                    label.set_hexpand(true);
+                    hbox.append(&label);
+
+                    row.set_child(Some(&hbox));
+                    add_list.append(&row);
+
+                    let selected = selected_users.clone();
+                    let uid = uid.clone();
+                    check.connect_toggled(move |check| {
+                        let mut sel = selected.borrow_mut();
+                        if check.is_active() {
+                            sel.push(uid.clone());
+                        } else {
+                            sel.retain(|id| *id != uid);
+                        }
+                    });
+                }
+
+                add_scrolled.set_child(Some(&add_list));
+                vbox.append(&add_scrolled);
+
+                // Filter on search
+                let add_list2 = add_list.clone();
+                search.connect_search_changed(move |entry| {
+                    let query = entry.text().to_string().to_lowercase();
+                    let mut idx = 0;
+                    while let Some(row) = add_list2.row_at_index(idx) {
+                        if let Some(child) = row.child() {
+                            if let Some(hbox) = child.downcast_ref::<gtk::Box>() {
+                                if let Some(label_widget) = hbox.last_child() {
+                                    if let Some(label) = label_widget.downcast_ref::<Label>() {
+                                        let name = label.text().to_string().to_lowercase();
+                                        row.set_visible(
+                                            query.is_empty() || name.contains(&query),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        idx += 1;
+                    }
+                });
+
+                // Invite button
+                let invite_btn = gtk::Button::with_label("Add Selected");
+                invite_btn.add_css_class("suggested-action");
+                vbox.append(&invite_btn);
+
+                let selected_final = selected_users.clone();
+                let dialog2 = dialog.clone();
+                invite_btn.connect_clicked(move |btn| {
+                    let sel = selected_final.borrow().clone();
+                    if sel.is_empty() {
+                        dialog2.close();
+                        return;
+                    }
+                    btn.set_sensitive(false);
+                    let client3 = client2.clone();
+                    let cid = channel_id.clone();
+                    let dialog3 = dialog2.clone();
+                    let (tx2, rx2) = tokio::sync::oneshot::channel();
+                    rt2.spawn(async move {
+                        let result = client3.conversations_invite(&cid, &sel).await;
+                        let _ = tx2.send(result);
+                    });
+                    gtk4::glib::spawn_future_local(async move {
+                        match rx2.await {
+                            Ok(Ok(())) => {
+                                tracing::info!("Invited users to channel");
+                            }
+                            Ok(Err(e)) => {
+                                tracing::error!("Failed to invite: {e}");
+                            }
+                            Err(_) => {}
+                        }
+                        dialog3.close();
+                    });
+                });
+
+                dialog.set_child(Some(&vbox));
+                dialog.present();
+            });
+        });
+    }
+
     // ── Infinite scroll: load older messages (top) and newer messages (bottom) ──
     {
         let mv = message_view.clone();
@@ -2209,11 +2447,13 @@ pub fn build_app(
                 sidebar.set_unread(&channel_id, 0);
                 message_view.set_channel_id(&channel_id);
 
-                // Set header name
+                // Set header name and toggle members button
                 {
                     let st = state.borrow();
                     if let Some(ch) = st.channels.iter().find(|c| c.id == channel_id) {
-                        let name = if ch.is_im == Some(true) {
+                        let is_dm = ch.is_im == Some(true);
+                        let is_mpdm = ch.name.as_deref().is_some_and(|n| n.starts_with("mpdm-"));
+                        let name = if is_dm {
                             st.user_names
                                 .get(ch.user.as_deref().unwrap_or(&channel_id))
                                 .cloned()
@@ -2222,6 +2462,7 @@ pub fn build_app(
                             channel_display_name(ch)
                         };
                         message_view.set_channel_name(&name);
+                        message_view.members_button.set_visible(!is_dm && !is_mpdm);
                         window.set_title(Some(&format!("{name} — Sludge")));
                     }
                 }
