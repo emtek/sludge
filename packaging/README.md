@@ -19,11 +19,22 @@ sudo dnf install ~/rpmbuild/RPMS/x86_64/sludge-*.rpm
 
 ## Ubuntu (latest) / Debian
 
+### Build with podman (recommended)
+
+```bash
+./packaging/build-deb.sh
+# Output: dist/sludge_*.deb
+```
+
+Uses Ubuntu 24.04 by default. Override with `IMAGE=ubuntu:25.04 ./packaging/build-deb.sh`.
+
+### Build natively
+
 Copy the packaging files into a `debian/` directory at the repo root, then build:
 
 ```bash
 cp -r packaging/debian ./debian
-sudo apt install debhelper cargo rustc pkg-config libgtk-4-dev libadwaita-1-dev
+sudo apt install debhelper cargo rustc pkg-config libgtk-4-dev libadwaita-1-dev libssl-dev
 dpkg-buildpackage -us -uc -b
 # Output: ../sludge_*.deb
 ```
@@ -31,5 +42,5 @@ dpkg-buildpackage -us -uc -b
 Install with:
 
 ```bash
-sudo apt install ../sludge_*.deb
+sudo apt install ./dist/sludge_*.deb
 ```

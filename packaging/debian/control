@@ -12,6 +12,7 @@ Build-Depends:
  libglib2.0-dev,
  libcairo2-dev,
  libpango1.0-dev,
+ libssl-dev,
 Standards-Version: 4.7.0
 Homepage: https://github.com/emtek/sludge
 Rules-Requires-Root: no
