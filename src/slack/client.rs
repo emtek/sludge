@@ -373,9 +373,9 @@ impl Client {
         ts: &str,
         count: u32,
     ) -> Result<Vec<Message>, String> {
-        // Fetch messages before (inclusive of ts) and after ts
+        // Fetch messages at-and-before ts (inclusive) and after ts.
         let (before, _) = self
-            .conversation_history_page(channel, "0", Some(ts), count + 1)
+            .conversation_history_page_inclusive(channel, "0", Some(ts), count + 1)
             .await?;
         let (after, _) = self
             .conversation_history_page(channel, ts, None, count + 1)
@@ -392,6 +392,29 @@ impl Client {
         // Sort newest first (Slack ts are lexicographically comparable)
         combined.sort_by(|a, b| b.ts.cmp(&a.ts));
         Ok(combined)
+    }
+
+    /// Same as `conversation_history_page` but with `inclusive=true` for the `latest` bound.
+    async fn conversation_history_page_inclusive(
+        &self,
+        channel: &str,
+        oldest: &str,
+        latest: Option<&str>,
+        limit: u32,
+    ) -> Result<(Vec<Message>, bool), String> {
+        let limit_str = limit.to_string();
+        let mut fields = vec![
+            ("channel", channel),
+            ("oldest", oldest),
+            ("limit", &limit_str),
+            ("inclusive", "true"),
+        ];
+        if let Some(l) = latest {
+            fields.push(("latest", l));
+        }
+        let data: RawConversationHistory =
+            Self::stealth_post(&self.http, &self.creds, "conversations.history", &fields).await?;
+        Ok((data.messages, data.has_more))
     }
 
     /// Fetch a page of messages older than `latest` with `oldest` lower bound.
@@ -704,10 +727,23 @@ impl Client {
             ("ts", thread_ts),
             ("limit", "100"),
         ];
-        let data: RawConversationHistory =
-            Self::stealth_post(&self.http, &self.creds, "conversations.replies", &fields).await?;
-        info!("conversations.replies returned {} messages", data.messages.len());
-        Ok(data.messages)
+        match Self::stealth_post::<RawConversationHistory>(
+            &self.http, &self.creds, "conversations.replies", &fields,
+        )
+        .await
+        {
+            Ok(data) => {
+                info!("conversations.replies returned {} messages", data.messages.len());
+                Ok(data.messages)
+            }
+            // If the thread doesn't exist yet (e.g. user just posted the first reply
+            // and Slack hasn't indexed it, or the thread was deleted), treat as empty.
+            Err(e) if e.contains("thread_not_found") => {
+                info!("conversations.replies thread_not_found — treating as empty");
+                Ok(Vec::new())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     // ── User profile ──

@@ -417,6 +417,34 @@ impl Database {
         self.index_messages(channel_id, &[message.clone()]).await;
     }
 
+    /// Return reply counts per thread parent for a channel, computed from
+    /// indexed messages. Each key is a thread_ts; the value is the number of
+    /// replies excluding the parent.
+    pub async fn reply_counts_for_channel(&self, channel_id: &str) -> std::collections::HashMap<String, usize> {
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let result = self
+            .db
+            .query("SELECT thread_ts FROM message WHERE channel = $channel AND thread_ts IS NOT NONE AND thread_ts != ts")
+            .bind(("channel", channel_id.to_string()))
+            .await;
+        match result {
+            Ok(mut response) => {
+                let rows: Result<Vec<serde_json::Value>, _> = response.take(0);
+                if let Ok(rows) = rows {
+                    for row in rows {
+                        if let Some(tts) = row.get("thread_ts").and_then(|v| v.as_str()) {
+                            *counts.entry(tts.to_string()).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                error!("DB reply_counts query error: {e}");
+            }
+        }
+        counts
+    }
+
     /// Load messages newer than `after_ts` for a channel from the FTS index.
     pub async fn load_messages_after(&self, channel_id: &str, after_ts: &str, limit: u32) -> Vec<Message> {
         let result = self

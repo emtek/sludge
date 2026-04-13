@@ -32,6 +32,93 @@ fn is_fatal_auth_error(err: &str) -> bool {
     FATAL_ERRORS.iter().any(|e| err.contains(e))
 }
 
+/// Expand the thread for `thread_ts` (if not already) and select the reply row matching `reply_ts`.
+/// Polls briefly for the async expand to populate reply rows.
+fn expand_and_select(
+    mv: &Rc<crate::ui::message_view::MessageView>,
+    channel_id: &str,
+    thread_ts: &str,
+    reply_ts: &str,
+) {
+    // Find the parent row
+    let mut parent_row_opt = None;
+    let mut idx = 0;
+    while let Some(r) = mv.list_box.row_at_index(idx) {
+        if r.widget_name() == thread_ts {
+            parent_row_opt = Some(r);
+            break;
+        }
+        idx += 1;
+    }
+    let Some(parent_row) = parent_row_opt else { return };
+
+    let was_expanded = mv.is_thread_expanded(thread_ts);
+    if !was_expanded {
+        // Trigger the expand callback
+        if let Some(cb) = mv.thread_expand_callback.borrow().as_ref() {
+            cb(thread_ts, channel_id, &parent_row);
+        }
+        // Flip the arrow icon on the thread button
+        fn find_btn(widget: &gtk::Widget, class: &str) -> Option<gtk::Button> {
+            if let Some(btn) = widget.downcast_ref::<gtk::Button>() {
+                if btn.has_css_class(class) {
+                    return Some(btn.clone());
+                }
+            }
+            let mut child = widget.first_child();
+            while let Some(c) = child {
+                if let Some(btn) = find_btn(&c, class) {
+                    return Some(btn);
+                }
+                child = c.next_sibling();
+            }
+            None
+        }
+        if let Some(btn) = find_btn(parent_row.upcast_ref(), "thread-btn") {
+            if let Some(child) = btn.child() {
+                if let Some(bx) = child.downcast_ref::<gtk::Box>() {
+                    if let Some(first) = bx.first_child() {
+                        if let Some(lbl) = first.downcast_ref::<Label>() {
+                            lbl.set_text("\u{25bc}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Poll until the reply appears, then select it
+    let mv = mv.clone();
+    let reply_ts = reply_ts.to_string();
+    let retries = std::rc::Rc::new(std::cell::Cell::new(0u32));
+    gtk4::glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+        let n = retries.get();
+        retries.set(n + 1);
+        let mut i = 0;
+        while let Some(row) = mv.list_box.row_at_index(i) {
+            if row.widget_name() == reply_ts {
+                mv.list_box.select_row(Some(&row));
+                row.grab_focus();
+                mv.scroll_row_to_bottom(&row);
+                row.add_css_class("notification-highlight");
+                let row_clone = row.clone();
+                gtk4::glib::timeout_add_local_once(
+                    std::time::Duration::from_millis(1500),
+                    move || {
+                        row_clone.remove_css_class("notification-highlight");
+                    },
+                );
+                return gtk4::glib::ControlFlow::Break;
+            }
+            i += 1;
+        }
+        if n >= 40 {
+            return gtk4::glib::ControlFlow::Break;
+        }
+        gtk4::glib::ControlFlow::Continue
+    });
+}
+
 /// Action to perform on startup, from CLI flags.
 #[derive(Clone, Debug)]
 pub enum StartupAction {
@@ -380,8 +467,7 @@ pub fn build_app(
     main_box.append(&sidebar.widget);
     main_box.append(&vert_sep);
     main_box.append(&right_pane);
-    main_box.append(&thread_panel.separator);
-    main_box.append(&thread_panel.widget);
+    // Thread panel is no longer shown; inline thread expansion + reply indicator replaces it.
 
     // ── Toggle channel search from header button ──
     {
@@ -665,73 +751,109 @@ pub fn build_app(
         });
     }
 
-    // ── Thread panel: open callback ──
+    // ── Reply callback: set reply target on the message input ──
     {
-        let thread_panel = thread_panel.clone();
+        let input = message_input.clone();
+        let cb: crate::ui::message_view::ThreadOpenCallback =
+            Rc::new(move |thread_ts: &str, _channel_id: &str, user_display: &str, preview: &str| {
+                input.set_reply_target(thread_ts, user_display, preview);
+            });
+        message_view.set_thread_callback(cb);
+    }
+
+    // ── Thread expand callback: inline thread expansion ──
+    {
+        let message_view_outer = message_view.clone();
+        let message_view = message_view.clone();
         let state = state.clone();
         let client = client.clone();
         let rt = rt.clone();
         let db = db.clone();
-        let message_view_tc = message_view.clone();
-        let cb: crate::ui::message_view::ThreadOpenCallback =
-            Rc::new(move |thread_ts: &str, channel_id: &str| {
-                let tp = thread_panel.clone();
-                let state = state.clone();
-                let client = client.clone();
-                let rt = rt.clone();
-                let db = db.clone();
-                let message_view = message_view_tc.clone();
+        let expand_cb: crate::ui::message_view::ThreadExpandCallback =
+            Rc::new(move |thread_ts: &str, channel_id: &str, parent_row: &gtk::ListBoxRow| {
+                let mv = message_view.clone();
                 let thread_ts = thread_ts.to_string();
                 let channel_id = channel_id.to_string();
+                let parent_row = parent_row.clone();
 
-                state.borrow_mut().current_thread =
-                    Some((thread_ts.clone(), channel_id.clone()));
+                // Toggle: if already expanded, collapse
+                if mv.is_thread_expanded(&thread_ts) {
+                    mv.remove_thread_replies(&thread_ts);
+                    return;
+                }
 
-                tp.set_channel_id(&channel_id);
-                tp.clear();
-                tp.show();
-                tp.text_view.grab_focus();
+                // Fetch replies and insert them
+                let client2 = client.clone();
+                let rt2 = rt.clone();
+                let state2 = state.clone();
+                let db2 = db.clone();
+                let tts = thread_ts.clone();
+                let cid = channel_id.clone();
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                rt.spawn(async move {
+                    let replies = client2.conversation_replies(&cid, &tts).await;
+                    if let Ok(ref messages) = replies {
+                        db2.index_messages(&cid, messages).await;
+                    }
+                    let _ = tx.send(replies);
+                });
 
-                let mv = message_view.clone();
-                let db = db.clone();
+                let client_img = client.clone();
+                let rt3 = rt2.clone();
                 gtk4::glib::spawn_future_local(async move {
-                    let c = client.clone();
-                    let cid = channel_id.clone();
-                    let tts = thread_ts.clone();
-                    let tts2 = tts.clone();
-                    let db2 = db.clone();
-                    let result = rt
-                        .spawn(async move {
-                            let replies = c.conversation_replies(&cid, &tts).await;
-                            if let Ok(ref messages) = replies {
-                                db2.index_messages(&cid, messages).await;
+                    let Ok(Ok(messages)) = rx.await else { return };
+
+                    // Skip the first message (it's the parent)
+                    let replies: Vec<_> = messages.into_iter().skip(1).collect();
+                    if replies.is_empty() {
+                        return;
+                    }
+
+                    // Update reply count on the button
+                    mv.update_thread_count(&thread_ts, replies.len());
+
+                    let users = state2.borrow().user_names.clone();
+                    let subteam_names = state2.borrow().subteam_names.clone();
+
+                    let thread_cb = mv.thread_callback.borrow();
+                    let thread_expand_cb = mv.thread_expand_callback.borrow();
+                    let mention_cb = mv.mention_callback.borrow();
+                    let reaction_cb = mv.reaction_callback.borrow();
+                    let delete_cb = mv.delete_callback.borrow();
+                    let edit_cb = mv.edit_callback.borrow();
+                    let self_uid = mv.self_user_id.borrow();
+
+                    let mut reply_rows = Vec::new();
+                    for msg in &replies {
+                        let row = crate::ui::message_view::make_message_row(
+                            msg, &users, &subteam_names, &client_img, &rt3,
+                            &thread_cb, &mention_cb, &reaction_cb, &delete_cb, &edit_cb,
+                            Some(&channel_id), &mv.thread_counts.borrow(), &mv.thread_labels, &mv.reaction_boxes, &self_uid,
+                            &mv.image_generation, &mv.picker_cells,
+                            &thread_expand_cb, &mv.expanded_threads,
+                        );
+                        // Indent reply rows for tree-like appearance
+                        if let Some(child) = row.child() {
+                            if let Some(outer) = child.downcast_ref::<gtk::Box>() {
+                                outer.set_margin_start(12);
                             }
-                            replies
-                        })
-                        .await
-                        .unwrap();
-
-                    if let Ok(messages) = result {
-                        // Update thread reply count on the button label
-                        let count = if messages.is_empty() {
-                            0
-                        } else {
-                            messages.len() - 1 // first message is the parent
-                        };
-                        mv.update_thread_count(&tts2, count);
-
-                        let users = state.borrow().user_names.clone();
-                        tp.set_messages(&messages, &users, &client, &rt);
-
-                        // Scroll to pending reply if set by notification click
-                        let pending = tp.pending_scroll.borrow_mut().take();
-                        if let Some(ts) = pending {
-                            tp.scroll_to_message(&ts);
                         }
+                        row.add_css_class("thread-reply");
+                        reply_rows.push(row);
+                    }
+
+                    mv.insert_thread_replies(&thread_ts, &parent_row, reply_rows);
+                    // Select the last thread reply and scroll it to the bottom of the view.
+                    let last = mv.expanded_threads.borrow()
+                        .get(&thread_ts)
+                        .and_then(|rows| rows.last().cloned());
+                    if let Some(last) = last {
+                        mv.list_box.select_row(Some(&last));
+                        mv.scroll_row_to_bottom(&last);
                     }
                 });
             });
-        message_view.set_thread_callback(cb);
+        message_view_outer.set_thread_expand_callback(expand_cb);
     }
 
     // ── Mention callback: open DM with user ──
@@ -2423,12 +2545,9 @@ pub fn build_app(
                     return;
                 }
 
-                // Clear search and focus the message input box
+                // Clear search; focus goes to the selected latest message (handled later),
+                // not to the message input.
                 search_entry.set_text("");
-                let input_focus = message_input.text_view.clone();
-                gtk4::glib::idle_add_local_once(move || {
-                    input_focus.grab_focus();
-                });
 
                 // Persist last selected channel
                 let db2 = db.clone();
@@ -2446,6 +2565,7 @@ pub fn build_app(
                 }
                 sidebar.set_unread(&channel_id, 0);
                 message_view.set_channel_id(&channel_id);
+                message_input.clear_reply_target();
 
                 // Set header name and toggle members button
                 {
@@ -2482,6 +2602,7 @@ pub fn build_app(
                 let rt3 = rt.clone();
                 let db2 = db.clone();
                 let sidebar2 = sidebar.clone();
+                let input_for_spawn = message_input.clone();
 
                 mv.spinner.set_visible(true);
                 mv.spinner.start();
@@ -2561,6 +2682,37 @@ pub fn build_app(
                         let users = state2.borrow().user_names.clone();
                         mv.set_messages(&messages, &users, &client_img, &rt3);
 
+                        // Select the latest message (last row) but focus the input.
+                        {
+                            let list_box = mv.list_box.clone();
+                            let input_tv = input_for_spawn.text_view.clone();
+                            gtk4::glib::idle_add_local_once(move || {
+                                let mut idx = 0;
+                                let mut last = None;
+                                while let Some(row) = list_box.row_at_index(idx) {
+                                    last = Some(row);
+                                    idx += 1;
+                                }
+                                if let Some(row) = last {
+                                    list_box.select_row(Some(&row));
+                                }
+                                input_tv.grab_focus();
+                            });
+                        }
+
+                        // Populate thread reply counts from the DB
+                        let db_counts = db2.clone();
+                        let cid_counts = cid.clone();
+                        let mv_counts = mv.clone();
+                        let rt_counts = rt2.clone();
+                        gtk4::glib::spawn_future_local(async move {
+                            let counts = rt_counts
+                                .spawn(async move { db_counts.reply_counts_for_channel(&cid_counts).await })
+                                .await
+                                .unwrap_or_default();
+                            mv_counts.apply_thread_counts(&counts);
+                        });
+
                         if pending_ts.is_some() {
                             mv.has_more_newer.set(true);
                         }
@@ -2571,12 +2723,12 @@ pub fn build_app(
                             mv.scroll_to_message(&ts);
                         }
 
-                        // Open pending thread if set by notification click
+                        // Expand pending thread if set by notification click,
+                        // then select the specific reply.
                         let pending_thread = state2.borrow_mut().pending_thread.take();
                         if let Some((thread_ts, reply_ts)) = pending_thread {
                             mv.scroll_to_message(&thread_ts);
-                            tp.pending_scroll.replace(Some(reply_ts));
-                            mv.open_thread(&thread_ts, &cid);
+                            expand_and_select(&mv, &cid, &thread_ts, &reply_ts);
                         }
 
                         // Update activity and mark as read
@@ -2719,11 +2871,10 @@ pub fn build_app(
                 }
                 sidebar.select_channel_by_id(&channel_id);
             } else if let Some(ref tts) = thread_ts {
-                // Already on the channel — scroll to parent, open thread, scroll to reply
+                // Already on the channel — scroll to parent, expand thread inline, select reply
                 if let Some(ref mts) = message_ts {
                     message_view.scroll_to_message(tts);
-                    thread_panel.pending_scroll.replace(Some(mts.clone()));
-                    message_view.open_thread(tts, &channel_id);
+                    expand_and_select(&message_view, &channel_id, tts, mts);
                 }
             } else if let Some(ref mts) = message_ts {
                 // Check if the message is already loaded; if not, fetch around it
@@ -2817,7 +2968,7 @@ pub fn build_app(
             let list_box = list_box.clone();
             let key_controller = gtk::EventControllerKey::new();
             key_controller.connect_key_pressed(move |_, key, _, _| {
-                if key == gtk4::gdk::Key::colon {
+                if key == gtk4::gdk::Key::colon || key == gtk4::gdk::Key::semicolon {
                     if let Some(row) = list_box.selected_row() {
                         // Walk the row's widget tree to find the reaction-add button
                         fn find_reaction_btn(widget: &gtk::Widget) -> Option<gtk::Button> {
@@ -2850,6 +3001,156 @@ pub fn build_app(
         thread_panel.list_box.add_controller(open_reaction_picker(&thread_panel.list_box));
     }
 
+    // ── Arrow keys: Right starts reply (or opens thread), Left clears reply ──
+    {
+        let mv = message_view.clone();
+        let input = message_input.clone();
+        let key_controller = gtk::EventControllerKey::new();
+        key_controller.connect_key_pressed(move |_, key, _, _| {
+            fn find_btn_with_class(widget: &gtk::Widget, class: &str) -> Option<gtk::Button> {
+                if let Some(btn) = widget.downcast_ref::<gtk::Button>() {
+                    if btn.has_css_class(class) {
+                        return Some(btn.clone());
+                    }
+                }
+                let mut child = widget.first_child();
+                while let Some(c) = child {
+                    if let Some(btn) = find_btn_with_class(&c, class) {
+                        return Some(btn);
+                    }
+                    child = c.next_sibling();
+                }
+                None
+            }
+
+            match key {
+                k if k == gtk4::gdk::Key::Right => {
+                    let Some(row) = mv.list_box.selected_row() else {
+                        return gtk4::glib::Propagation::Proceed;
+                    };
+                    let ts = row.widget_name().to_string();
+
+                    // If the message has a thread (expand button is visible), open it.
+                    // Otherwise fall through to reply-mode to create a new thread.
+                    let expand_btn_opt = find_btn_with_class(row.upcast_ref(), "thread-btn")
+                        .filter(|b| b.is_visible());
+                    if let Some(expand_btn) = expand_btn_opt {
+                        let was_expanded = mv.is_thread_expanded(&ts);
+                        if !was_expanded {
+                            expand_btn.emit_clicked();
+                        }
+                        let mv = mv.clone();
+                        let ts = ts.clone();
+                        let select_latest = move || {
+                            let last = mv.expanded_threads.borrow().get(&ts)
+                                .and_then(|rows| rows.last().cloned());
+                            if let Some(last) = last {
+                                mv.list_box.select_row(Some(&last));
+                                last.grab_focus();
+                                return true;
+                            }
+                            false
+                        };
+                        if was_expanded {
+                            select_latest();
+                        } else {
+                            // Poll until the async fetch populates the expanded rows
+                            let retries = std::rc::Rc::new(std::cell::Cell::new(0u32));
+                            gtk4::glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+                                if select_latest() {
+                                    return gtk4::glib::ControlFlow::Break;
+                                }
+                                retries.set(retries.get() + 1);
+                                if retries.get() >= 40 {
+                                    return gtk4::glib::ControlFlow::Break;
+                                }
+                                gtk4::glib::ControlFlow::Continue
+                            });
+                        }
+                        return gtk4::glib::Propagation::Stop;
+                    }
+
+                    // Otherwise (no thread), click the Reply button to create a new thread
+                    if let Some(btn) = find_btn_with_class(row.upcast_ref(), "reply-btn") {
+                        btn.emit_clicked();
+                        return gtk4::glib::Propagation::Stop;
+                    }
+                    gtk4::glib::Propagation::Proceed
+                }
+                k if k == gtk4::gdk::Key::Left => {
+                    let Some(row) = mv.list_box.selected_row() else {
+                        return gtk4::glib::Propagation::Proceed;
+                    };
+
+                    // If this row is a thread reply, find the parent, collapse the thread,
+                    // and select the parent.
+                    if row.has_css_class("thread-reply") {
+                        // Find which expanded thread contains this row
+                        let parent_ts = mv.expanded_threads.borrow().iter()
+                            .find(|(_, rows)| rows.iter().any(|r| *r == row))
+                            .map(|(ts, _)| ts.clone());
+                        if let Some(parent_ts) = parent_ts {
+                            // Collapse via the expand callback so the arrow icon updates too
+                            let mut idx = 0;
+                            let mut parent_row_opt = None;
+                            while let Some(r) = mv.list_box.row_at_index(idx) {
+                                if r.widget_name() == parent_ts {
+                                    parent_row_opt = Some(r);
+                                    break;
+                                }
+                                idx += 1;
+                            }
+                            if let Some(parent_row) = parent_row_opt {
+                                // Click the expand button to collapse and flip the arrow
+                                if let Some(expand_btn) =
+                                    find_btn_with_class(parent_row.upcast_ref(), "thread-btn")
+                                {
+                                    expand_btn.emit_clicked();
+                                }
+                                mv.list_box.select_row(Some(&parent_row));
+                                parent_row.grab_focus();
+                            }
+                            return gtk4::glib::Propagation::Stop;
+                        }
+                    }
+
+                    // Top-level message: deselect, scroll to bottom, focus input
+                    mv.list_box.unselect_all();
+                    mv.scroll_to_bottom();
+                    input.text_view.grab_focus();
+                    gtk4::glib::Propagation::Stop
+                }
+                k if k == gtk4::gdk::Key::Delete => {
+                    let Some(row) = mv.list_box.selected_row() else {
+                        return gtk4::glib::Propagation::Proceed;
+                    };
+                    // Only owns-messages have a delete-btn; emit_clicked is a no-op otherwise.
+                    if let Some(btn) = find_btn_with_class(row.upcast_ref(), "delete-btn") {
+                        btn.emit_clicked();
+                        return gtk4::glib::Propagation::Stop;
+                    }
+                    gtk4::glib::Propagation::Proceed
+                }
+                k if k == gtk4::gdk::Key::Down => {
+                    // If the selected row is the last one in the list, Down moves
+                    // focus to the message input.
+                    let Some(row) = mv.list_box.selected_row() else {
+                        return gtk4::glib::Propagation::Proceed;
+                    };
+                    // Check if there's any row after this one
+                    let idx = row.index();
+                    if mv.list_box.row_at_index(idx + 1).is_none() {
+                        input.text_view.grab_focus();
+                        return gtk4::glib::Propagation::Stop;
+                    }
+                    gtk4::glib::Propagation::Proceed
+                }
+                _ => gtk4::glib::Propagation::Proceed,
+            }
+        });
+        message_view.list_box.add_controller(key_controller);
+    }
+
     // ── Message search: navigate to channel + scroll to message on click ──
     {
         let state_nav = state.clone();
@@ -2857,50 +3158,97 @@ pub fn build_app(
         let message_view_nav = message_view.clone();
         let client_nav = client.clone();
         let rt_nav = rt.clone();
-        message_view.set_search_result_callback(Rc::new(move |channel_id: &str, ts: &str| {
-            let current = state_nav.borrow().current_channel.clone();
-            let needs_switch = current.as_deref() != Some(channel_id);
-
-            let mv = message_view_nav.clone();
-            let c = client_nav.clone();
-            let c_img = client_nav.clone();
-            let rt2 = rt_nav.clone();
-            let rt3 = rt_nav.clone();
+        message_view.set_search_result_callback(Rc::new(move |channel_id: &str, ts: &str, thread_ts: Option<&str>| {
             let cid = channel_id.to_string();
             let target_ts = ts.to_string();
-            let state2 = state_nav.clone();
-            let sidebar2 = sidebar_nav.clone();
+            let thread_ts_opt = thread_ts.map(|s| s.to_string());
 
-            // Set current channel immediately so the sidebar switch doesn't
-            // trigger a second load
-            state_nav.borrow_mut().current_channel = Some(cid.clone());
+            let current = state_nav.borrow().current_channel.clone();
+            let needs_switch = current.as_deref() != Some(&cid);
 
             if needs_switch {
-                sidebar2.select_channel_by_id(&cid);
-            }
-
-            // Load 25 messages either side of the target message
-            mv.spinner.set_visible(true);
-            mv.spinner.start();
-
-            gtk4::glib::spawn_future_local(async move {
-                let ch = cid.clone();
-                let t = target_ts.clone();
-                let result = rt2
-                    .spawn(async move { c.conversation_history_around(&ch, &t, 25).await })
-                    .await
-                    .unwrap();
-
-                mv.spinner.stop();
-                mv.spinner.set_visible(false);
-
-                if let Ok(messages) = result {
-                    let users = state2.borrow().user_names.clone();
-                    mv.set_messages(&messages, &users, &c_img, &rt3);
-                    mv.has_more_newer.set(true);
-                    mv.scroll_to_message(&target_ts);
+                // Set pending state so the channel-load flow navigates correctly.
+                {
+                    let mut st = state_nav.borrow_mut();
+                    if let Some(tts) = &thread_ts_opt {
+                        st.pending_thread = Some((tts.clone(), target_ts.clone()));
+                        st.pending_scroll = None;
+                    } else {
+                        st.pending_scroll = Some(target_ts.clone());
+                        st.pending_thread = None;
+                    }
                 }
-            });
+                sidebar_nav.select_channel_by_id(&cid);
+            } else {
+                // Already on this channel: fetch history around target and display.
+                let mv = message_view_nav.clone();
+                let client = client_nav.clone();
+                let client_img = client_nav.clone();
+                let rt2 = rt_nav.clone();
+                let rt3 = rt_nav.clone();
+                let state2 = state_nav.clone();
+                let scroll_to_ts = thread_ts_opt.clone().unwrap_or_else(|| target_ts.clone());
+                let cid2 = cid.clone();
+                let target_ts2 = target_ts.clone();
+                let thread_ts2 = thread_ts_opt.clone();
+                mv.spinner.set_visible(true);
+                mv.spinner.start();
+                gtk4::glib::spawn_future_local(async move {
+                    let c = client.clone();
+                    let ch = cid2.clone();
+                    let t = scroll_to_ts.clone();
+                    let result = rt2
+                        .spawn(async move { c.conversation_history_around(&ch, &t, 25).await })
+                        .await
+                        .unwrap();
+                    mv.spinner.stop();
+                    mv.spinner.set_visible(false);
+                    if let Ok(messages) = result {
+                        let users = state2.borrow().user_names.clone();
+                        mv.set_messages(&messages, &users, &client_img, &rt3);
+                        mv.has_more_newer.set(true);
+
+                        if let Some(tts) = &thread_ts2 {
+                            expand_and_select(&mv, &cid2, tts, &target_ts2);
+                        } else {
+                            // Poll for the target row, then select + scroll.
+                            let mv_sel = mv.clone();
+                            let tgt = target_ts2.clone();
+                            let attempts = std::rc::Rc::new(std::cell::Cell::new(0u32));
+                            gtk4::glib::timeout_add_local(
+                                std::time::Duration::from_millis(30),
+                                move || {
+                                    let n = attempts.get();
+                                    attempts.set(n + 1);
+                                    let mut i = 0;
+                                    while let Some(row) = mv_sel.list_box.row_at_index(i) {
+                                        if row.widget_name() == tgt {
+                                            mv_sel.list_box.select_row(Some(&row));
+                                            row.grab_focus();
+                                            mv_sel.scroll_row_to_bottom(&row);
+                                            row.add_css_class("notification-highlight");
+                                            let row_clone = row.clone();
+                                            gtk4::glib::timeout_add_local_once(
+                                                std::time::Duration::from_millis(1500),
+                                                move || {
+                                                    row_clone.remove_css_class("notification-highlight");
+                                                },
+                                            );
+                                            return gtk4::glib::ControlFlow::Break;
+                                        }
+                                        i += 1;
+                                    }
+                                    if n >= 40 {
+                                        gtk4::glib::ControlFlow::Break
+                                    } else {
+                                        gtk4::glib::ControlFlow::Continue
+                                    }
+                                },
+                            );
+                        }
+                    }
+                });
+            }
         }));
     }
 
@@ -3022,7 +3370,11 @@ pub fn build_app(
                 None => return,
             };
 
+            // Capture reply target before clearing the input
+            let reply_thread_ts = input.reply_thread_ts();
+
             input.clear();
+            input.clear_reply_target();
 
             let client = client_send.clone();
             let rt2 = rt_send.clone();
@@ -3034,6 +3386,7 @@ pub fn build_app(
                 let c = client.clone();
                 let ch = channel.clone();
                 let txt = text.clone();
+                let reply_ts = reply_thread_ts.clone();
                 let sent_ts = rt2
                     .spawn(async move {
                         // Upload files first
@@ -3050,7 +3403,7 @@ pub fn build_app(
                                     } else {
                                         None
                                     };
-                                    if let Err(e) = c.upload_file(&ch, bytes, &filename, comment, None).await {
+                                    if let Err(e) = c.upload_file(&ch, bytes, &filename, comment, reply_ts.as_deref()).await {
                                         tracing::error!("Failed to upload file {filename}: {e}");
                                     }
                                 }
@@ -3061,7 +3414,7 @@ pub fn build_app(
                         }
                         // If no files, just send a text message and return the ts
                         if files.is_empty() && !txt.trim().is_empty() {
-                            match c.post_message(&ch, &txt, None).await {
+                            match c.post_message(&ch, &txt, reply_ts.as_deref()).await {
                                 Ok(ts) => Some(ts),
                                 Err(e) => {
                                     tracing::error!("Failed to send message: {e}");
@@ -3084,20 +3437,76 @@ pub fn build_app(
                         let st = state2.borrow();
                         let self_uid = st.self_user_id.clone();
                         let users = st.user_names.clone();
+                        let subteam_names = st.subteam_names.clone();
                         drop(st);
                         let msg = Message {
                             msg_type: "message".into(),
-                            user: Some(self_uid),
+                            user: Some(self_uid.clone()),
                             bot_id: None,
                             text,
                             ts,
-                            thread_ts: None,
-                            channel: Some(channel),
+                            thread_ts: reply_thread_ts.clone(),
+                            channel: Some(channel.clone()),
                             attachments: None,
                             reactions: None,
                             files: None,
                         };
-                        mv.append_message(&msg, &users, &client2, &rt3);
+                        if let Some(tts) = &reply_thread_ts {
+                            // Thread reply — insert inline if the thread is expanded
+                            if mv.is_thread_expanded(tts) {
+                                let mut parent_idx = None;
+                                let mut idx = 0;
+                                while let Some(r) = mv.list_box.row_at_index(idx) {
+                                    if r.widget_name() == *tts {
+                                        parent_idx = Some(idx);
+                                        break;
+                                    }
+                                    idx += 1;
+                                }
+                                if let Some(parent_idx) = parent_idx {
+                                    let thread_cb = mv.thread_callback.borrow();
+                                    let thread_expand_cb = mv.thread_expand_callback.borrow();
+                                    let mention_cb = mv.mention_callback.borrow();
+                                    let reaction_cb = mv.reaction_callback.borrow();
+                                    let delete_cb = mv.delete_callback.borrow();
+                                    let edit_cb = mv.edit_callback.borrow();
+                                    let row = crate::ui::message_view::make_message_row(
+                                        &msg, &users, &subteam_names, &client2, &rt3,
+                                        &thread_cb, &mention_cb, &reaction_cb, &delete_cb, &edit_cb,
+                                        Some(&channel), &mv.thread_counts.borrow(),
+                                        &mv.thread_labels, &mv.reaction_boxes,
+                                        &self_uid, &mv.image_generation,
+                                        &mv.picker_cells,
+                                        &thread_expand_cb, &mv.expanded_threads,
+                                    );
+                                    if let Some(child) = row.child() {
+                                        if let Some(outer) = child.downcast_ref::<gtk::Box>() {
+                                            outer.set_margin_start(12);
+                                        }
+                                    }
+                                    row.add_css_class("thread-reply");
+                                    let existing_count = mv
+                                        .expanded_threads
+                                        .borrow()
+                                        .get(tts)
+                                        .map(|v| v.len())
+                                        .unwrap_or(0);
+                                    mv.list_box.insert(&row, parent_idx + 1 + existing_count as i32);
+                                    mv.expanded_threads
+                                        .borrow_mut()
+                                        .entry(tts.clone())
+                                        .or_default()
+                                        .push(row);
+                                }
+                            }
+                            // Update reply count and promote parent to thread
+                            let current_count = mv.thread_counts.borrow().get(tts).copied().unwrap_or(0);
+                            mv.update_thread_count(tts, current_count + 1);
+                            mv.promote_to_thread(tts);
+                        } else {
+                            // Regular message — append to main list
+                            mv.append_message(&msg, &users, &client2, &rt3);
+                        }
                     }
                 }
             });
@@ -3109,10 +3518,13 @@ pub fn build_app(
             do_send_clone();
         });
 
-        // Enter to send, Shift+Enter or Ctrl+Enter to insert newline
+        // Enter to send, Shift+Enter or Ctrl+Enter to insert newline,
+        // Left arrow in an empty buffer clears the reply target.
         let key_controller = gtk::EventControllerKey::new();
         let do_send_key = do_send.clone();
         let tv = message_input.text_view.clone();
+        let input_keys = message_input.clone();
+        let mv_keys = message_view.clone();
         key_controller.connect_key_pressed(move |_, key, _, modifier| {
             if key == gtk4::gdk::Key::Return || key == gtk4::gdk::Key::KP_Enter {
                 if modifier.contains(gtk4::gdk::ModifierType::SHIFT_MASK)
@@ -3123,6 +3535,29 @@ pub fn build_app(
                 }
                 do_send_key();
                 return gtk4::glib::Propagation::Stop;
+            }
+            if key == gtk4::gdk::Key::Left && input_keys.is_replying() {
+                let buf = tv.buffer();
+                if buf.char_count() == 0 {
+                    input_keys.clear_reply_target();
+                    mv_keys.list_box.unselect_all();
+                    mv_keys.scroll_to_bottom();
+                    return gtk4::glib::Propagation::Stop;
+                }
+            }
+            if key == gtk4::gdk::Key::Up && tv.buffer().char_count() == 0 {
+                // Select the latest (bottom-most) message in the list
+                let mut last_row = None;
+                let mut idx = 0;
+                while let Some(row) = mv_keys.list_box.row_at_index(idx) {
+                    last_row = Some(row);
+                    idx += 1;
+                }
+                if let Some(row) = last_row {
+                    mv_keys.list_box.select_row(Some(&row));
+                    row.grab_focus();
+                    return gtk4::glib::Propagation::Stop;
+                }
             }
             gtk4::glib::Propagation::Proceed
         });
@@ -3210,17 +3645,7 @@ pub fn build_app(
                             )
                         };
 
-                        // Append to thread panel if the message belongs to the open thread
-                        if let Some((tts, tcid)) = &current_thread {
-                            if *tcid == channel
-                                && thread_ts.as_deref() == Some(tts.as_str())
-                            {
-                                thread_panel.append_message(
-                                    &msg, &users, &client_rt, &rt_rt,
-                                );
-                            }
-                        }
-
+                        let _ = current_thread;
                         let is_current = current.as_deref() == Some(&channel);
 
                         // Update thread reply count for thread replies in the current channel
@@ -3234,21 +3659,82 @@ pub fn build_app(
                                         .copied()
                                         .unwrap_or(0);
                                     message_view.update_thread_count(tts, current_count + 1);
+                                    message_view.promote_to_thread(tts);
+                                }
+                            }
+                        }
+
+                        // If this is a thread reply and the thread is expanded inline,
+                        // insert the reply into the expanded rows.
+                        let is_thread_reply = thread_ts
+                            .as_ref()
+                            .is_some_and(|tts| *tts != msg.ts);
+                        if is_current && is_thread_reply {
+                            if let Some(tts) = &thread_ts {
+                                if message_view.is_thread_expanded(tts) {
+                                    // Find the parent row, then build a reply row and append it
+                                    // at the end of the currently-expanded block.
+                                    let mut parent_idx = None;
+                                    let mut idx = 0;
+                                    while let Some(r) = message_view.list_box.row_at_index(idx) {
+                                        if r.widget_name() == *tts {
+                                            parent_idx = Some(idx);
+                                            break;
+                                        }
+                                        idx += 1;
+                                    }
+                                    if let Some(parent_idx) = parent_idx {
+                                        let subteam_names = state.borrow().subteam_names.clone();
+                                        let thread_cb = message_view.thread_callback.borrow();
+                                        let thread_expand_cb = message_view.thread_expand_callback.borrow();
+                                        let mention_cb = message_view.mention_callback.borrow();
+                                        let reaction_cb = message_view.reaction_callback.borrow();
+                                        let delete_cb = message_view.delete_callback.borrow();
+                                        let edit_cb = message_view.edit_callback.borrow();
+                                        let self_uid = message_view.self_user_id.borrow();
+                                        let row = crate::ui::message_view::make_message_row(
+                                            &msg, &users, &subteam_names, &client_rt, &rt_rt,
+                                            &thread_cb, &mention_cb, &reaction_cb, &delete_cb, &edit_cb,
+                                            Some(&channel), &message_view.thread_counts.borrow(),
+                                            &message_view.thread_labels, &message_view.reaction_boxes,
+                                            &self_uid, &message_view.image_generation,
+                                            &message_view.picker_cells,
+                                            &thread_expand_cb, &message_view.expanded_threads,
+                                        );
+                                        if let Some(child) = row.child() {
+                                            if let Some(outer) = child.downcast_ref::<gtk::Box>() {
+                                                outer.set_margin_start(12);
+                                            }
+                                        }
+                                        row.add_css_class("thread-reply");
+                                        // Insert at end of existing expanded block
+                                        let existing_count = message_view
+                                            .expanded_threads
+                                            .borrow()
+                                            .get(tts)
+                                            .map(|v| v.len())
+                                            .unwrap_or(0);
+                                        message_view.list_box.insert(
+                                            &row,
+                                            parent_idx + 1 + existing_count as i32,
+                                        );
+                                        message_view
+                                            .expanded_threads
+                                            .borrow_mut()
+                                            .entry(tts.clone())
+                                            .or_default()
+                                            .push(row);
+                                    }
                                 }
                             }
                         }
 
                         // Append to main message view if in current channel
                         // (skip thread replies that aren't top-level, skip already-displayed messages)
-                        if is_current {
-                            let is_thread_reply = thread_ts
-                                .as_ref()
-                                .is_some_and(|tts| *tts != msg.ts);
-                            if !is_thread_reply {
-                                message_view.append_message(
-                                    &msg, &users, &client_rt, &rt_rt,
-                                );
-                            }
+                        if is_current && !is_thread_reply {
+                            message_view.append_message(
+                                &msg, &users, &client_rt, &rt_rt,
+                            );
                         }
 
                         // Update unread count for non-active channels
@@ -3630,6 +4116,7 @@ pub fn build_app(
                         let current = state.borrow().current_channel.clone();
                         if current.as_deref() == Some(&channel) {
                             message_view.update_thread_count(&thread_ts, reply_count);
+                            message_view.promote_to_thread(&thread_ts);
                         }
                     }
                     SlackEvent::ChannelJoined { channel, user } => {
@@ -3946,6 +4433,10 @@ fn load_css() {
         .notification-highlight {
             background-color: alpha(@accent_color, 0.15);
             transition: background-color 300ms ease-in;
+        }
+        .thread-reply {
+            border-left: 3px solid @accent_color;
+            margin-left: 16px;
         }
         "#,
     );

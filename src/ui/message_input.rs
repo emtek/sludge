@@ -1,5 +1,5 @@
 use gtk4::prelude::*;
-use gtk4::{self as gtk, Button, TextView};
+use gtk4::{self as gtk, Button, Label, TextView};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -62,6 +62,12 @@ pub struct MessageInput {
     files: Rc<RefCell<Vec<PathBuf>>>,
     file_preview_box: gtk::Box,
     autocomplete: Autocomplete,
+    /// Reply indicator bar (hidden unless replying to a message).
+    pub reply_bar: gtk::Box,
+    reply_label: Label,
+    _reply_close_btn: Button,
+    /// Current thread_ts being replied to (if any).
+    reply_thread_ts: Rc<RefCell<Option<String>>>,
 }
 
 impl MessageInput {
@@ -71,6 +77,38 @@ impl MessageInput {
         container.set_margin_bottom(8);
         container.set_margin_start(8);
         container.set_margin_end(8);
+
+        // Reply indicator bar (hidden unless replying)
+        let reply_bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        reply_bar.set_margin_bottom(4);
+        reply_bar.set_visible(false);
+        reply_bar.add_css_class("card");
+        let reply_icon = Label::new(Some("\u{21a9}"));
+        reply_icon.add_css_class("dim-label");
+        reply_icon.set_margin_start(8);
+        reply_bar.append(&reply_icon);
+        let reply_label = Label::new(None);
+        reply_label.set_halign(gtk::Align::Start);
+        reply_label.set_hexpand(true);
+        reply_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        reply_label.add_css_class("caption");
+        reply_bar.append(&reply_label);
+        let reply_close_btn = Button::from_icon_name("window-close-symbolic");
+        reply_close_btn.add_css_class("flat");
+        reply_close_btn.add_css_class("circular");
+        reply_close_btn.set_tooltip_text(Some("Cancel reply"));
+        reply_bar.append(&reply_close_btn);
+        container.append(&reply_bar);
+
+        let reply_thread_ts: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+
+        // Wire up close button to clear reply state
+        let reply_bar_close = reply_bar.clone();
+        let reply_ts_close = reply_thread_ts.clone();
+        reply_close_btn.connect_clicked(move |_| {
+            reply_bar_close.set_visible(false);
+            *reply_ts_close.borrow_mut() = None;
+        });
 
         // File preview area (hidden when empty)
         let file_preview_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -161,7 +199,46 @@ impl MessageInput {
             files,
             file_preview_box,
             autocomplete,
+            reply_bar,
+            reply_label,
+            _reply_close_btn: reply_close_btn,
+            reply_thread_ts,
         }
+    }
+
+    /// Enter reply mode: show the indicator with user and message preview.
+    pub fn set_reply_target(&self, thread_ts: &str, user_display: &str, preview: &str) {
+        let truncated = if preview.chars().count() > 80 {
+            let s: String = preview.chars().take(80).collect();
+            format!("{s}\u{2026}")
+        } else {
+            preview.to_string()
+        };
+        let markup = format!(
+            "Replying to <b>{}</b>: {}",
+            gtk4::glib::markup_escape_text(user_display),
+            gtk4::glib::markup_escape_text(&truncated),
+        );
+        self.reply_label.set_markup(&markup);
+        self.reply_bar.set_visible(true);
+        *self.reply_thread_ts.borrow_mut() = Some(thread_ts.to_string());
+        self.text_view.grab_focus();
+    }
+
+    /// Exit reply mode.
+    pub fn clear_reply_target(&self) {
+        self.reply_bar.set_visible(false);
+        *self.reply_thread_ts.borrow_mut() = None;
+    }
+
+    /// Get the current reply thread_ts if any.
+    pub fn reply_thread_ts(&self) -> Option<String> {
+        self.reply_thread_ts.borrow().clone()
+    }
+
+    /// Is the message input currently in reply mode?
+    pub fn is_replying(&self) -> bool {
+        self.reply_thread_ts.borrow().is_some()
     }
 
     /// Set the user list for @mention autocomplete.

@@ -70,35 +70,81 @@ enum Mode {
     Emoji,
 }
 
+/// Fuzzy match: returns Some(score) if all characters of `query` appear in `target`
+/// in order (lowercased); lower score = better match. Returns None if no match.
+/// Scoring rules (smaller is better):
+///   - prefix match: 0
+///   - substring match: 10 + start index
+///   - subsequence match: 100 + first_index + (last_index - first_index)
+fn fuzzy_score(query: &str, target: &str) -> Option<usize> {
+    if query.is_empty() {
+        return Some(0);
+    }
+    let t = target.to_lowercase();
+    let q = query.to_lowercase();
+    if t.starts_with(&q) {
+        return Some(0);
+    }
+    if let Some(idx) = t.find(&q) {
+        return Some(10 + idx);
+    }
+    // Subsequence
+    let mut q_chars = q.chars();
+    let mut next_q = q_chars.next();
+    let mut first_idx: Option<usize> = None;
+    let mut last_idx: usize = 0;
+    for (i, c) in t.char_indices() {
+        if let Some(qc) = next_q {
+            if c == qc {
+                if first_idx.is_none() {
+                    first_idx = Some(i);
+                }
+                last_idx = i;
+                next_q = q_chars.next();
+                if next_q.is_none() {
+                    break;
+                }
+            }
+        }
+    }
+    if next_q.is_none() {
+        let first = first_idx.unwrap_or(0);
+        Some(100 + first + (last_idx - first))
+    } else {
+        None
+    }
+}
+
 /// Search emoji by query, returning (shortcode, display_text, image_path_for_custom).
-/// Results are sorted: recently used first, then by search relevance.
+/// Results are sorted: (recent_rank, fuzzy_score) — recently used matches first,
+/// then best fuzzy-score matches.
 /// When query is empty, returns the most recently used emoji.
 fn search_emoji(query: &str) -> Vec<(String, String, Option<String>)> {
     let recent = get_recent_emoji();
+    let recent_rank: HashMap<&str, usize> = recent
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.as_str(), i))
+        .collect();
     let mut seen = std::collections::HashSet::new();
     let mut m: Vec<(String, String, Option<String>)> = Vec::new();
     let is_empty = query.is_empty();
 
-    // First pass: recently used emoji that match the query
-    for sc in &recent {
-        if m.len() >= 8 {
-            break;
-        }
-        if !is_empty && !sc.to_lowercase().contains(query) {
-            continue;
-        }
-        if !seen.insert(sc.clone()) {
-            continue;
-        }
-        if let Some(glyph) = resolve_slack_shortcode(sc) {
-            m.push((sc.clone(), format!("{glyph} :{sc}:"), None));
-        } else if let Some(path) = get_custom_emoji_path(sc) {
-            m.push((sc.clone(), format!(":{sc}:"), Some(path)));
-        }
-    }
-
-    // If query is empty, fill remaining slots with common defaults
+    // Empty query: show recent emoji, then common defaults
     if is_empty {
+        for sc in &recent {
+            if m.len() >= 8 {
+                break;
+            }
+            if !seen.insert(sc.clone()) {
+                continue;
+            }
+            if let Some(glyph) = resolve_slack_shortcode(sc) {
+                m.push((sc.clone(), format!("{glyph} :{sc}:"), None));
+            } else if let Some(path) = get_custom_emoji_path(sc) {
+                m.push((sc.clone(), format!(":{sc}:"), Some(path)));
+            }
+        }
         const DEFAULTS: &[(&str, &str)] = &[
             ("thumbsup", "👍"),
             ("heart", "❤️"),
@@ -120,58 +166,60 @@ fn search_emoji(query: &str) -> Vec<(String, String, Option<String>)> {
         return m;
     }
 
-    // Second pass: standard emoji search (by name AND shortcode)
-    // The emoji crate only searches by CLDR name (e.g. "folded hands"),
-    // so we also need to match by shortcode (e.g. "pray") from the emojis crate.
-    for e in emoji::search::search_name(query) {
+    // Collect fuzzy-matched candidates; sort by (recent_rank, fuzzy_score).
+    // Non-recent items get rank = usize::MAX so they come after all recent matches.
+    let mut scored: Vec<(usize, usize, String, String, Option<String>)> = Vec::new();
+
+    // Recent emoji (may not be in the emojis crate, e.g. custom ones)
+    for (idx, sc) in recent.iter().enumerate() {
+        if let Some(score) = fuzzy_score(query, sc) {
+            let (display, image_path) = if let Some(glyph) = resolve_slack_shortcode(sc) {
+                (format!("{glyph} :{sc}:"), None)
+            } else if let Some(path) = get_custom_emoji_path(sc) {
+                (format!(":{sc}:"), Some(path))
+            } else {
+                continue;
+            };
+            scored.push((idx, score, sc.clone(), display, image_path));
+        }
+    }
+
+    // Built-in emoji (from the emojis crate)
+    for e in emojis::iter() {
+        if let Some(sc) = e.shortcode() {
+            if let Some(score) = fuzzy_score(query, sc) {
+                let rank = recent_rank.get(sc).copied().unwrap_or(usize::MAX);
+                scored.push((rank, score, sc.to_string(), format!("{} :{sc}:", e.as_str()), None));
+            }
+        }
+    }
+
+    // Custom emoji
+    if let Some(custom) = crate::slack::helpers::get_all_custom_emoji_names() {
+        for name in custom {
+            if let Some(score) = fuzzy_score(query, &name) {
+                let rank = recent_rank.get(name.as_str()).copied().unwrap_or(usize::MAX);
+                let image_path = get_custom_emoji_path(&name);
+                scored.push((rank, score, name.clone(), format!(":{name}:"), image_path));
+            }
+        }
+    }
+
+    // Sort by (recent_rank, fuzzy_score, shortcode) — recent + best fuzzy score first
+    scored.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
+    });
+
+    for (_, _, sc, display, image_path) in scored {
         if m.len() >= 8 {
             break;
-        }
-        if e.status != emoji::Status::FullyQualified || e.is_variant {
-            continue;
-        }
-        let sc = emojis::get(e.glyph)
-            .and_then(|em| em.shortcode())
-            .unwrap_or(e.name)
-            .to_string();
-        if !sc.to_lowercase().contains(query) {
-            continue;
         }
         if !seen.insert(sc.clone()) {
             continue;
         }
-        m.push((sc.clone(), format!("{} :{sc}:", e.glyph), None));
-    }
-
-    // Shortcode search: find emoji whose shortcode matches but CLDR name didn't
-    if m.len() < 8 {
-        for e in emojis::iter() {
-            if m.len() >= 8 {
-                break;
-            }
-            if let Some(sc) = e.shortcode() {
-                if sc.to_lowercase().contains(query) && seen.insert(sc.to_string()) {
-                    m.push((sc.to_string(), format!("{} :{sc}:", e.as_str()), None));
-                }
-            }
-        }
-    }
-
-    // Third pass: custom emoji
-    if let Some(custom) = crate::slack::helpers::get_all_custom_emoji_names() {
-        for name in custom {
-            if m.len() >= 8 {
-                break;
-            }
-            if !name.to_lowercase().contains(query) {
-                continue;
-            }
-            if !seen.insert(name.clone()) {
-                continue;
-            }
-            let image_path = get_custom_emoji_path(&name);
-            m.push((name.clone(), format!(":{name}:"), image_path));
-        }
+        m.push((sc, display, image_path));
     }
 
     m.truncate(8);
@@ -305,14 +353,18 @@ impl Autocomplete {
                 let matches: Vec<(String, String, Option<String>)> = match current_mode {
                     Mode::Mention => {
                         let user_map = users.borrow();
-                        let mut m: Vec<_> = user_map
+                        let mut scored: Vec<(usize, String, String)> = user_map
                             .iter()
-                            .filter(|(_, name)| name.to_lowercase().contains(&query))
-                            .map(|(id, name)| (id.clone(), name.clone(), None))
+                            .filter_map(|(id, name)| {
+                                fuzzy_score(&query, name)
+                                    .map(|s| (s, id.clone(), name.clone()))
+                            })
                             .collect();
-                        m.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
-                        m.truncate(8);
-                        m
+                        scored.sort_by(|a, b| {
+                            a.0.cmp(&b.0).then_with(|| a.2.to_lowercase().cmp(&b.2.to_lowercase()))
+                        });
+                        scored.truncate(8);
+                        scored.into_iter().map(|(_, id, name)| (id, name, None)).collect()
                     }
                     Mode::Emoji => search_emoji(&query),
                 };
@@ -549,6 +601,24 @@ pub fn build_reaction_popover(
 
     // Attach emoji-only autocomplete
     let ac = Autocomplete::attach(&tv);
+
+    // Escape closes the reaction popover (and the autocomplete list with it,
+    // since it's a child). Capture phase runs before the autocomplete handler.
+    {
+        let popover_weak = popover.downgrade();
+        let esc_ctl = gtk::EventControllerKey::new();
+        esc_ctl.set_propagation_phase(gtk::PropagationPhase::Capture);
+        esc_ctl.connect_key_pressed(move |_, key, _, _| {
+            if key == gtk4::gdk::Key::Escape {
+                if let Some(p) = popover_weak.upgrade() {
+                    p.popdown();
+                }
+                return gtk4::glib::Propagation::Stop;
+            }
+            gtk4::glib::Propagation::Proceed
+        });
+        tv.add_controller(esc_ctl);
+    }
 
     // When emoji is picked: call the reaction callback, record recent, close popover
     let popover_weak = popover.downgrade();

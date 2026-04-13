@@ -291,12 +291,15 @@ impl ThreadPanel {
         let cid = self.channel_id.borrow();
         let subteam_names = self.subteam_names.borrow();
         self.reaction_boxes.borrow_mut().clear();
+        let no_expand: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, Vec<gtk::ListBoxRow>>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
         for msg in messages {
             let row = crate::ui::message_view::make_message_row(
                 msg, users, &subteam_names, client, rt,
                 &None, &mcb, &rcb, &dcb, &ecb,
                 cid.as_deref(), &self.thread_counts.borrow(), &self.thread_labels, &self.reaction_boxes, &self_uid,
                 &self.image_generation, &self.picker_cells,
+                &None, &no_expand,
             );
             self.list_box.append(&row);
         }
@@ -318,11 +321,14 @@ impl ThreadPanel {
         let self_uid = self.self_user_id.borrow();
         let cid = self.channel_id.borrow();
         let subteam_names = self.subteam_names.borrow();
+        let no_expand: std::rc::Rc<std::cell::RefCell<std::collections::HashMap<String, Vec<gtk::ListBoxRow>>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(std::collections::HashMap::new()));
         let row = crate::ui::message_view::make_message_row(
             msg, users, &subteam_names, client, rt,
             &None, &mcb, &rcb, &dcb, &ecb,
             cid.as_deref(), &self.thread_counts.borrow(), &self.thread_labels, &self.reaction_boxes, &self_uid,
             &self.image_generation, &self.picker_cells,
+            &None, &no_expand,
         );
         self.list_box.append(&row);
         self.scroll_to_bottom();

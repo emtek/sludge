@@ -8,8 +8,9 @@ use std::rc::Rc;
 use crate::slack::client::Client;
 use crate::slack::helpers::format_message_markup;
 
-/// Callback type for opening a thread: (thread_ts, channel_id)
-pub type ThreadOpenCallback = Rc<dyn Fn(&str, &str)>;
+/// Callback type for starting a reply to a message:
+/// (thread_ts, channel_id, user_display_name, text_preview)
+pub type ThreadOpenCallback = Rc<dyn Fn(&str, &str, &str, &str)>;
 
 /// Callback type for opening a DM with a user: (user_id)
 pub type MentionCallback = Rc<dyn Fn(&str)>;
@@ -30,8 +31,13 @@ pub type LoadMoreCallback = Rc<dyn Fn(&str, &str)>;
 /// Callback for loading newer messages: called with channel_id and newest message ts.
 pub type LoadNewerCallback = Rc<dyn Fn(&str, &str)>;
 
-/// Callback for clicking a search result: (channel_id, message_ts)
-pub type SearchResultCallback = Rc<dyn Fn(&str, &str)>;
+/// Callback for clicking a search result: (channel_id, message_ts, thread_ts_if_reply)
+pub type SearchResultCallback = Rc<dyn Fn(&str, &str, Option<&str>)>;
+
+/// Callback for expanding/collapsing a thread inline: (thread_ts, channel_id, parent_row)
+/// Called when the user toggles the thread expander. The implementation should fetch
+/// replies and call `insert_thread_replies` / `remove_thread_replies` on the MessageView.
+pub type ThreadExpandCallback = Rc<dyn Fn(&str, &str, &ListBoxRow)>;
 
 pub struct MessageView {
     pub widget: gtk::Box,
@@ -40,19 +46,19 @@ pub struct MessageView {
     pub header_label: Label,
     pub search_entry: gtk::SearchEntry,
     pub spinner: gtk::Spinner,
-    thread_callback: RefCell<Option<ThreadOpenCallback>>,
-    mention_callback: RefCell<Option<MentionCallback>>,
-    reaction_callback: RefCell<Option<ReactionCallback>>,
-    delete_callback: RefCell<Option<DeleteCallback>>,
-    edit_callback: RefCell<Option<EditCallback>>,
-    self_user_id: RefCell<String>,
+    pub thread_callback: RefCell<Option<ThreadOpenCallback>>,
+    pub mention_callback: RefCell<Option<MentionCallback>>,
+    pub reaction_callback: RefCell<Option<ReactionCallback>>,
+    pub delete_callback: RefCell<Option<DeleteCallback>>,
+    pub edit_callback: RefCell<Option<EditCallback>>,
+    pub self_user_id: RefCell<String>,
     channel_id: Rc<RefCell<Option<String>>>,
     /// Known thread reply counts: thread_ts -> reply count (excluding parent).
     pub thread_counts: Rc<RefCell<HashMap<String, usize>>>,
     /// Thread button labels keyed by message ts, for updating counts after loading.
-    thread_labels: Rc<RefCell<HashMap<String, Label>>>,
+    pub thread_labels: Rc<RefCell<HashMap<String, Label>>>,
     /// Reaction FlowBox containers keyed by message ts, for live reaction updates.
-    reaction_boxes: Rc<RefCell<HashMap<String, gtk::FlowBox>>>,
+    pub reaction_boxes: Rc<RefCell<HashMap<String, gtk::FlowBox>>>,
     /// Typing indicator label in the channel header.
     pub typing_label: Label,
     /// Button to show channel members / invite users.
@@ -60,10 +66,10 @@ pub struct MessageView {
     /// Button to start a Google Meet call.
     pub call_button: Button,
     /// Generation counter; incremented on clear() so in-flight image loads detect staleness.
-    image_generation: Rc<Cell<u64>>,
+    pub image_generation: Rc<Cell<u64>>,
     subteam_names: RefCell<Rc<HashMap<String, String>>>,
     /// Reaction picker cells — take + unparent on clear.
-    picker_cells: Rc<RefCell<Vec<Rc<RefCell<Option<gtk::Popover>>>>>>,
+    pub picker_cells: Rc<RefCell<Vec<Rc<RefCell<Option<gtk::Popover>>>>>>,
     /// Whether a load-more request is in flight (prevents duplicate fetches).
     loading_more: Rc<Cell<bool>>,
     /// Set to false when the server returns fewer messages than requested (no more history).
@@ -75,9 +81,10 @@ pub struct MessageView {
     search_result_callback: RefCell<Option<SearchResultCallback>>,
     /// Active search query — when set, scroll-to-top loads more search results.
     pub search_query: Rc<RefCell<Option<String>>>,
-    /// When true, the next `upper_notify` unconditionally scrolls to bottom
-    /// (ignoring the 400px proximity check). Cleared once the scroll fires.
-    force_bottom: Rc<Cell<bool>>,
+    /// Callback for expanding/collapsing a thread inline.
+    pub thread_expand_callback: RefCell<Option<ThreadExpandCallback>>,
+    /// Tracks which threads are expanded and holds their reply row widgets.
+    pub expanded_threads: Rc<RefCell<HashMap<String, Vec<ListBoxRow>>>>,
 }
 
 impl MessageView {
@@ -157,16 +164,10 @@ impl MessageView {
 
         // Auto-scroll to bottom when content grows (e.g. images loading),
         // but only if the user was already near the bottom.
-        let force_bottom: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let adj = scrolled.vadjustment();
-        let force_bottom_notify = force_bottom.clone();
         adj.connect_upper_notify(move |adj| {
             let max_scroll = adj.upper() - adj.page_size();
             if max_scroll <= 0.0 {
-                return;
-            }
-            if force_bottom_notify.get() {
-                adj.set_value(max_scroll);
                 return;
             }
             let distance_from_bottom = max_scroll - adj.value();
@@ -209,7 +210,8 @@ impl MessageView {
             has_more_newer: Rc::new(Cell::new(false)),
             search_result_callback: RefCell::new(None),
             search_query: Rc::new(RefCell::new(None)),
-            force_bottom,
+            thread_expand_callback: RefCell::new(None),
+            expanded_threads: Rc::new(RefCell::new(HashMap::new())),
         }
     }
 
@@ -217,10 +219,78 @@ impl MessageView {
         *self.thread_callback.borrow_mut() = Some(cb);
     }
 
-    /// Invoke the thread open callback programmatically.
+    pub fn set_thread_expand_callback(&self, cb: ThreadExpandCallback) {
+        *self.thread_expand_callback.borrow_mut() = Some(cb);
+    }
+
+    /// Insert reply rows below the parent message row for inline thread expansion.
+    pub fn insert_thread_replies(&self, thread_ts: &str, parent_row: &ListBoxRow, rows: Vec<ListBoxRow>) {
+        // Find the parent row's index
+        let mut parent_idx = None;
+        let mut idx = 0;
+        while let Some(r) = self.list_box.row_at_index(idx) {
+            if r == *parent_row {
+                parent_idx = Some(idx);
+                break;
+            }
+            idx += 1;
+        }
+        let Some(parent_idx) = parent_idx else { return };
+
+        // Insert reply rows after the parent
+        for (i, reply_row) in rows.iter().enumerate() {
+            self.list_box.insert(reply_row, parent_idx + 1 + i as i32);
+        }
+
+        self.expanded_threads.borrow_mut().insert(thread_ts.to_string(), rows);
+    }
+
+    /// Remove reply rows for a collapsed thread.
+    pub fn remove_thread_replies(&self, thread_ts: &str) {
+        if let Some(rows) = self.expanded_threads.borrow_mut().remove(thread_ts) {
+            for row in &rows {
+                self.list_box.remove(row);
+            }
+        }
+    }
+
+    /// Check if a thread is currently expanded.
+    pub fn is_thread_expanded(&self, thread_ts: &str) -> bool {
+        self.expanded_threads.borrow().contains_key(thread_ts)
+    }
+
+    /// Promote a message row to a thread parent: hide its Reply button and
+    /// show the thread expander. Called when the first reply is posted to
+    /// a previously-unthreaded message.
+    pub fn promote_to_thread(&self, ts: &str) {
+        let mut idx = 0;
+        while let Some(row) = self.list_box.row_at_index(idx) {
+            if row.widget_name() == ts {
+                fn swap(widget: &gtk::Widget) {
+                    if let Some(btn) = widget.downcast_ref::<gtk::Button>() {
+                        if btn.has_css_class("thread-btn") {
+                            btn.set_visible(true);
+                        } else if btn.has_css_class("reply-btn") {
+                            btn.set_visible(false);
+                        }
+                    }
+                    let mut child = widget.first_child();
+                    while let Some(c) = child {
+                        swap(&c);
+                        child = c.next_sibling();
+                    }
+                }
+                swap(row.upcast_ref());
+                return;
+            }
+            idx += 1;
+        }
+    }
+
+    /// Invoke the thread open callback programmatically (without user/preview).
     pub fn open_thread(&self, thread_ts: &str, channel_id: &str) {
         if let Some(cb) = self.thread_callback.borrow().as_ref() {
-            cb(thread_ts, channel_id);
+            cb(thread_ts, channel_id, "", "");
         }
     }
 
@@ -353,12 +423,14 @@ impl MessageView {
         let old_upper = adj.upper();
 
         // Messages from the API are newest-first; prepend oldest-first (i.e. iterate forward)
+        let thread_expand_cb = self.thread_expand_callback.borrow();
         for msg in messages.iter().rev() {
             let row = make_message_row(
                 msg, users, &subteam_names, client, rt,
                 &thread_cb, &mention_cb, &reaction_cb, &delete_cb, &edit_cb,
                 channel_id.as_deref(), &self.thread_counts.borrow(), &self.thread_labels, &self.reaction_boxes, &self_uid,
                 &self.image_generation, &self.picker_cells,
+                &thread_expand_cb, &self.expanded_threads,
             );
             self.list_box.prepend(&row);
         }
@@ -412,12 +484,14 @@ impl MessageView {
         let subteam_names = self.subteam_names.borrow();
 
         // Messages are already in ASC order from the DB query
+        let thread_expand_cb = self.thread_expand_callback.borrow();
         for msg in messages {
             let row = make_message_row(
                 msg, users, &subteam_names, client, rt,
                 &thread_cb, &mention_cb, &reaction_cb, &delete_cb, &edit_cb,
                 channel_id.as_deref(), &self.thread_counts.borrow(), &self.thread_labels, &self.reaction_boxes, &self_uid,
                 &self.image_generation, &self.picker_cells,
+                &thread_expand_cb, &self.expanded_threads,
             );
             self.list_box.append(&row);
         }
@@ -428,6 +502,29 @@ impl MessageView {
     /// Reset the loading_more flag (e.g. on error).
     pub fn reset_loading_more(&self) {
         self.loading_more.set(false);
+    }
+
+    /// Apply a batch of reply counts, refresh thread labels, and promote rows
+    /// to thread parents (showing the expander instead of the Reply button).
+    /// Typically called right after `set_messages` to populate counts from the DB.
+    pub fn apply_thread_counts(&self, counts: &HashMap<String, usize>) {
+        let mut tc = self.thread_counts.borrow_mut();
+        for (ts, count) in counts {
+            tc.insert(ts.clone(), *count);
+        }
+        drop(tc);
+        let labels = self.thread_labels.borrow().clone();
+        for (ts, count) in counts {
+            if let Some(label) = labels.get(ts) {
+                label.set_text(&format!(
+                    "{count} {}",
+                    if *count == 1 { "reply" } else { "replies" }
+                ));
+            }
+            if *count > 0 {
+                self.promote_to_thread(ts);
+            }
+        }
     }
 
     /// Update the thread button label for a message after loading its replies.
@@ -521,6 +618,7 @@ impl MessageView {
         self.thread_counts.borrow_mut().clear();
         self.thread_labels.borrow_mut().clear();
         self.reaction_boxes.borrow_mut().clear();
+        self.expanded_threads.borrow_mut().clear();
     }
 
     /// Recursively find and unparent all Popover and EmojiChooser widgets in the tree.
@@ -582,12 +680,14 @@ impl MessageView {
         let subteam_names = self.subteam_names.borrow();
 
         // Slack returns newest-first; display oldest-first
+        let thread_expand_cb = self.thread_expand_callback.borrow();
         for msg in messages.iter().rev() {
             let row = make_message_row(
                 msg, users, &subteam_names, client, rt,
                 &thread_cb, &mention_cb, &reaction_cb, &delete_cb, &edit_cb,
                 channel_id.as_deref(), &self.thread_counts.borrow(), &self.thread_labels, &self.reaction_boxes, &self_uid,
                 &self.image_generation, &self.picker_cells,
+                &thread_expand_cb, &self.expanded_threads,
             );
             self.list_box.append(&row);
         }
@@ -610,6 +710,7 @@ impl MessageView {
         self.set_channel_id("");
 
         let thread_cb = self.thread_callback.borrow();
+        let thread_expand_cb = self.thread_expand_callback.borrow();
         let mention_cb = self.mention_callback.borrow();
         let reaction_cb = self.reaction_callback.borrow();
         let delete_cb = self.delete_callback.borrow();
@@ -640,6 +741,7 @@ impl MessageView {
                 &thread_cb, &mention_cb, &reaction_cb, &delete_cb, &edit_cb,
                 Some(channel_id), &self.thread_counts.borrow(), &self.thread_labels, &self.reaction_boxes, &self_uid,
                 &self.image_generation, &self.picker_cells,
+                &thread_expand_cb, &self.expanded_threads,
             );
 
             // Prepend a channel name label to the row
@@ -659,9 +761,12 @@ impl MessageView {
                 let cb = cb.clone();
                 let cid = channel_id.clone();
                 let ts = msg.ts.clone();
+                // If this is a thread reply (thread_ts is set and differs from ts),
+                // pass it along so the parent thread can be opened.
+                let thread_ts = msg.thread_ts.clone().filter(|tts| *tts != msg.ts);
                 let gesture = gtk::GestureClick::new();
                 gesture.connect_released(move |_, _, _, _| {
-                    cb(&cid, &ts);
+                    cb(&cid, &ts, thread_ts.as_deref());
                 });
                 row.add_controller(gesture);
             }
@@ -686,6 +791,7 @@ impl MessageView {
         self.has_more.set(false); // no scroll-to-top pagination for search yet
 
         let thread_cb = self.thread_callback.borrow();
+        let thread_expand_cb = self.thread_expand_callback.borrow();
         let mention_cb = self.mention_callback.borrow();
         let reaction_cb = self.reaction_callback.borrow();
         let delete_cb = self.delete_callback.borrow();
@@ -701,6 +807,7 @@ impl MessageView {
                 &thread_cb, &mention_cb, &reaction_cb, &delete_cb, &edit_cb,
                 channel_id.as_deref(), &self.thread_counts.borrow(), &self.thread_labels, &self.reaction_boxes, &self_uid,
                 &self.image_generation, &self.picker_cells,
+                &thread_expand_cb, &self.expanded_threads,
             );
 
             // Replace the body widget with a highlighted version
@@ -727,9 +834,10 @@ impl MessageView {
                 let cb = cb.clone();
                 let cid = channel_id.clone().unwrap_or_default();
                 let ts = msg.ts.clone();
+                let thread_ts = msg.thread_ts.clone().filter(|tts| *tts != msg.ts);
                 let gesture = gtk::GestureClick::new();
                 gesture.connect_released(move |_, _, _, _| {
-                    cb(&cid, &ts);
+                    cb(&cid, &ts, thread_ts.as_deref());
                 });
                 row.add_controller(gesture);
             }
@@ -748,6 +856,7 @@ impl MessageView {
         rt: &tokio::runtime::Handle,
     ) {
         let thread_cb = self.thread_callback.borrow();
+        let thread_expand_cb = self.thread_expand_callback.borrow();
         let mention_cb = self.mention_callback.borrow();
         let reaction_cb = self.reaction_callback.borrow();
         let delete_cb = self.delete_callback.borrow();
@@ -760,26 +869,48 @@ impl MessageView {
             &thread_cb, &mention_cb, &reaction_cb, &delete_cb, &edit_cb,
             channel_id.as_deref(), &self.thread_counts.borrow(), &self.thread_labels, &self.reaction_boxes, &self_uid,
             &self.image_generation, &self.picker_cells,
+            &thread_expand_cb, &self.expanded_threads,
         );
         self.list_box.append(&row);
         self.scroll_to_bottom_after(&row);
     }
 
     pub fn scroll_to_bottom(&self) {
-        // Tell the upper_notify handler to force-scroll on every layout update
-        // until the timeout expires, covering reactions, images, etc.
-        self.force_bottom.set(true);
-        let adj = self.scrolled.vadjustment();
-        adj.set_value(adj.upper() - adj.page_size());
-        // Defer once more for pending layout
-        let adj2 = adj.clone();
+        // Find the last row and use the reliable row-allocation-aware scroll.
+        // Defer via idle so newly-appended rows are picked up.
+        let list_box = self.list_box.clone();
+        let scrolled = self.scrolled.clone();
         gtk4::glib::idle_add_local_once(move || {
-            adj2.set_value(adj2.upper() - adj2.page_size());
-        });
-        // Clear the force flag after layout has had time to fully settle
-        let force = self.force_bottom.clone();
-        gtk4::glib::timeout_add_local_once(std::time::Duration::from_millis(500), move || {
-            force.set(false);
+            let mut idx = 0;
+            let mut last = None;
+            while let Some(row) = list_box.row_at_index(idx) {
+                last = Some(row);
+                idx += 1;
+            }
+            let Some(row) = last else { return };
+            // Poll for allocation (newly-inserted rows take a frame or two).
+            let scrolled = scrolled.clone();
+            let attempts = std::rc::Rc::new(std::cell::Cell::new(0u32));
+            gtk4::glib::timeout_add_local(std::time::Duration::from_millis(30), move || {
+                let n = attempts.get();
+                attempts.set(n + 1);
+                let alloc = row.allocation();
+                if alloc.height() < 20 {
+                    if n >= 40 {
+                        return gtk4::glib::ControlFlow::Break;
+                    }
+                    return gtk4::glib::ControlFlow::Continue;
+                }
+                let adj = scrolled.vadjustment();
+                let row_bottom = (alloc.y() + alloc.height()) as f64;
+                let target = (row_bottom - adj.page_size()).max(0.0);
+                adj.set_value(target);
+                if n >= 5 {
+                    gtk4::glib::ControlFlow::Break
+                } else {
+                    gtk4::glib::ControlFlow::Continue
+                }
+            });
         });
     }
 
@@ -797,7 +928,45 @@ impl MessageView {
         });
     }
 
-    /// Scroll to a specific message by its ts and briefly highlight it.
+    /// Scroll so the given row's bottom edge aligns with the viewport's bottom.
+    /// Polls at short intervals until the row is allocated, then snaps.
+    pub fn scroll_row_to_bottom(&self, row: &ListBoxRow) {
+        let scrolled = self.scrolled.clone();
+        let row = row.clone();
+        let attempts = std::rc::Rc::new(std::cell::Cell::new(0u32));
+        gtk4::glib::timeout_add_local(std::time::Duration::from_millis(30), move || {
+            let n = attempts.get();
+            attempts.set(n + 1);
+            let alloc = row.allocation();
+            // Real rows are at least ~20px tall. Anything smaller means the row
+            // hasn't been allocated yet (GTK default sentinel is (y=-2, h=4)).
+            if alloc.height() < 20 {
+                if n >= 40 {
+                    return gtk4::glib::ControlFlow::Break;
+                }
+                return gtk4::glib::ControlFlow::Continue;
+            }
+            let adj = scrolled.vadjustment();
+            let row_bottom = (alloc.y() + alloc.height()) as f64;
+            let target = (row_bottom - adj.page_size()).max(0.0);
+            adj.set_value(target);
+            // Run a few more times to catch any subsequent layout (images, etc.)
+            if n >= 5 {
+                gtk4::glib::ControlFlow::Break
+            } else {
+                gtk4::glib::ControlFlow::Continue
+            }
+        });
+    }
+
+    /// Scroll so the currently-selected message/row sits at the bottom of
+    /// the viewport. No-op if nothing is selected.
+    pub fn scroll_selected_to_bottom(&self) {
+        if let Some(row) = self.list_box.selected_row() {
+            self.scroll_row_to_bottom(&row);
+        }
+    }
+
     /// Scroll to a specific message by its ts and briefly highlight it.
     /// Deferred to run after GTK completes its layout pass.
     pub fn scroll_to_message(&self, ts: &str) {
@@ -858,6 +1027,8 @@ pub fn make_message_row(
     self_user_id: &str,
     image_generation: &Rc<Cell<u64>>,
     picker_cells: &Rc<RefCell<Vec<Rc<RefCell<Option<gtk::Popover>>>>>>,
+    thread_expand_cb: &Option<ThreadExpandCallback>,
+    expanded_threads: &Rc<RefCell<HashMap<String, Vec<ListBoxRow>>>>,
 ) -> ListBoxRow {
     let row = ListBoxRow::new();
 
@@ -947,55 +1118,95 @@ pub fn make_message_row(
         }
     }
 
-    // Thread button in the header (right-most)
-    if let (Some(cb), Some(cid)) = (thread_cb, channel_id) {
+    // Thread expander and Reply button — both always created, visibility toggled
+    // based on whether the message currently has a thread. This lets us swap
+    // from "Reply" to "N replies" in-place when the first reply is posted.
+    if let Some(cid) = channel_id {
         let has_thread = msg
             .thread_ts
             .as_ref()
             .is_some_and(|tts| *tts == msg.ts);
 
-        let thread_btn = gtk::Button::new();
+        // Expander button — shown only when the message has a thread
+        let is_expanded = expanded_threads.borrow().contains_key(&msg.ts);
+        let expand_btn = gtk::Button::new();
         let btn_content = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-        let icon = gtk::Image::from_icon_name(if has_thread {
-            "chat-message-new-symbolic"
+        let arrow_label = if is_expanded { "\u{25bc}" } else { "\u{25b6}" };
+        let arrow = Label::new(Some(arrow_label));
+        arrow.add_css_class("caption");
+        let count = thread_counts.get(&msg.ts).copied().unwrap_or(0);
+        let label_text = if count > 0 {
+            format!("{count} {}", if count == 1 { "reply" } else { "replies" })
         } else {
-            "mail-reply-sender-symbolic"
-        });
-        let label_text = if has_thread {
-            let count = thread_counts.get(&msg.ts).copied().unwrap_or(0);
-            if count > 0 {
-                format!("{count} {}", if count == 1 { "reply" } else { "replies" })
-            } else {
-                "Thread".to_string()
-            }
-        } else {
-            "Reply".to_string()
+            "Thread".to_string()
         };
         let label = Label::new(Some(&label_text));
         label.add_css_class("caption");
-        btn_content.append(&icon);
+        btn_content.append(&arrow);
         btn_content.append(&label);
-        thread_btn.set_child(Some(&btn_content));
-        thread_btn.add_css_class("flat");
-        thread_btn.add_css_class("thread-btn");
-        thread_btn.set_halign(gtk::Align::End);
+        expand_btn.set_child(Some(&btn_content));
+        expand_btn.add_css_class("flat");
+        expand_btn.add_css_class("thread-btn");
+        expand_btn.set_halign(gtk::Align::End);
+        expand_btn.set_visible(has_thread);
 
-        // Register label for dynamic count updates (all messages, so first
-        // reply to a message can update the "Reply" button to show "1 reply")
         thread_labels.borrow_mut().insert(msg.ts.clone(), label.clone());
 
-        let ts = if has_thread {
-            msg.thread_ts.clone().unwrap_or_else(|| msg.ts.clone())
-        } else {
-            msg.ts.clone()
-        };
-        let cid = cid.to_string();
-        let cb = cb.clone();
-        thread_btn.connect_clicked(move |_| {
-            cb(&ts, &cid);
-        });
+        {
+            let ts = msg.ts.clone();
+            let cid_e = cid.to_string();
+            let row_weak = row.downgrade();
+            if let Some(expand_cb) = thread_expand_cb.clone() {
+                expand_btn.connect_clicked(move |btn| {
+                    if let Some(parent_row) = row_weak.upgrade() {
+                        expand_cb(&ts, &cid_e, &parent_row);
+                        if let Some(child) = btn.child() {
+                            if let Some(bx) = child.downcast_ref::<gtk::Box>() {
+                                if let Some(first) = bx.first_child() {
+                                    if let Some(lbl) = first.downcast_ref::<Label>() {
+                                        let current = lbl.text();
+                                        if current == "\u{25b6}" {
+                                            lbl.set_text("\u{25bc}");
+                                        } else {
+                                            lbl.set_text("\u{25b6}");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        }
+        header.append(&expand_btn);
 
-        header.append(&thread_btn);
+        // Reply button — shown only when the message has no thread
+        if let Some(cb) = thread_cb {
+            let reply_btn = gtk::Button::new();
+            let btn_content = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+            let icon = gtk::Image::from_icon_name("mail-reply-sender-symbolic");
+            let label = Label::new(Some("Reply"));
+            label.add_css_class("caption");
+            btn_content.append(&icon);
+            btn_content.append(&label);
+            reply_btn.set_child(Some(&btn_content));
+            reply_btn.add_css_class("flat");
+            reply_btn.add_css_class("reply-btn");
+            reply_btn.set_halign(gtk::Align::End);
+            reply_btn.set_visible(!has_thread);
+
+            // For a non-threaded message, replying uses its own ts as the new thread_ts.
+            let reply_thread_ts = msg.thread_ts.clone().unwrap_or_else(|| msg.ts.clone());
+            let cid_r = cid.to_string();
+            let cb = cb.clone();
+            let user_display = display_name.clone();
+            let preview = msg.text.clone();
+            reply_btn.connect_clicked(move |_| {
+                cb(&reply_thread_ts, &cid_r, &user_display, &preview);
+            });
+
+            header.append(&reply_btn);
+        }
     }
 
     outer.append(&header);
