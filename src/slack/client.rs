@@ -28,6 +28,11 @@ struct RawConversationsList {
 }
 
 #[derive(Debug, serde::Deserialize)]
+struct RawConversationsInfo {
+    channel: Channel,
+}
+
+#[derive(Debug, serde::Deserialize)]
 struct RawConversationHistory {
     messages: Vec<Message>,
     #[serde(default)]
@@ -312,6 +317,14 @@ impl Client {
         Ok(all)
     }
 
+    pub async fn conversations_info(&self, channel: &str) -> Result<Channel, String> {
+        info!("Calling conversations.info for channel={channel}");
+        let fields = vec![("channel", channel)];
+        let data: RawConversationsInfo =
+            Self::stealth_post(&self.http, &self.creds, "conversations.info", &fields).await?;
+        Ok(data.channel)
+    }
+
     pub async fn conversation_history(
         &self,
         channel: &str,
@@ -471,6 +484,20 @@ impl Client {
             Self::stealth_post(&self.http, &self.creds, "conversations.archive", &[("channel", channel)])
                 .await?;
         Ok(())
+    }
+
+    /// Open (or create) a multi-party DM with the given user IDs.
+    pub async fn conversations_open(&self, user_ids: &[String]) -> Result<Channel, String> {
+        let users_str = user_ids.join(",");
+        info!("Calling conversations.open for users={users_str}");
+        let data: RawConversationsInfo = Self::stealth_post(
+            &self.http,
+            &self.creds,
+            "conversations.open",
+            &[("users", &users_str), ("return_im", "false")],
+        )
+        .await?;
+        Ok(data.channel)
     }
 
     pub async fn close_conversation(&self, channel: &str) -> Result<(), String> {

@@ -94,12 +94,13 @@ fn main() {
     app.connect_activate(move |app| {
         libadwaita::init().expect("Failed to init libadwaita");
 
-        // Install embedded app icon (PNG) into user icon theme and set as default
+        // Install embedded app icon (PNG) into user icon theme.
+        // Only write the PNG files — never touch index.theme as that
+        // shadows the system hicolor theme and breaks other apps' icons.
         {
             let base = dirs::data_dir()
                 .unwrap_or_else(|| std::path::PathBuf::from("."))
                 .join("icons/hicolor");
-            let sizes = ["256x256", "128x128", "64x64", "48x48"];
             let icon_data: &[(&str, &[u8])] = &[
                 ("256x256", &include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/hicolor/256x256/apps/sludge.png"))[..]),
                 ("128x128", &include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/hicolor/128x128/apps/sludge.png"))[..]),
@@ -112,43 +113,10 @@ fn main() {
                 std::fs::write(icon_dir.join("sludge.png"), bytes).ok();
             }
 
-            // Merge our icon directories into the existing index.theme (don't overwrite it —
-            // clobbering hicolor/index.theme breaks system icons for all GTK apps).
-            let index_path = base.join("index.theme");
-            let existing = std::fs::read_to_string(&index_path).unwrap_or_default();
-            let needs_update = sizes.iter().any(|s| !existing.contains(&format!("{s}/apps")));
-            if needs_update {
-                if existing.contains("[Icon Theme]") {
-                    // Append our directories to the existing Directories= line and add sections
-                    let mut content = existing.clone();
-                    for size in &sizes {
-                        let dir_entry = format!("{size}/apps");
-                        if !content.contains(&dir_entry) {
-                            // Append to Directories= line
-                            if let Some(pos) = content.find("Directories=") {
-                                if let Some(eol) = content[pos..].find('\n') {
-                                    let insert_at = pos + eol;
-                                    content.insert_str(insert_at, &format!(",{dir_entry}"));
-                                }
-                            }
-                            // Append section
-                            let num: u32 = size.split('x').next().unwrap().parse().unwrap();
-                            content.push_str(&format!("\n[{dir_entry}]\nSize={num}\nType=Fixed\n"));
-                        }
-                    }
-                    std::fs::write(&index_path, content).ok();
-                } else {
-                    // No existing index.theme — create a minimal one
-                    let dirs_list = sizes.iter().map(|s| format!("{s}/apps")).collect::<Vec<_>>().join(",");
-                    let index_content = format!(
-                        "[Icon Theme]\nName=hicolor\nDirectories={dirs_list}\n\n{}\n",
-                        sizes.iter().map(|s| {
-                            let num: u32 = s.split('x').next().unwrap().parse().unwrap();
-                            format!("[{s}/apps]\nSize={num}\nType=Fixed\n")
-                        }).collect::<Vec<_>>().join("\n")
-                    );
-                    std::fs::write(&index_path, index_content).ok();
-                }
+            // Remove any leftover index.theme we may have created previously
+            let bad_index = base.join("index.theme");
+            if bad_index.exists() {
+                std::fs::remove_file(&bad_index).ok();
             }
 
             gtk4::Window::set_default_icon_name("sludge");

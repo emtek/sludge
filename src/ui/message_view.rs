@@ -73,6 +73,9 @@ pub struct MessageView {
     search_result_callback: RefCell<Option<SearchResultCallback>>,
     /// Active search query — when set, scroll-to-top loads more search results.
     pub search_query: Rc<RefCell<Option<String>>>,
+    /// When true, the next `upper_notify` unconditionally scrolls to bottom
+    /// (ignoring the 400px proximity check). Cleared once the scroll fires.
+    force_bottom: Rc<Cell<bool>>,
 }
 
 impl MessageView {
@@ -147,10 +150,16 @@ impl MessageView {
 
         // Auto-scroll to bottom when content grows (e.g. images loading),
         // but only if the user was already near the bottom.
+        let force_bottom: Rc<Cell<bool>> = Rc::new(Cell::new(false));
         let adj = scrolled.vadjustment();
-        adj.connect_upper_notify(|adj| {
+        let force_bottom_notify = force_bottom.clone();
+        adj.connect_upper_notify(move |adj| {
             let max_scroll = adj.upper() - adj.page_size();
             if max_scroll <= 0.0 {
+                return;
+            }
+            if force_bottom_notify.get() {
+                adj.set_value(max_scroll);
                 return;
             }
             let distance_from_bottom = max_scroll - adj.value();
@@ -192,6 +201,7 @@ impl MessageView {
             has_more_newer: Rc::new(Cell::new(false)),
             search_result_callback: RefCell::new(None),
             search_query: Rc::new(RefCell::new(None)),
+            force_bottom,
         }
     }
 
@@ -748,12 +758,20 @@ impl MessageView {
     }
 
     pub fn scroll_to_bottom(&self) {
+        // Tell the upper_notify handler to force-scroll on every layout update
+        // until the timeout expires, covering reactions, images, etc.
+        self.force_bottom.set(true);
         let adj = self.scrolled.vadjustment();
         adj.set_value(adj.upper() - adj.page_size());
         // Defer once more for pending layout
         let adj2 = adj.clone();
         gtk4::glib::idle_add_local_once(move || {
             adj2.set_value(adj2.upper() - adj2.page_size());
+        });
+        // Clear the force flag after layout has had time to fully settle
+        let force = self.force_bottom.clone();
+        gtk4::glib::timeout_add_local_once(std::time::Duration::from_millis(500), move || {
+            force.set(false);
         });
     }
 

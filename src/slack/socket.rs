@@ -49,6 +49,17 @@ pub enum SlackEvent {
         thread_ts: String,
         reply_count: usize,
     },
+    /// A message was deleted from a channel.
+    MessageDeleted {
+        channel: String,
+        deleted_ts: String,
+    },
+    /// The authenticated user was added to a channel (or joined one).
+    ChannelJoined {
+        channel: String,
+        /// The user who joined (only set for member_joined_channel; absent for channel_joined/group_joined which are self-only).
+        user: Option<String>,
+    },
     /// Indicates the WebSocket connection is alive.
     Connected,
     /// Connection was lost; will attempt to reconnect.
@@ -246,6 +257,19 @@ fn dispatch_event(evt: &serde_json::Value, tx: &mpsc::UnboundedSender<SlackEvent
                 return;
             }
 
+            // Handle message_deleted: remove from local DB
+            if subtype == Some("message_deleted") {
+                let channel = evt.get("channel").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let deleted_ts = evt.get("deleted_ts").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                if !channel.is_empty() && !deleted_ts.is_empty() {
+                    let _ = tx.send(SlackEvent::MessageDeleted {
+                        channel,
+                        deleted_ts,
+                    });
+                }
+                return;
+            }
+
             // Skip subtypes we can't handle (allow thread_broadcast, bot_message, file_share)
             if let Some(st) = subtype {
                 if st != "thread_broadcast" && st != "bot_message" && st != "file_share" {
@@ -370,6 +394,27 @@ fn dispatch_event(evt: &serde_json::Value, tx: &mpsc::UnboundedSender<SlackEvent
                 let _ = tx.send(SlackEvent::ReactionChanged {
                     channel, message_ts, reaction, user, added,
                 });
+            }
+        }
+        "member_joined_channel" | "channel_joined" | "group_joined" => {
+            // member_joined_channel has "channel" as a string ID and includes "user"
+            // channel_joined / group_joined have "channel" as an object with "id" and are self-only
+            let (channel_id, user) = if evt_type == "member_joined_channel" {
+                (
+                    evt.get("channel").and_then(|v| v.as_str()).map(String::from),
+                    evt.get("user").and_then(|v| v.as_str()).map(String::from),
+                )
+            } else {
+                (
+                    evt.get("channel")
+                        .and_then(|v| v.get("id"))
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    None,
+                )
+            };
+            if let Some(channel) = channel_id {
+                let _ = tx.send(SlackEvent::ChannelJoined { channel, user });
             }
         }
         // Informational events we can safely ignore

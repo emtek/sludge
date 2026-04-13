@@ -1008,6 +1008,201 @@ pub fn build_app(
         sidebar.set_action_callback(action_cb);
     }
 
+    // ── Create group callback ──
+    {
+        let state = state.clone();
+        let sidebar = sidebar.clone();
+        let sidebar_outer = sidebar.clone();
+        let client = client.clone();
+        let rt = rt.clone();
+        let db = db.clone();
+        let window = window.clone();
+        let create_group_cb: Rc<dyn Fn()> = Rc::new(move || {
+            let user_names = state.borrow().user_names.clone();
+            let self_uid = state.borrow().self_user_id.clone();
+
+            let dialog = gtk::Window::builder()
+                .title("New Group Chat")
+                .transient_for(&window)
+                .modal(true)
+                .default_width(400)
+                .default_height(500)
+                .build();
+
+            let vbox = gtk::Box::new(gtk::Orientation::Vertical, 8);
+            vbox.set_margin_top(12);
+            vbox.set_margin_bottom(12);
+            vbox.set_margin_start(12);
+            vbox.set_margin_end(12);
+
+            let search = gtk::SearchEntry::new();
+            search.set_placeholder_text(Some("Search people..."));
+            vbox.append(&search);
+
+            // Selected users display
+            let selected_box = gtk::FlowBox::new();
+            selected_box.set_selection_mode(gtk::SelectionMode::None);
+            selected_box.set_max_children_per_line(10);
+            selected_box.set_min_children_per_line(1);
+            vbox.append(&selected_box);
+
+            // User list
+            let scrolled = gtk::ScrolledWindow::new();
+            scrolled.set_vexpand(true);
+            let user_list = gtk::ListBox::new();
+            user_list.set_selection_mode(gtk::SelectionMode::None);
+            user_list.add_css_class("boxed-list");
+            scrolled.set_child(Some(&user_list));
+            vbox.append(&scrolled);
+
+            // Create button
+            let create_btn = gtk::Button::with_label("Create");
+            create_btn.add_css_class("suggested-action");
+            create_btn.set_sensitive(false);
+            vbox.append(&create_btn);
+
+            dialog.set_child(Some(&vbox));
+
+            // Build sorted user list (excluding self and bots)
+            let mut users: Vec<(String, String)> = user_names
+                .iter()
+                .filter(|(uid, _)| **uid != self_uid)
+                .map(|(uid, name)| (uid.clone(), name.clone()))
+                .collect();
+            users.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+
+            let selected_users: Rc<RefCell<Vec<(String, String)>>> =
+                Rc::new(RefCell::new(Vec::new()));
+
+            // Populate user rows with checkboxes
+            for (uid, name) in &users {
+                let row = gtk::ListBoxRow::new();
+                row.set_widget_name(uid);
+                let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+                hbox.set_margin_top(4);
+                hbox.set_margin_bottom(4);
+                hbox.set_margin_start(8);
+                hbox.set_margin_end(8);
+
+                let check = gtk::CheckButton::new();
+                hbox.append(&check);
+
+                let label = Label::new(Some(name));
+                label.set_halign(gtk::Align::Start);
+                label.set_hexpand(true);
+                hbox.append(&label);
+
+                row.set_child(Some(&hbox));
+                user_list.append(&row);
+
+                let selected = selected_users.clone();
+                let uid = uid.clone();
+                let name = name.clone();
+                let create_btn2 = create_btn.clone();
+                let selected_box2 = selected_box.clone();
+                check.connect_toggled(move |check| {
+                    let mut sel = selected.borrow_mut();
+                    if check.is_active() {
+                        sel.push((uid.clone(), name.clone()));
+                        // Add chip to selected display
+                        let chip = gtk::Label::new(Some(&name));
+                        chip.add_css_class("caption");
+                        chip.set_margin_start(4);
+                        chip.set_margin_end(4);
+                        chip.set_widget_name(&uid);
+                        selected_box2.append(&chip);
+                    } else {
+                        sel.retain(|(id, _)| *id != uid);
+                        // Remove chip
+                        let mut idx = 0;
+                        while let Some(child) = selected_box2.child_at_index(idx) {
+                            if child.widget_name() == uid {
+                                selected_box2.remove(&child);
+                                break;
+                            }
+                            idx += 1;
+                        }
+                    }
+                    create_btn2.set_sensitive(sel.len() >= 2);
+                });
+            }
+
+            // Filter on search
+            let user_list2 = user_list.clone();
+            search.connect_search_changed(move |entry| {
+                let query = entry.text().to_string().to_lowercase();
+                let mut idx = 0;
+                while let Some(row) = user_list2.row_at_index(idx) {
+                    if let Some(child) = row.child() {
+                        if let Some(hbox) = child.downcast_ref::<gtk::Box>() {
+                            // The label is the second child (after the checkbox)
+                            if let Some(label_widget) = hbox.last_child() {
+                                if let Some(label) = label_widget.downcast_ref::<Label>() {
+                                    let name = label.text().to_string().to_lowercase();
+                                    row.set_visible(query.is_empty() || name.contains(&query));
+                                }
+                            }
+                        }
+                    }
+                    idx += 1;
+                }
+            });
+
+            // Create action
+            let selected_final = selected_users.clone();
+            let client2 = client.clone();
+            let rt2 = rt.clone();
+            let sidebar2 = sidebar.clone();
+            let state2 = state.clone();
+            let db2 = db.clone();
+            let dialog2 = dialog.clone();
+            create_btn.connect_clicked(move |btn| {
+                btn.set_sensitive(false);
+                let user_ids: Vec<String> = selected_final
+                    .borrow()
+                    .iter()
+                    .map(|(uid, _)| uid.clone())
+                    .collect();
+                let client3 = client2.clone();
+                let sidebar3 = sidebar2.clone();
+                let state3 = state2.clone();
+                let db3 = db2.clone();
+                let rt3 = rt2.clone();
+                let dialog3 = dialog2.clone();
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                rt2.spawn(async move {
+                    let result = client3.conversations_open(&user_ids).await;
+                    let _ = tx.send(result);
+                });
+                gtk4::glib::spawn_future_local(async move {
+                    match rx.await {
+                        Ok(Ok(ch)) => {
+                            let cid = ch.id.clone();
+                            sidebar3.add_channel(&ch);
+                            state3.borrow_mut().channels.push(ch.clone());
+                            let channels = state3.borrow().channels.clone();
+                            rt3.spawn(async move {
+                                let _ = db3.save_channels(&channels).await;
+                            });
+                            sidebar3.select_channel_by_id(&cid);
+                            dialog3.close();
+                        }
+                        Ok(Err(e)) => {
+                            tracing::error!("Failed to create group: {e}");
+                            dialog3.close();
+                        }
+                        Err(_) => {
+                            dialog3.close();
+                        }
+                    }
+                });
+            });
+
+            dialog.present();
+        });
+        sidebar_outer.set_create_group_callback(create_group_cb);
+    }
+
     // ── Delete message callback ──
     {
         message_view.set_self_user_id(&user_id);
@@ -2581,6 +2776,7 @@ pub fn build_app(
         let status_entry_rt = status_entry.clone();
         let self_status_icon_rt = self_status_icon.clone();
         let nav_action = nav_action.clone();
+        let presence_tx = presence_tx.clone();
         let (notif_nav_tx, mut notif_nav_rx) = mpsc::unbounded_channel::<String>();
 
         // Drain notification click navigations on the main thread
@@ -2807,6 +3003,44 @@ pub fn build_app(
                             });
                         }
                     }
+                    SlackEvent::MessageDeleted { channel, deleted_ts } => {
+                        tracing::debug!("Message deleted: {channel} {deleted_ts}");
+
+                        // Remove from DB
+                        let db2 = db.clone();
+                        let cid = channel.clone();
+                        let ts = deleted_ts.clone();
+                        rt_rt.spawn(async move {
+                            db2.delete_indexed_message(&cid, &ts).await;
+                        });
+
+                        // Remove from main message view if visible
+                        let is_current = state.borrow().current_channel.as_deref() == Some(&channel);
+                        if is_current {
+                            let mut idx = 0;
+                            while let Some(row) = message_view.list_box.row_at_index(idx) {
+                                if row.widget_name() == deleted_ts {
+                                    message_view.list_box.remove(&row);
+                                    break;
+                                }
+                                idx += 1;
+                            }
+                        }
+
+                        // Remove from thread panel if visible
+                        if let Some((_tts, tcid)) = &state.borrow().current_thread {
+                            if *tcid == channel {
+                                let mut idx = 0;
+                                while let Some(row) = thread_panel.list_box.row_at_index(idx) {
+                                    if row.widget_name() == deleted_ts {
+                                        thread_panel.list_box.remove(&row);
+                                        break;
+                                    }
+                                    idx += 1;
+                                }
+                            }
+                        }
+                    }
                     SlackEvent::PresenceChange { user, presence } => {
                         tracing::debug!("Presence change: {user} -> {presence}");
                         let is_active = presence == "active";
@@ -3027,6 +3261,52 @@ pub fn build_app(
                         let current = state.borrow().current_channel.clone();
                         if current.as_deref() == Some(&channel) {
                             message_view.update_thread_count(&thread_ts, reply_count);
+                        }
+                    }
+                    SlackEvent::ChannelJoined { channel, user } => {
+                        // For member_joined_channel, only act if it's us who joined
+                        if let Some(ref uid) = user {
+                            if *uid != state.borrow().self_user_id {
+                                continue;
+                            }
+                        }
+                        // Check if we already have this channel
+                        let already_known = state.borrow().channels.iter().any(|c| c.id == channel);
+                        if !already_known {
+                            let client2 = client_rt.clone();
+                            let cid = channel.clone();
+                            let sidebar2 = sidebar.clone();
+                            let state2 = state.clone();
+                            let presence_tx2 = presence_tx.clone();
+                            let rt2 = rt_rt.clone();
+                            let (tx, rx) = tokio::sync::oneshot::channel();
+                            rt2.spawn(async move {
+                                let result = client2.conversations_info(&cid).await;
+                                let _ = tx.send(result);
+                            });
+                            let db3 = db.clone();
+                            let rt3 = rt_rt.clone();
+                            gtk4::glib::spawn_future_local(async move {
+                                if let Ok(Ok(ch)) = rx.await {
+                                    tracing::info!("Joined channel: {} ({})", ch.name.as_deref().unwrap_or("?"), ch.id);
+                                    if sidebar2.add_channel(&ch) {
+                                        // Subscribe to presence if this is a DM
+                                        if ch.is_im == Some(true) {
+                                            if let Some(uid) = &ch.user {
+                                                let _ = presence_tx2.send(vec![uid.clone()]);
+                                            }
+                                        }
+                                        state2.borrow_mut().channels.push(ch.clone());
+                                        // Persist updated channel list
+                                        let channels = state2.borrow().channels.clone();
+                                        rt3.spawn(async move {
+                                            if let Err(e) = db3.save_channels(&channels).await {
+                                                tracing::error!("Failed to save channels after join: {e}");
+                                            }
+                                        });
+                                    }
+                                }
+                            });
                         }
                     }
                     SlackEvent::Connected => {

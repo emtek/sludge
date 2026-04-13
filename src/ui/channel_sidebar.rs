@@ -22,6 +22,9 @@ pub enum ChannelAction {
 /// Callback type for channel actions: (action, channel_id)
 pub type ChannelActionCallback = Rc<dyn Fn(ChannelAction, &str)>;
 
+/// Callback type for the "create group" button.
+pub type CreateGroupCallback = Rc<dyn Fn()>;
+
 pub struct ChannelSidebar {
     pub widget: gtk::Box,
     pub channels_list: ListBox,
@@ -56,6 +59,8 @@ pub struct ChannelSidebar {
     status_emoji: Rc<RefCell<HashMap<String, String>>>,
     /// User status text keyed by user ID.
     status_text: Rc<RefCell<HashMap<String, String>>>,
+    /// Callback for the "create group" button.
+    create_group_callback: Rc<RefCell<Option<CreateGroupCallback>>>,
 }
 
 impl ChannelSidebar {
@@ -109,14 +114,34 @@ impl ChannelSidebar {
         inner.append(&channels_list);
 
         // Groups section
+        let group_header_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        group_header_box.set_margin_top(12);
+        group_header_box.set_margin_start(12);
+        group_header_box.set_margin_end(8);
+        group_header_box.set_margin_bottom(4);
+
         let group_header = Label::new(Some("Groups"));
         group_header.add_css_class("heading");
         group_header.add_css_class("dim-label");
         group_header.set_halign(gtk::Align::Start);
-        group_header.set_margin_top(12);
-        group_header.set_margin_start(12);
-        group_header.set_margin_bottom(4);
-        inner.append(&group_header);
+        group_header.set_hexpand(true);
+        group_header_box.append(&group_header);
+
+        let create_group_callback: Rc<RefCell<Option<CreateGroupCallback>>> =
+            Rc::new(RefCell::new(None));
+        let create_group_btn = gtk::Button::from_icon_name("list-add-symbolic");
+        create_group_btn.add_css_class("flat");
+        create_group_btn.add_css_class("dim-label");
+        create_group_btn.set_tooltip_text(Some("New group chat"));
+        let cgc = create_group_callback.clone();
+        create_group_btn.connect_clicked(move |_| {
+            if let Some(cb) = cgc.borrow().as_ref() {
+                cb();
+            }
+        });
+        group_header_box.append(&create_group_btn);
+
+        inner.append(&group_header_box);
 
         let group_list = ListBox::new();
         group_list.set_selection_mode(gtk::SelectionMode::Single);
@@ -290,11 +315,16 @@ impl ChannelSidebar {
             watch_labels: Rc::new(RefCell::new(HashMap::new())),
             status_emoji: Rc::new(RefCell::new(HashMap::new())),
             status_text: Rc::new(RefCell::new(HashMap::new())),
+            create_group_callback,
         }
     }
 
     pub fn set_action_callback(&self, cb: ChannelActionCallback) {
         *self.action_callback.borrow_mut() = Some(cb);
+    }
+
+    pub fn set_create_group_callback(&self, cb: CreateGroupCallback) {
+        *self.create_group_callback.borrow_mut() = Some(cb);
     }
 
     /// Set the list of user IDs being watched for presence notifications.
@@ -543,6 +573,69 @@ impl ChannelSidebar {
         *self.dms.borrow_mut() = dm_list;
         *self.groups.borrow_mut() = gr_list;
         self.search_entry.set_text("");
+    }
+
+    /// Add a single channel to the sidebar (e.g. when the user is added to a new channel at runtime).
+    /// Returns true if the channel was added, false if it already exists.
+    pub fn add_channel(&self, channel: &Channel) -> bool {
+        // Check if it already exists in any list
+        let id = &channel.id;
+        if self.channels.borrow().iter().any(|c| c.id == *id)
+            || self.dms.borrow().iter().any(|c| c.id == *id)
+            || self.groups.borrow().iter().any(|c| c.id == *id)
+        {
+            return false;
+        }
+
+        let names = self.user_names.borrow();
+        let acb = self.action_callback.borrow().clone();
+        let watched = &self.watched_users;
+
+        if Self::is_mpdm(channel) {
+            let (row, badge) = Self::make_group_row(channel, &names);
+            row.set_visible(true);
+            Self::attach_context_menu(&row, id, true, None, &acb, watched, &self.watch_labels, &self.status_emoji, &self.status_text);
+            self.group_list.append(&row);
+            self.badges.borrow_mut().insert(id.clone(), badge);
+            self.display_names.borrow_mut().insert(
+                id.clone(),
+                Self::group_display_name(channel, &names).to_lowercase(),
+            );
+            self.groups.borrow_mut().push(channel.clone());
+        } else if channel.is_im == Some(true) {
+            let user_watched = channel.user.as_ref()
+                .is_some_and(|uid| self.watched_users.borrow().contains(uid));
+            let (row, badge, presence_lbl, status_box, watch_label) =
+                Self::make_dm_row(channel, &names, user_watched);
+            row.set_visible(true);
+            Self::attach_context_menu(&row, id, true, channel.user.as_deref(), &acb, watched, &self.watch_labels, &self.status_emoji, &self.status_text);
+            self.dm_list.append(&row);
+            self.badges.borrow_mut().insert(id.clone(), badge);
+            self.display_names.borrow_mut().insert(
+                id.clone(),
+                Self::dm_display_name(channel, &names).to_lowercase(),
+            );
+            if let Some(uid) = &channel.user {
+                self.presence_icons.borrow_mut().insert(uid.clone(), presence_lbl);
+                self.status_icons.borrow_mut().insert(uid.clone(), status_box);
+                self.dm_rows.borrow_mut().insert(uid.clone(), row);
+                self.watch_labels.borrow_mut().insert(uid.clone(), watch_label);
+            }
+            self.dms.borrow_mut().push(channel.clone());
+        } else {
+            let (row, badge) = Self::make_channel_row(channel);
+            row.set_visible(true);
+            Self::attach_context_menu(&row, id, false, None, &acb, watched, &self.watch_labels, &self.status_emoji, &self.status_text);
+            self.channels_list.append(&row);
+            self.badges.borrow_mut().insert(id.clone(), badge);
+            self.display_names.borrow_mut().insert(
+                id.clone(),
+                channel_display_name(channel).to_lowercase(),
+            );
+            self.channels.borrow_mut().push(channel.clone());
+        }
+
+        true
     }
 
     fn attach_context_menu(
