@@ -27,3 +27,41 @@ tokio-tungstenite = { version = "0.29.0", features = ["native-tls"] }
 futures-util = "0.3.32"
 emoji = "0.2.1"
 zbus = { version = "5", default-features = false, features = ["tokio"] }
+
+# ── cargo-generate-rpm configuration ──
+# Build with:
+#   cargo build --release
+#   cargo generate-rpm
+#
+# Install cargo-generate-rpm once:
+#   cargo install cargo-generate-rpm
+[package.metadata.generate-rpm]
+summary = "A native GTK4/libadwaita Slack client for the Linux desktop"
+assets = [
+    { source = "target/release/sludge", dest = "/usr/bin/sludge", mode = "755" },
+    { source = "assets/dev.sludge.app.desktop", dest = "/usr/share/applications/dev.sludge.app.desktop", mode = "644" },
+    { source = "assets/hicolor/48x48/apps/sludge.png",   dest = "/usr/share/icons/hicolor/48x48/apps/sludge.png",   mode = "644" },
+    { source = "assets/hicolor/64x64/apps/sludge.png",   dest = "/usr/share/icons/hicolor/64x64/apps/sludge.png",   mode = "644" },
+    { source = "assets/hicolor/128x128/apps/sludge.png", dest = "/usr/share/icons/hicolor/128x128/apps/sludge.png", mode = "644" },
+    { source = "assets/hicolor/256x256/apps/sludge.png", dest = "/usr/share/icons/hicolor/256x256/apps/sludge.png", mode = "644" },
+    { source = "assets/dev.sludge.app.search-provider.ini", dest = "/usr/share/gnome-shell/search-providers/dev.sludge.app.search-provider.ini", mode = "644" },
+    { source = "assets/dev.sludge.app.service", dest = "/usr/share/dbus-1/services/dev.sludge.app.service", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/sludge/README.md", mode = "644", doc = true },
+]
+# Post/postun scriptlets refresh the icon cache and desktop database.
+post_install_script = """
+/usr/bin/gtk-update-icon-cache /usr/share/icons/hicolor &>/dev/null || :
+/usr/bin/update-desktop-database /usr/share/applications &>/dev/null || :
+"""
+post_uninstall_script = """
+/usr/bin/gtk-update-icon-cache /usr/share/icons/hicolor &>/dev/null || :
+/usr/bin/update-desktop-database /usr/share/applications &>/dev/null || :
+"""
+
+[package.metadata.generate-rpm.requires]
+gtk4 = ">= 4.14"
+libadwaita = ">= 1.4"
+hicolor-icon-theme = "*"
+
+[package.metadata.generate-rpm.recommends]
+libnotify = "*"
