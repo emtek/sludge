@@ -25,6 +25,9 @@ pub type ChannelActionCallback = Rc<dyn Fn(ChannelAction, &str)>;
 /// Callback type for the "create group" button.
 pub type CreateGroupCallback = Rc<dyn Fn()>;
 
+/// Callback type for the "create channel" button.
+pub type CreateChannelCallback = Rc<dyn Fn()>;
+
 pub struct ChannelSidebar {
     pub widget: gtk::Box,
     pub channels_list: ListBox,
@@ -61,6 +64,8 @@ pub struct ChannelSidebar {
     status_text: Rc<RefCell<HashMap<String, String>>>,
     /// Callback for the "create group" button.
     create_group_callback: Rc<RefCell<Option<CreateGroupCallback>>>,
+    /// Callback for the "create channel" button.
+    create_channel_callback: Rc<RefCell<Option<CreateChannelCallback>>>,
 }
 
 impl ChannelSidebar {
@@ -99,14 +104,34 @@ impl ChannelSidebar {
         inner.append(&dm_list);
 
         // Channels section
+        let channels_header_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        channels_header_box.set_margin_top(12);
+        channels_header_box.set_margin_start(12);
+        channels_header_box.set_margin_end(8);
+        channels_header_box.set_margin_bottom(4);
+
         let channels_header = Label::new(Some("Channels"));
         channels_header.add_css_class("heading");
         channels_header.add_css_class("dim-label");
         channels_header.set_halign(gtk::Align::Start);
-        channels_header.set_margin_top(12);
-        channels_header.set_margin_start(12);
-        channels_header.set_margin_bottom(4);
-        inner.append(&channels_header);
+        channels_header.set_hexpand(true);
+        channels_header_box.append(&channels_header);
+
+        let create_channel_callback: Rc<RefCell<Option<CreateChannelCallback>>> =
+            Rc::new(RefCell::new(None));
+        let create_channel_btn = gtk::Button::from_icon_name("list-add-symbolic");
+        create_channel_btn.add_css_class("flat");
+        create_channel_btn.add_css_class("dim-label");
+        create_channel_btn.set_tooltip_text(Some("New channel"));
+        let ccc = create_channel_callback.clone();
+        create_channel_btn.connect_clicked(move |_| {
+            if let Some(cb) = ccc.borrow().as_ref() {
+                cb();
+            }
+        });
+        channels_header_box.append(&create_channel_btn);
+
+        inner.append(&channels_header_box);
 
         let channels_list = ListBox::new();
         channels_list.set_selection_mode(gtk::SelectionMode::Single);
@@ -316,6 +341,7 @@ impl ChannelSidebar {
             status_emoji: Rc::new(RefCell::new(HashMap::new())),
             status_text: Rc::new(RefCell::new(HashMap::new())),
             create_group_callback,
+            create_channel_callback,
         }
     }
 
@@ -325,6 +351,10 @@ impl ChannelSidebar {
 
     pub fn set_create_group_callback(&self, cb: CreateGroupCallback) {
         *self.create_group_callback.borrow_mut() = Some(cb);
+    }
+
+    pub fn set_create_channel_callback(&self, cb: CreateChannelCallback) {
+        *self.create_channel_callback.borrow_mut() = Some(cb);
     }
 
     /// Set the list of user IDs being watched for presence notifications.

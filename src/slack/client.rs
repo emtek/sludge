@@ -500,6 +500,24 @@ impl Client {
         Ok(data.channel)
     }
 
+    /// Create a new channel (public or private).
+    pub async fn conversations_create(
+        &self,
+        name: &str,
+        is_private: bool,
+    ) -> Result<Channel, String> {
+        let private_str = if is_private { "true" } else { "false" };
+        info!("Calling conversations.create name={name} is_private={private_str}");
+        let data: RawConversationsInfo = Self::stealth_post(
+            &self.http,
+            &self.creds,
+            "conversations.create",
+            &[("name", name), ("is_private", private_str)],
+        )
+        .await?;
+        Ok(data.channel)
+    }
+
     pub async fn close_conversation(&self, channel: &str) -> Result<(), String> {
         info!("Calling conversations.close for channel={channel}");
         let _: serde_json::Value =

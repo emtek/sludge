@@ -1203,6 +1203,134 @@ pub fn build_app(
         sidebar_outer.set_create_group_callback(create_group_cb);
     }
 
+    // ── Create channel callback ──
+    {
+        let sidebar = sidebar.clone();
+        let sidebar_outer = sidebar.clone();
+        let client = client.clone();
+        let rt = rt.clone();
+        let db = db.clone();
+        let state = state.clone();
+        let window = window.clone();
+        let create_channel_cb: Rc<dyn Fn()> = Rc::new(move || {
+            let dialog = gtk::Window::builder()
+                .title("New Channel")
+                .transient_for(&window)
+                .modal(true)
+                .default_width(400)
+                .default_height(200)
+                .build();
+
+            let vbox = gtk::Box::new(gtk::Orientation::Vertical, 12);
+            vbox.set_margin_top(16);
+            vbox.set_margin_bottom(16);
+            vbox.set_margin_start(16);
+            vbox.set_margin_end(16);
+
+            // Channel name entry
+            let name_entry = gtk::Entry::new();
+            name_entry.set_placeholder_text(Some("channel-name"));
+            let name_label = Label::new(Some("Channel name"));
+            name_label.set_halign(gtk::Align::Start);
+            name_label.add_css_class("heading");
+            vbox.append(&name_label);
+            vbox.append(&name_entry);
+
+            let hint = Label::new(Some("Lowercase, no spaces. Use hyphens to separate words."));
+            hint.add_css_class("dim-label");
+            hint.add_css_class("caption");
+            hint.set_halign(gtk::Align::Start);
+            vbox.append(&hint);
+
+            // Private toggle
+            let private_check = gtk::CheckButton::with_label("Make private");
+            vbox.append(&private_check);
+
+            // Error label
+            let error_label = Label::new(None);
+            error_label.add_css_class("error");
+            error_label.set_visible(false);
+            error_label.set_halign(gtk::Align::Start);
+            vbox.append(&error_label);
+
+            // Create button
+            let create_btn = gtk::Button::with_label("Create Channel");
+            create_btn.add_css_class("suggested-action");
+            create_btn.set_sensitive(false);
+            vbox.append(&create_btn);
+
+            dialog.set_child(Some(&vbox));
+
+            // Enable button only when name is non-empty
+            let create_btn2 = create_btn.clone();
+            name_entry.connect_changed(move |entry| {
+                create_btn2.set_sensitive(!entry.text().is_empty());
+            });
+
+            // Create action
+            let client2 = client.clone();
+            let rt2 = rt.clone();
+            let sidebar2 = sidebar.clone();
+            let state2 = state.clone();
+            let db2 = db.clone();
+            let dialog2 = dialog.clone();
+            create_btn.connect_clicked(move |btn| {
+                let raw_name = name_entry.text().to_string();
+                // Normalize: lowercase, replace spaces with hyphens
+                let name = raw_name
+                    .trim()
+                    .to_lowercase()
+                    .replace(' ', "-");
+                if name.is_empty() {
+                    return;
+                }
+                btn.set_sensitive(false);
+                error_label.set_visible(false);
+                let is_private = private_check.is_active();
+                let client3 = client2.clone();
+                let sidebar3 = sidebar2.clone();
+                let state3 = state2.clone();
+                let db3 = db2.clone();
+                let rt3 = rt2.clone();
+                let dialog3 = dialog2.clone();
+                let error_label2 = error_label.clone();
+                let btn2 = btn.clone();
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                rt2.spawn(async move {
+                    let result = client3.conversations_create(&name, is_private).await;
+                    let _ = tx.send(result);
+                });
+                gtk4::glib::spawn_future_local(async move {
+                    match rx.await {
+                        Ok(Ok(ch)) => {
+                            let cid = ch.id.clone();
+                            sidebar3.add_channel(&ch);
+                            state3.borrow_mut().channels.push(ch.clone());
+                            let channels = state3.borrow().channels.clone();
+                            rt3.spawn(async move {
+                                let _ = db3.save_channels(&channels).await;
+                            });
+                            sidebar3.select_channel_by_id(&cid);
+                            dialog3.close();
+                        }
+                        Ok(Err(e)) => {
+                            tracing::error!("Failed to create channel: {e}");
+                            error_label2.set_text(&e);
+                            error_label2.set_visible(true);
+                            btn2.set_sensitive(true);
+                        }
+                        Err(_) => {
+                            dialog3.close();
+                        }
+                    }
+                });
+            });
+
+            dialog.present();
+        });
+        sidebar_outer.set_create_channel_callback(create_channel_cb);
+    }
+
     // ── Delete message callback ──
     {
         message_view.set_self_user_id(&user_id);
