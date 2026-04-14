@@ -1,16 +1,13 @@
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use slacko::types::{Channel, Message, User};
-use surrealdb::engine::local::SurrealKv;
-use surrealdb::types::SurrealValue;
-use surrealdb::Surreal;
 use tracing::{error, info};
 
-type Db = Surreal<surrealdb::engine::local::Db>;
-
 /// Stored login credentials.
-#[derive(Debug, Clone, Serialize, Deserialize, SurrealValue)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SavedCredentials {
     pub xoxc_token: Option<String>,
     pub xoxd_cookie: Option<String>,
@@ -18,25 +15,38 @@ pub struct SavedCredentials {
 }
 
 /// A recently used status (emoji + text).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SurrealValue)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RecentStatus {
     pub emoji: String,
     pub text: String,
 }
 
-/// Wrapper to store a list as a JSON blob, avoiding surrealdb `id` field conflicts.
-#[derive(Debug, Serialize, Deserialize, SurrealValue)]
-struct JsonCache {
-    data: String,
+/// User-configurable preferences, persisted to the `kv` table.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Preferences {
+    /// How many months of history to backfill per channel.
+    pub history_months: u32,
+    /// How many weeks counts as "recent" activity for sidebar filtering.
+    pub activity_weeks: u32,
+}
+
+impl Default for Preferences {
+    fn default() -> Self {
+        Self {
+            history_months: 1,
+            activity_weeks: 2,
+        }
+    }
 }
 
 #[derive(Clone)]
 pub struct Database {
-    db: Db,
+    conn: Arc<Mutex<Connection>>,
 }
 
 impl Database {
-    pub async fn open(rt: &tokio::runtime::Handle) -> Result<Self, String> {
+    pub async fn open(_rt: &tokio::runtime::Handle) -> Result<Self, String> {
         let data_dir = dirs::data_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("."))
             .join("sludge");
@@ -44,160 +54,192 @@ impl Database {
         std::fs::create_dir_all(&data_dir)
             .map_err(|e| format!("Failed to create data dir: {e}"))?;
 
-        let db_path = data_dir.join("db");
+        let db_path = data_dir.join("sludge.db");
         info!("Opening database at {}", db_path.display());
 
-        // surrealdb must be initialized on the tokio runtime
-        let path = db_path.to_string_lossy().to_string();
-        let db = rt
-            .spawn(async move {
-                let db = Surreal::new::<SurrealKv>(&path)
-                    .await
-                    .map_err(|e| format!("DB open error: {e}"))?;
-                db.use_ns("slack")
-                    .use_db("main")
-                    .await
-                    .map_err(|e| format!("DB namespace error: {e}"))?;
-                Ok::<Db, String>(db)
+        let conn = Connection::open(&db_path)
+            .map_err(|e| format!("DB open error: {e}"))?;
+
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(|e| format!("WAL mode error: {e}"))?;
+        conn.pragma_update(None, "synchronous", "NORMAL")
+            .map_err(|e| format!("synchronous pragma error: {e}"))?;
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .map_err(|e| format!("foreign_keys pragma error: {e}"))?;
+
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS message (
+                channel TEXT NOT NULL,
+                ts      TEXT NOT NULL,
+                thread_ts TEXT,
+                user    TEXT,
+                text    TEXT NOT NULL DEFAULT '',
+                data    TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (channel, ts)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_message_channel ON message(channel);
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS message_fts USING fts5(
+                text,
+                content=message,
+                content_rowid=rowid,
+                tokenize='porter unicode61'
+            );
+
+            -- Triggers to keep FTS index in sync with message table
+            CREATE TRIGGER IF NOT EXISTS message_fts_insert AFTER INSERT ON message BEGIN
+                INSERT INTO message_fts(rowid, text) VALUES (new.rowid, new.text);
+            END;
+            CREATE TRIGGER IF NOT EXISTS message_fts_delete AFTER DELETE ON message BEGIN
+                INSERT INTO message_fts(message_fts, rowid, text) VALUES ('delete', old.rowid, old.text);
+            END;
+            CREATE TRIGGER IF NOT EXISTS message_fts_update AFTER UPDATE ON message BEGIN
+                INSERT INTO message_fts(message_fts, rowid, text) VALUES ('delete', old.rowid, old.text);
+                INSERT INTO message_fts(rowid, text) VALUES (new.rowid, new.text);
+            END;
+
+            CREATE TABLE IF NOT EXISTS kv (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS channel_meta (
+                channel             TEXT PRIMARY KEY,
+                oldest_ts           TEXT NOT NULL,
+                newest_ts           TEXT NOT NULL,
+                backfill_checked_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS channel_activity (
+                channel TEXT PRIMARY KEY,
+                ts      TEXT NOT NULL
+            );"
+        ).map_err(|e| format!("DB schema error: {e}"))?;
+
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+        })
+    }
+
+    // ── helpers ──
+
+    fn with_conn<F, T>(&self, f: F) -> T
+    where
+        F: FnOnce(&Connection) -> T,
+    {
+        let conn = self.conn.lock().unwrap();
+        f(&conn)
+    }
+
+    fn kv_set(&self, key: &str, value: &str) {
+        self.with_conn(|c| {
+            let _ = c.execute(
+                "INSERT OR REPLACE INTO kv (key, value) VALUES (?1, ?2)",
+                params![key, value],
+            );
+        });
+    }
+
+    fn kv_get(&self, key: &str) -> Option<String> {
+        self.with_conn(|c| {
+            c.query_row("SELECT value FROM kv WHERE key = ?1", params![key], |r| {
+                r.get(0)
             })
-            .await
-            .map_err(|e| format!("DB task error: {e}"))??;
+            .ok()
+        })
+    }
 
-        // Define tables and full-text search indexes
-        let mut schema_response = db.query(
-            "DEFINE TABLE IF NOT EXISTS message SCHEMAFULL;
-             DEFINE FIELD IF NOT EXISTS channel ON message TYPE string;
-             DEFINE FIELD IF NOT EXISTS ts ON message TYPE string;
-             DEFINE FIELD IF NOT EXISTS thread_ts ON message TYPE option<string>;
-             DEFINE FIELD IF NOT EXISTS user ON message TYPE option<string>;
-             DEFINE FIELD IF NOT EXISTS text ON message TYPE string;
-             DEFINE FIELD IF NOT EXISTS data ON message TYPE string;
-             DEFINE INDEX IF NOT EXISTS message_channel_ts ON message FIELDS channel, ts UNIQUE;
-             DEFINE ANALYZER IF NOT EXISTS msg_analyzer TOKENIZERS blank, class FILTERS lowercase, snowball(english);
-             DEFINE INDEX IF NOT EXISTS message_text_ft ON message FIELDS text
-                 FULLTEXT ANALYZER msg_analyzer BM25 HIGHLIGHTS;
-
-             DEFINE TABLE IF NOT EXISTS credentials SCHEMALESS;
-             DEFINE TABLE IF NOT EXISTS cache SCHEMALESS;
-             DEFINE TABLE IF NOT EXISTS settings SCHEMALESS;
-
-             DEFINE TABLE IF NOT EXISTS channel_meta SCHEMAFULL;
-             DEFINE FIELD IF NOT EXISTS channel ON channel_meta TYPE string;
-             DEFINE FIELD IF NOT EXISTS oldest_ts ON channel_meta TYPE string;
-             DEFINE FIELD IF NOT EXISTS newest_ts ON channel_meta TYPE string;
-             DEFINE FIELD IF NOT EXISTS backfill_checked_at ON channel_meta TYPE option<string>;
-             DEFINE INDEX IF NOT EXISTS channel_meta_channel ON channel_meta FIELDS channel UNIQUE;
-            "
-        )
-            .await
-            .map_err(|e| format!("DB schema error: {e}"))?;
-
-        // Check each schema statement for errors
-        let statement_names = [
-            "DEFINE TABLE message", "DEFINE FIELD channel", "DEFINE FIELD ts",
-            "DEFINE FIELD thread_ts", "DEFINE FIELD user", "DEFINE FIELD text",
-            "DEFINE FIELD data", "DEFINE INDEX message_channel_ts",
-            "DEFINE ANALYZER msg_analyzer", "DEFINE INDEX message_text_ft",
-            "DEFINE TABLE credentials", "DEFINE TABLE cache", "DEFINE TABLE settings",
-            "DEFINE TABLE channel_meta", "DEFINE FIELD channel_meta.channel",
-            "DEFINE FIELD channel_meta.oldest_ts", "DEFINE FIELD channel_meta.newest_ts",
-            "DEFINE FIELD channel_meta.backfill_checked_at",
-            "DEFINE INDEX channel_meta_channel",
-        ];
-        for (i, name) in statement_names.iter().enumerate() {
-            let result: Result<Vec<serde_json::Value>, _> = schema_response.take(i);
-            if let Err(e) = result {
-                tracing::warn!("Schema statement {i} ({name}) error: {e}");
-            }
-        }
-
-        Ok(Self { db })
+    fn kv_delete(&self, key: &str) {
+        self.with_conn(|c| {
+            let _ = c.execute("DELETE FROM kv WHERE key = ?1", params![key]);
+        });
     }
 
     // ── Credentials ──
 
     pub async fn save_credentials(&self, creds: &SavedCredentials) -> Result<(), String> {
-        // Delete then create for a clean upsert
-        let _: Result<Option<SavedCredentials>, _> =
-            self.db.delete(("credentials", "main")).await;
-        let _: Option<SavedCredentials> = self
-            .db
-            .create(("credentials", "main"))
-            .content(creds.clone())
+        let json =
+            serde_json::to_string(creds).map_err(|e| format!("JSON serialize error: {e}"))?;
+        let db = self.clone();
+        tokio::task::spawn_blocking(move || db.kv_set("credentials", &json))
             .await
-            .map_err(|e| format!("DB save credentials error: {e}"))?;
-
+            .map_err(|e| format!("spawn_blocking error: {e}"))?;
         info!("Credentials saved to database");
         Ok(())
     }
 
     pub async fn load_credentials(&self) -> Option<SavedCredentials> {
-        match self
-            .db
-            .select::<Option<SavedCredentials>>(("credentials", "main"))
+        let db = self.clone();
+        let json = tokio::task::spawn_blocking(move || db.kv_get("credentials"))
             .await
-        {
-            Ok(Some(creds)) => {
+            .ok()??;
+        match serde_json::from_str(&json) {
+            Ok(creds) => {
                 info!("Loaded saved credentials");
                 Some(creds)
             }
-            Ok(None) => {
-                info!("No saved credentials found");
-                None
-            }
             Err(e) => {
-                error!("DB load credentials error: {e}");
+                error!("Failed to deserialize credentials: {e}");
                 None
             }
         }
     }
 
     pub async fn clear_credentials(&self) {
-        let _: Result<Option<SavedCredentials>, _> =
-            self.db.delete(("credentials", "main")).await;
+        let db = self.clone();
+        let _ = tokio::task::spawn_blocking(move || db.kv_delete("credentials")).await;
         info!("Credentials cleared from database");
+    }
+
+    /// Clear all cached content — messages, channel/user cache, channel metadata.
+    /// Leaves credentials and app settings intact.
+    pub async fn clear_cache(&self) {
+        let db = self.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            db.with_conn(|c| {
+                let _ = c.execute_batch(
+                    "DELETE FROM message;
+                     DELETE FROM channel_meta;
+                     DELETE FROM channel_activity;
+                     DELETE FROM kv WHERE key LIKE 'cache:%';",
+                );
+            });
+        })
+        .await;
+        info!("Cleared cached messages, channels, users, and channel metadata");
     }
 
     // ── Custom Emoji ──
 
-    pub async fn save_custom_emoji(&self, emoji: &HashMap<String, String>) -> Result<(), String> {
+    pub async fn save_custom_emoji(
+        &self,
+        emoji: &HashMap<String, String>,
+    ) -> Result<(), String> {
         let json =
             serde_json::to_string(emoji).map_err(|e| format!("JSON serialize error: {e}"))?;
-        let cache = JsonCache { data: json };
-        let _: Result<Option<JsonCache>, _> = self.db.delete(("cache", "custom_emoji")).await;
-        let _: Option<JsonCache> = self
-            .db
-            .create(("cache", "custom_emoji"))
-            .content(cache)
+        let db = self.clone();
+        tokio::task::spawn_blocking(move || db.kv_set("cache:custom_emoji", &json))
             .await
-            .map_err(|e| format!("DB save custom emoji error: {e}"))?;
+            .map_err(|e| format!("spawn_blocking error: {e}"))?;
         info!("Saved {} custom emoji to database", emoji.len());
         Ok(())
     }
 
     pub async fn load_custom_emoji(&self) -> Option<HashMap<String, String>> {
-        match self
-            .db
-            .select::<Option<JsonCache>>(("cache", "custom_emoji"))
-            .await
-        {
-            Ok(Some(cache)) => match serde_json::from_str(&cache.data) {
-                Ok(emoji) => {
-                    let emoji: HashMap<String, String> = emoji;
-                    info!("Loaded {} cached custom emoji from database", emoji.len());
-                    Some(emoji)
-                }
-                Err(e) => {
-                    error!("Failed to deserialize cached custom emoji: {e}");
-                    None
-                }
-            },
-            Ok(None) => {
-                info!("No cached custom emoji found");
-                None
+        let db = self.clone();
+        let json =
+            tokio::task::spawn_blocking(move || db.kv_get("cache:custom_emoji"))
+                .await
+                .ok()??;
+        match serde_json::from_str(&json) {
+            Ok(emoji) => {
+                let emoji: HashMap<String, String> = emoji;
+                info!("Loaded {} cached custom emoji from database", emoji.len());
+                Some(emoji)
             }
             Err(e) => {
-                error!("DB load custom emoji error: {e}");
+                error!("Failed to deserialize cached custom emoji: {e}");
                 None
             }
         }
@@ -206,46 +248,52 @@ impl Database {
     // ── Channels ──
 
     pub async fn save_channels(&self, channels: &[Channel]) -> Result<(), String> {
-        let json =
-            serde_json::to_string(channels).map_err(|e| format!("JSON serialize error: {e}"))?;
-        let cache = JsonCache { data: json };
-        // Delete then create for a clean upsert
-        let _: Result<Option<JsonCache>, _> = self.db.delete(("cache", "channels")).await;
-        let _: Option<JsonCache> = self
-            .db
-            .create(("cache", "channels"))
-            .content(cache)
+        let json = serde_json::to_string(channels)
+            .map_err(|e| format!("JSON serialize error: {e}"))?;
+        let db = self.clone();
+        tokio::task::spawn_blocking(move || db.kv_set("cache:channels", &json))
             .await
-            .map_err(|e| format!("DB save channels error: {e}"))?;
+            .map_err(|e| format!("spawn_blocking error: {e}"))?;
         info!("Saved {} channels to database", channels.len());
         Ok(())
+    }
+
+    pub async fn load_channels(&self) -> Option<Vec<Channel>> {
+        let db = self.clone();
+        let json =
+            tokio::task::spawn_blocking(move || db.kv_get("cache:channels"))
+                .await
+                .ok()??;
+        match serde_json::from_str(&json) {
+            Ok(channels) => {
+                let channels: Vec<Channel> = channels;
+                info!("Loaded {} cached channels from database", channels.len());
+                Some(channels)
+            }
+            Err(e) => {
+                error!("Failed to deserialize cached channels: {e}");
+                None
+            }
+        }
     }
 
     // ── Last channel ──
 
     pub async fn save_last_channel(&self, channel_id: &str) {
-        let _: Result<Option<serde_json::Value>, _> =
-            self.db.delete(("cache", "last_channel")).await;
-        let val = serde_json::json!({ "channel_id": channel_id });
-        let _: Result<Option<serde_json::Value>, _> = self
-            .db
-            .create(("cache", "last_channel"))
-            .content(val)
-            .await;
+        let db = self.clone();
+        let cid = channel_id.to_string();
+        let _ = tokio::task::spawn_blocking(move || db.kv_set("cache:last_channel", &cid)).await;
     }
 
     pub async fn load_last_channel(&self) -> Option<String> {
-        let result: Result<Option<serde_json::Value>, _> =
-            self.db.select(("cache", "last_channel")).await;
-        result
-            .ok()
-            .flatten()
-            .and_then(|v| v.get("channel_id")?.as_str().map(String::from))
+        let db = self.clone();
+        tokio::task::spawn_blocking(move || db.kv_get("cache:last_channel"))
+            .await
+            .ok()?
     }
 
     // ── Recent statuses ──
 
-    /// Push a status to the front of the recent list (deduplicating, max 8).
     pub async fn push_recent_status(&self, status: &RecentStatus) {
         if status.emoji.is_empty() && status.text.is_empty() {
             return;
@@ -255,26 +303,19 @@ impl Database {
         list.insert(0, status.clone());
         list.truncate(8);
         let json = serde_json::to_string(&list).unwrap_or_default();
-        let cache = JsonCache { data: json };
-        let _: Result<Option<JsonCache>, _> = self.db.delete(("cache", "recent_statuses")).await;
-        let _: Result<Option<JsonCache>, _> = self
-            .db
-            .create(("cache", "recent_statuses"))
-            .content(cache)
-            .await;
+        let db = self.clone();
+        let _ =
+            tokio::task::spawn_blocking(move || db.kv_set("cache:recent_statuses", &json)).await;
     }
 
     pub async fn load_recent_statuses(&self) -> Vec<RecentStatus> {
-        match self
-            .db
-            .select::<Option<JsonCache>>(("cache", "recent_statuses"))
+        let db = self.clone();
+        let json = tokio::task::spawn_blocking(move || db.kv_get("cache:recent_statuses"))
             .await
-        {
-            Ok(Some(cache)) => {
-                serde_json::from_str(&cache.data).unwrap_or_default()
-            }
-            _ => Vec::new(),
-        }
+            .ok()
+            .flatten();
+        json.and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or_default()
     }
 
     // ── Users ──
@@ -282,41 +323,27 @@ impl Database {
     pub async fn save_users(&self, users: &[User]) -> Result<(), String> {
         let json =
             serde_json::to_string(users).map_err(|e| format!("JSON serialize error: {e}"))?;
-        let cache = JsonCache { data: json };
-        let _: Result<Option<JsonCache>, _> = self.db.delete(("cache", "users")).await;
-        let _: Option<JsonCache> = self
-            .db
-            .create(("cache", "users"))
-            .content(cache)
+        let db = self.clone();
+        tokio::task::spawn_blocking(move || db.kv_set("cache:users", &json))
             .await
-            .map_err(|e| format!("DB save users error: {e}"))?;
+            .map_err(|e| format!("spawn_blocking error: {e}"))?;
         info!("Saved {} users to database", users.len());
         Ok(())
     }
 
     pub async fn load_users(&self) -> Option<Vec<User>> {
-        match self
-            .db
-            .select::<Option<JsonCache>>(("cache", "users"))
+        let db = self.clone();
+        let json = tokio::task::spawn_blocking(move || db.kv_get("cache:users"))
             .await
-        {
-            Ok(Some(cache)) => match serde_json::from_str(&cache.data) {
-                Ok(users) => {
-                    let users: Vec<User> = users;
-                    info!("Loaded {} cached users from database", users.len());
-                    Some(users)
-                }
-                Err(e) => {
-                    error!("Failed to deserialize cached users: {e}");
-                    None
-                }
-            },
-            Ok(None) => {
-                info!("No cached users found");
-                None
+            .ok()??;
+        match serde_json::from_str(&json) {
+            Ok(users) => {
+                let users: Vec<User> = users;
+                info!("Loaded {} cached users from database", users.len());
+                Some(users)
             }
             Err(e) => {
-                error!("DB load users error: {e}");
+                error!("Failed to deserialize cached users: {e}");
                 None
             }
         }
@@ -324,194 +351,191 @@ impl Database {
 
     // ── Channel activity ──
 
-    /// Update the last activity timestamp for a channel.
     pub async fn update_channel_activity(&self, channel_id: &str, ts: &str) {
-        let key = format!("activity_{channel_id}");
-        let val = serde_json::json!({ "ts": ts });
-        let _: Result<Option<serde_json::Value>, _> = self.db.delete(("cache", &*key)).await;
-        let _: Result<Option<serde_json::Value>, _> = self
-            .db
-            .create(("cache", &*key))
-            .content(val)
-            .await;
+        let db = self.clone();
+        let cid = channel_id.to_string();
+        let ts = ts.to_string();
+        let _ = tokio::task::spawn_blocking(move || {
+            db.with_conn(|c| {
+                let _ = c.execute(
+                    "INSERT OR REPLACE INTO channel_activity (channel, ts) VALUES (?1, ?2)",
+                    params![cid, ts],
+                );
+            });
+        })
+        .await;
     }
 
-    /// Load all channel activity timestamps. Returns map of channel_id -> ts string.
     pub async fn load_all_channel_activity(&self) -> HashMap<String, String> {
-        // Query all cache records with activity_ prefix
-        let result: Result<Vec<serde_json::Value>, _> =
-            self.db.select("cache").await;
-        let mut map = HashMap::new();
-        if let Ok(records) = result {
-            for record in records {
-                // SurrealDB records have an `id` field like `cache:activity_C12345`
-                let id_str = record
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if let Some(channel_id) = id_str
-                    .strip_prefix("cache:")
-                    .and_then(|s| s.strip_prefix("activity_"))
-                {
-                    if let Some(ts) = record.get("ts").and_then(|v| v.as_str()) {
-                        map.insert(channel_id.to_string(), ts.to_string());
-                    }
-                }
-            }
-        }
-        map
+        let db = self.clone();
+        tokio::task::spawn_blocking(move || {
+            db.with_conn(|c| {
+                let mut stmt = match c.prepare("SELECT channel, ts FROM channel_activity") {
+                    Ok(s) => s,
+                    Err(_) => return HashMap::new(),
+                };
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .unwrap_or_else(|_| unreachable!());
+                rows.filter_map(|r| r.ok()).collect()
+            })
+        })
+        .await
+        .unwrap_or_default()
     }
 
     // ── Messages ──
 
-    /// Index messages for a channel (FTS + channel metadata).
-    pub async fn save_messages(&self, channel_id: &str, messages: &[Message]) -> Result<(), String> {
+    pub async fn save_messages(
+        &self,
+        channel_id: &str,
+        messages: &[Message],
+    ) -> Result<(), String> {
         self.index_messages(channel_id, messages).await;
         self.update_channel_meta(channel_id, messages).await;
-        tracing::debug!("Indexed {} messages for channel {channel_id}", messages.len());
+        tracing::debug!(
+            "Indexed {} messages for channel {channel_id}",
+            messages.len()
+        );
         Ok(())
     }
 
-    /// Load recent messages for a channel from the FTS index.
     pub async fn load_messages(&self, channel_id: &str) -> Option<Vec<Message>> {
-        let result = self
-            .db
-            .query("SELECT ts, data FROM message WHERE channel = $channel AND (thread_ts IS NONE OR thread_ts = ts) ORDER BY ts DESC LIMIT 10")
-            .bind(("channel", channel_id.to_string()))
-            .await;
-
-        match result {
-            Ok(mut response) => {
-                let rows: Result<Vec<serde_json::Value>, _> = response.take(0);
-                match rows {
-                    Ok(rows) if rows.is_empty() => None,
-                    Ok(rows) => {
-                        let messages: Vec<Message> = rows
-                            .into_iter()
-                            .filter_map(|row| {
-                                let data = row.get("data")?.as_str()?;
-                                serde_json::from_str(data).ok()
-                            })
-                            .collect();
-                        tracing::debug!(
-                            "Loaded {} messages for channel {channel_id}",
-                            messages.len()
-                        );
-                        if messages.is_empty() { None } else { Some(messages) }
-                    }
-                    Err(e) => {
-                        error!("DB load messages error: {e}");
-                        None
-                    }
-                }
-            }
-            Err(e) => {
-                error!("DB load messages query error: {e}");
-                None
-            }
-        }
+        let db = self.clone();
+        let cid = channel_id.to_string();
+        let result = tokio::task::spawn_blocking(move || {
+            db.with_conn(|c| {
+                let mut stmt = c.prepare(
+                    "SELECT data FROM message
+                     WHERE channel = ?1 AND (thread_ts IS NULL OR thread_ts = ts)
+                     ORDER BY ts DESC LIMIT 10",
+                ).ok()?;
+                let rows: Vec<Message> = stmt
+                    .query_map(params![cid], |row| row.get::<_, String>(0))
+                    .ok()?
+                    .filter_map(|r| r.ok())
+                    .filter_map(|data| serde_json::from_str(&data).ok())
+                    .collect();
+                if rows.is_empty() { None } else { Some(rows) }
+            })
+        })
+        .await
+        .ok()?;
+        result
     }
 
-    /// Index a single message for a channel.
     pub async fn append_message(&self, channel_id: &str, message: &Message) {
         self.index_messages(channel_id, &[message.clone()]).await;
     }
 
-    /// Return reply counts per thread parent for a channel, computed from
-    /// indexed messages. Each key is a thread_ts; the value is the number of
-    /// replies excluding the parent.
-    pub async fn reply_counts_for_channel(&self, channel_id: &str) -> std::collections::HashMap<String, usize> {
-        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        let result = self
-            .db
-            .query("SELECT thread_ts FROM message WHERE channel = $channel AND thread_ts IS NOT NONE AND thread_ts != ts")
-            .bind(("channel", channel_id.to_string()))
-            .await;
-        match result {
-            Ok(mut response) => {
-                let rows: Result<Vec<serde_json::Value>, _> = response.take(0);
-                if let Ok(rows) = rows {
-                    for row in rows {
-                        if let Some(tts) = row.get("thread_ts").and_then(|v| v.as_str()) {
-                            *counts.entry(tts.to_string()).or_insert(0) += 1;
-                        }
-                    }
+    pub async fn reply_counts_for_channel(
+        &self,
+        channel_id: &str,
+    ) -> HashMap<String, usize> {
+        let db = self.clone();
+        let cid = channel_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            db.with_conn(|c| {
+                let mut counts = HashMap::new();
+                let mut stmt = match c.prepare(
+                    "SELECT thread_ts FROM message
+                     WHERE channel = ?1 AND thread_ts IS NOT NULL AND thread_ts != ts",
+                ) {
+                    Ok(s) => s,
+                    Err(_) => return counts,
+                };
+                let rows = stmt
+                    .query_map(params![cid], |row| row.get::<_, String>(0))
+                    .unwrap_or_else(|_| unreachable!());
+                for r in rows.flatten() {
+                    *counts.entry(r).or_insert(0) += 1;
                 }
-            }
-            Err(e) => {
-                error!("DB reply_counts query error: {e}");
-            }
-        }
-        counts
+                counts
+            })
+        })
+        .await
+        .unwrap_or_default()
     }
 
-    /// Load messages newer than `after_ts` for a channel from the FTS index.
-    pub async fn load_messages_after(&self, channel_id: &str, after_ts: &str, limit: u32) -> Vec<Message> {
-        let result = self
-            .db
-            .query("SELECT ts, data FROM message WHERE channel = $channel AND ts > $after_ts AND (thread_ts IS NONE OR thread_ts = ts) ORDER BY ts ASC LIMIT $limit")
-            .bind(("channel", channel_id.to_string()))
-            .bind(("after_ts", after_ts.to_string()))
-            .bind(("limit", limit as i64))
-            .await;
-
-        match result {
-            Ok(mut response) => {
-                let rows: Result<Vec<serde_json::Value>, _> = response.take(0);
-                match rows {
-                    Ok(rows) => rows
-                        .into_iter()
-                        .filter_map(|row| {
-                            let data = row.get("data")?.as_str()?;
-                            serde_json::from_str(data).ok()
-                        })
-                        .collect(),
+    pub async fn load_messages_after(
+        &self,
+        channel_id: &str,
+        after_ts: &str,
+        limit: u32,
+    ) -> Vec<Message> {
+        let db = self.clone();
+        let cid = channel_id.to_string();
+        let ats = after_ts.to_string();
+        tokio::task::spawn_blocking(move || {
+            db.with_conn(|c| {
+                let mut stmt = match c.prepare(
+                    "SELECT data FROM message
+                     WHERE channel = ?1 AND ts > ?2 AND (thread_ts IS NULL OR thread_ts = ts)
+                     ORDER BY ts ASC LIMIT ?3",
+                ) {
+                    Ok(s) => s,
                     Err(e) => {
                         error!("DB load_messages_after error: {e}");
-                        Vec::new()
+                        return Vec::new();
                     }
-                }
-            }
-            Err(e) => {
-                error!("DB load_messages_after query error: {e}");
-                Vec::new()
-            }
-        }
+                };
+                stmt.query_map(params![cid, ats, limit], |row| row.get::<_, String>(0))
+                    .unwrap_or_else(|_| unreachable!())
+                    .filter_map(|r| r.ok())
+                    .filter_map(|data| serde_json::from_str(&data).ok())
+                    .collect()
+            })
+        })
+        .await
+        .unwrap_or_default()
     }
 
-    /// Delete an indexed message by channel and timestamp.
     pub async fn delete_indexed_message(&self, channel_id: &str, ts: &str) {
-        if let Err(e) = self
-            .db
-            .query("DELETE FROM message WHERE channel = $channel AND ts = $ts")
-            .bind(("channel", channel_id.to_string()))
-            .bind(("ts", ts.to_string()))
-            .await
-        {
-            tracing::warn!("Failed to delete indexed message {ts} in {channel_id}: {e}");
-        }
+        let db = self.clone();
+        let cid = channel_id.to_string();
+        let ts = ts.to_string();
+        let _ = tokio::task::spawn_blocking(move || {
+            db.with_conn(|c| {
+                if let Err(e) = c.execute(
+                    "DELETE FROM message WHERE channel = ?1 AND ts = ?2",
+                    params![cid, ts],
+                ) {
+                    tracing::warn!("Failed to delete indexed message {ts} in {cid}: {e}");
+                }
+            });
+        })
+        .await;
     }
 
-    /// Update the text of an indexed message and re-serialize its data blob.
-    pub async fn update_indexed_message_text(&self, channel_id: &str, ts: &str, new_text: &str) {
+    pub async fn update_indexed_message_text(
+        &self,
+        channel_id: &str,
+        ts: &str,
+        new_text: &str,
+    ) {
         if let Some(mut msg) = self.get_indexed_message(channel_id, ts).await {
             msg.text = new_text.to_string();
             let data = serde_json::to_string(&msg).unwrap_or_default();
-            if let Err(e) = self
-                .db
-                .query("UPDATE message SET text = $text, data = $data WHERE channel = $channel AND ts = $ts")
-                .bind(("channel", channel_id.to_string()))
-                .bind(("ts", ts.to_string()))
-                .bind(("text", new_text.to_string()))
-                .bind(("data", data))
-                .await
-            {
-                tracing::warn!("Failed to update indexed message {ts} in {channel_id}: {e}");
-            }
+            let db = self.clone();
+            let cid = channel_id.to_string();
+            let ts = ts.to_string();
+            let text = new_text.to_string();
+            let _ = tokio::task::spawn_blocking(move || {
+                db.with_conn(|c| {
+                    if let Err(e) = c.execute(
+                        "UPDATE message SET text = ?1, data = ?2 WHERE channel = ?3 AND ts = ?4",
+                        params![text, data, cid, ts],
+                    ) {
+                        tracing::warn!("Failed to update indexed message {ts} in {cid}: {e}");
+                    }
+                });
+            })
+            .await;
         }
     }
 
-    /// Update a reaction on an indexed message. Returns the updated reactions list if found.
     pub async fn update_reaction(
         &self,
         channel_id: &str,
@@ -542,19 +566,15 @@ impl Database {
             r.count = r.count.saturating_sub(1);
         }
 
-        // Remove reactions with zero count
         reactions.retain(|r| r.count > 0);
 
         let updated = msg.reactions.clone();
-        // Re-index with updated data
         self.index_messages(channel_id, &[msg]).await;
         updated
     }
 
     // ── Channel metadata ──
 
-    /// Update channel metadata (oldest/newest message timestamps).
-    /// Only expands the range — oldest gets smaller, newest gets larger.
     pub async fn update_channel_meta(&self, channel_id: &str, messages: &[Message]) {
         if messages.is_empty() {
             return;
@@ -562,111 +582,112 @@ impl Database {
         let batch_oldest = messages.iter().map(|m| m.ts.as_str()).min().unwrap();
         let batch_newest = messages.iter().map(|m| m.ts.as_str()).max().unwrap();
 
-        if let Err(e) = self
-            .db
-            .query(
-                "INSERT INTO channel_meta (channel, oldest_ts, newest_ts) VALUES ($channel, $oldest, $newest)
-                 ON DUPLICATE KEY UPDATE
-                     oldest_ts = IF $oldest < oldest_ts THEN $oldest ELSE oldest_ts END,
-                     newest_ts = IF $newest > newest_ts THEN $newest ELSE newest_ts END",
-            )
-            .bind(("channel", channel_id.to_string()))
-            .bind(("oldest", batch_oldest.to_string()))
-            .bind(("newest", batch_newest.to_string()))
-            .await
-        {
-            tracing::warn!("Failed to update channel meta for {channel_id}: {e}");
-        }
+        let db = self.clone();
+        let cid = channel_id.to_string();
+        let oldest = batch_oldest.to_string();
+        let newest = batch_newest.to_string();
+        let _ = tokio::task::spawn_blocking(move || {
+            db.with_conn(|c| {
+                if let Err(e) = c.execute(
+                    "INSERT INTO channel_meta (channel, oldest_ts, newest_ts)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(channel) DO UPDATE SET
+                         oldest_ts = CASE WHEN excluded.oldest_ts < oldest_ts THEN excluded.oldest_ts ELSE oldest_ts END,
+                         newest_ts = CASE WHEN excluded.newest_ts > newest_ts THEN excluded.newest_ts ELSE newest_ts END",
+                    params![cid, oldest, newest],
+                ) {
+                    tracing::warn!("Failed to update channel meta for {cid}: {e}");
+                }
+            });
+        })
+        .await;
     }
 
-    /// Remove all stored data for a channel (messages, cache, activity, metadata).
     pub async fn delete_channel_data(&self, channel_id: &str) {
-        // Delete indexed messages
-        if let Err(e) = self.db
-            .query("DELETE FROM message WHERE channel = $channel")
-            .bind(("channel", channel_id.to_string()))
-            .await
-        {
-            tracing::warn!("Failed to delete messages for {channel_id}: {e}");
-        }
-
-        // Delete activity cache
-        let activity_key = format!("activity_{channel_id}");
-        let _: Result<Option<serde_json::Value>, _> = self.db.delete(("cache", &*activity_key)).await;
-
-        // Delete channel metadata
-        if let Err(e) = self.db
-            .query("DELETE FROM channel_meta WHERE channel = $channel")
-            .bind(("channel", channel_id.to_string()))
-            .await
-        {
-            tracing::warn!("Failed to delete channel meta for {channel_id}: {e}");
-        }
-
-        tracing::info!("Deleted all data for channel {channel_id}");
+        let db = self.clone();
+        let cid = channel_id.to_string();
+        let _ = tokio::task::spawn_blocking(move || {
+            db.with_conn(|c| {
+                if let Err(e) = c.execute(
+                    "DELETE FROM message WHERE channel = ?1",
+                    params![cid],
+                ) {
+                    tracing::warn!("Failed to delete messages for {cid}: {e}");
+                }
+                let _ = c.execute(
+                    "DELETE FROM channel_activity WHERE channel = ?1",
+                    params![cid],
+                );
+                let _ = c.execute(
+                    "DELETE FROM channel_meta WHERE channel = ?1",
+                    params![cid],
+                );
+            });
+            tracing::info!("Deleted all data for channel {cid}");
+        })
+        .await;
     }
 
-    /// Mark a channel's backfill as fully checked (reached end of history).
     pub async fn mark_backfill_checked(&self, channel_id: &str) {
+        let db = self.clone();
+        let cid = channel_id.to_string();
         let now = chrono::Utc::now().to_rfc3339();
-        if let Err(e) = self
-            .db
-            .query(
-                "UPDATE channel_meta SET backfill_checked_at = $checked WHERE channel = $channel",
-            )
-            .bind(("channel", channel_id.to_string()))
-            .bind(("checked", now))
-            .await
-        {
-            tracing::warn!("Failed to mark backfill checked for {channel_id}: {e}");
-        }
+        let _ = tokio::task::spawn_blocking(move || {
+            db.with_conn(|c| {
+                if let Err(e) = c.execute(
+                    "UPDATE channel_meta SET backfill_checked_at = ?1 WHERE channel = ?2",
+                    params![now, cid],
+                ) {
+                    tracing::warn!("Failed to mark backfill checked for {cid}: {e}");
+                }
+            });
+        })
+        .await;
     }
 
-    /// Get the newest cached message timestamp for a channel.
     pub async fn get_newest_ts(&self, channel_id: &str) -> Option<String> {
-        let result = self
-            .db
-            .query("SELECT newest_ts FROM channel_meta WHERE channel = $channel LIMIT 1")
-            .bind(("channel", channel_id.to_string()))
-            .await;
-        match result {
-            Ok(mut response) => {
-                let rows: Result<Vec<serde_json::Value>, _> = response.take(0);
-                rows.ok()?.into_iter().next()
-                    .and_then(|row| row.get("newest_ts")?.as_str().map(String::from))
-                    .filter(|s| !s.is_empty())
-            }
-            Err(_) => None,
-        }
+        let db = self.clone();
+        let cid = channel_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            db.with_conn(|c| {
+                c.query_row(
+                    "SELECT newest_ts FROM channel_meta WHERE channel = ?1",
+                    params![cid],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok()
+                .filter(|s| !s.is_empty())
+            })
+        })
+        .await
+        .ok()?
     }
 
-    /// Load messages around a timestamp from the DB (for navigating to a specific message).
-    pub async fn load_messages_around(&self, channel_id: &str, ts: &str, count: u32) -> Vec<Message> {
-        // Get `count` messages before (inclusive) and `count` after
-        let before_result = self
-            .db
-            .query("SELECT ts, data FROM message WHERE channel = $channel AND ts <= $ts AND (thread_ts IS NONE OR thread_ts = ts) ORDER BY ts DESC LIMIT $limit")
-            .bind(("channel", channel_id.to_string()))
-            .bind(("ts", ts.to_string()))
-            .bind(("limit", count as i64))
-            .await;
-        let after_result = self
-            .db
-            .query("SELECT ts, data FROM message WHERE channel = $channel AND ts > $ts AND (thread_ts IS NONE OR thread_ts = ts) ORDER BY ts ASC LIMIT $limit")
-            .bind(("channel", channel_id.to_string()))
-            .bind(("ts", ts.to_string()))
-            .bind(("limit", count as i64))
-            .await;
+    pub async fn load_messages_around(
+        &self,
+        channel_id: &str,
+        ts: &str,
+        count: u32,
+    ) -> Vec<Message> {
+        let db = self.clone();
+        let cid = channel_id.to_string();
+        let ts = ts.to_string();
+        tokio::task::spawn_blocking(move || {
+            db.with_conn(|c| {
+                let mut messages = Vec::new();
+                let mut seen = std::collections::HashSet::new();
 
-        let mut messages = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for result in [before_result, after_result] {
-            if let Ok(mut response) = result {
-                let rows: Result<Vec<serde_json::Value>, _> = response.take(0);
-                if let Ok(rows) = rows {
-                    for row in rows {
-                        if let Some(data) = row.get("data").and_then(|v| v.as_str()) {
-                            if let Ok(msg) = serde_json::from_str::<Message>(data) {
+                // Before (inclusive)
+                if let Ok(mut stmt) = c.prepare(
+                    "SELECT data FROM message
+                     WHERE channel = ?1 AND ts <= ?2 AND (thread_ts IS NULL OR thread_ts = ts)
+                     ORDER BY ts DESC LIMIT ?3",
+                ) {
+                    if let Ok(rows) = stmt.query_map(params![cid, ts, count], |row| {
+                        row.get::<_, String>(0)
+                    }) {
+                        for data in rows.flatten() {
+                            if let Ok(msg) = serde_json::from_str::<Message>(&data) {
                                 if seen.insert(msg.ts.clone()) {
                                     messages.push(msg);
                                 }
@@ -674,69 +695,90 @@ impl Database {
                         }
                     }
                 }
-            }
-        }
-        // Sort newest first (matches convention of load_messages)
-        messages.sort_by(|a, b| b.ts.cmp(&a.ts));
-        messages
-    }
 
-    /// Load all channel metadata. Returns map of channel_id -> (oldest_ts, newest_ts, backfill_checked_at).
-    pub async fn load_all_channel_meta(&self) -> HashMap<String, (String, String, Option<String>)> {
-        let result: Result<Vec<serde_json::Value>, _> = self.db.select("channel_meta").await;
-        let mut map = HashMap::new();
-        if let Ok(records) = result {
-            for record in records {
-                let channel = record.get("channel").and_then(|v| v.as_str()).unwrap_or("");
-                let oldest = record.get("oldest_ts").and_then(|v| v.as_str()).unwrap_or("");
-                let newest = record.get("newest_ts").and_then(|v| v.as_str()).unwrap_or("");
-                let checked = record.get("backfill_checked_at").and_then(|v| v.as_str()).map(String::from);
-                if !channel.is_empty() {
-                    map.insert(channel.to_string(), (oldest.to_string(), newest.to_string(), checked));
-                }
-            }
-        }
-        map
-    }
-
-    /// Index messages into the full-text search table.
-    pub async fn index_messages(&self, channel_id: &str, messages: &[Message]) {
-        let mut indexed = 0u32;
-        let mut errors = 0u32;
-        for msg in messages {
-            let data = serde_json::to_string(msg).unwrap_or_default();
-            let res = self
-                .db
-                .query(
-                    "INSERT INTO message (channel, ts, thread_ts, user, text, data) VALUES ($channel, $ts, $thread_ts, $user, $text, $data)
-                     ON DUPLICATE KEY UPDATE text = $text, data = $data",
-                )
-                .bind(("channel", channel_id.to_string()))
-                .bind(("ts", msg.ts.clone()))
-                .bind(("thread_ts", msg.thread_ts.clone()))
-                .bind(("user", msg.user.clone()))
-                .bind(("text", msg.text.clone()))
-                .bind(("data", data))
-                .await;
-            match res {
-                Ok(mut response) => {
-                    // Check the actual statement result — the outer Ok just means the query was sent
-                    let inner: Result<Vec<serde_json::Value>, _> = response.take(0);
-                    match inner {
-                        Ok(rows) if !rows.is_empty() => indexed += 1,
-                        Ok(_) => {
-                            if errors == 0 {
-                                tracing::warn!(
-                                    "FTS index returned empty for message {} in {channel_id}",
-                                    msg.ts
-                                );
+                // After
+                if let Ok(mut stmt) = c.prepare(
+                    "SELECT data FROM message
+                     WHERE channel = ?1 AND ts > ?2 AND (thread_ts IS NULL OR thread_ts = ts)
+                     ORDER BY ts ASC LIMIT ?3",
+                ) {
+                    if let Ok(rows) = stmt.query_map(params![cid, ts, count], |row| {
+                        row.get::<_, String>(0)
+                    }) {
+                        for data in rows.flatten() {
+                            if let Ok(msg) = serde_json::from_str::<Message>(&data) {
+                                if seen.insert(msg.ts.clone()) {
+                                    messages.push(msg);
+                                }
                             }
-                            errors += 1;
                         }
+                    }
+                }
+
+                messages.sort_by(|a, b| b.ts.cmp(&a.ts));
+                messages
+            })
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    pub async fn load_all_channel_meta(
+        &self,
+    ) -> HashMap<String, (String, String, Option<String>)> {
+        let db = self.clone();
+        tokio::task::spawn_blocking(move || {
+            db.with_conn(|c| {
+                let mut map = HashMap::new();
+                let mut stmt = match c
+                    .prepare("SELECT channel, oldest_ts, newest_ts, backfill_checked_at FROM channel_meta")
+                {
+                    Ok(s) => s,
+                    Err(_) => return map,
+                };
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                        ))
+                    })
+                    .unwrap_or_else(|_| unreachable!());
+                for r in rows.flatten() {
+                    map.insert(r.0, (r.1, r.2, r.3));
+                }
+                map
+            })
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    pub async fn index_messages(&self, channel_id: &str, messages: &[Message]) {
+        if messages.is_empty() {
+            return;
+        }
+        let db = self.clone();
+        let cid = channel_id.to_string();
+        let msgs: Vec<Message> = messages.to_vec();
+        let _ = tokio::task::spawn_blocking(move || {
+            db.with_conn(|c| {
+                let mut indexed = 0u32;
+                let mut errors = 0u32;
+                for msg in &msgs {
+                    let data = serde_json::to_string(msg).unwrap_or_default();
+                    match c.execute(
+                        "INSERT OR REPLACE INTO message (channel, ts, thread_ts, user, text, data)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![cid, msg.ts, msg.thread_ts, msg.user, msg.text, data],
+                    ) {
+                        Ok(_) => indexed += 1,
                         Err(e) => {
                             if errors == 0 {
                                 tracing::warn!(
-                                    "FTS index statement error for message {} in {channel_id}: {e}",
+                                    "FTS index error for message {} in {cid}: {e}",
                                     msg.ts
                                 );
                             }
@@ -744,208 +786,184 @@ impl Database {
                         }
                     }
                 }
-                Err(e) => {
-                    if errors == 0 {
-                        tracing::warn!("FTS index query error for message {} in {channel_id}: {e}", msg.ts);
-                    }
-                    errors += 1;
+                if indexed > 0 || errors > 0 {
+                    tracing::info!(
+                        "FTS indexing {cid}: {indexed} ok, {errors} errors (of {} total)",
+                        msgs.len()
+                    );
                 }
-            }
-        }
-        if indexed > 0 || errors > 0 {
-            tracing::info!("FTS indexing {channel_id}: {indexed} ok, {errors} errors (of {} total)", messages.len());
-        }
+            });
+        })
+        .await;
     }
 
-    /// Look up a single indexed message by channel and timestamp.
     pub async fn get_indexed_message(&self, channel_id: &str, ts: &str) -> Option<Message> {
-        let result = self
-            .db
-            .query("SELECT data FROM message WHERE channel = $channel AND ts = $ts LIMIT 1")
-            .bind(("channel", channel_id.to_string()))
-            .bind(("ts", ts.to_string()))
-            .await;
-
-        match result {
-            Ok(mut response) => {
-                let rows: Result<Vec<serde_json::Value>, _> = response.take(0);
-                rows.ok()?
-                    .into_iter()
-                    .next()
-                    .and_then(|row| {
-                        let data = row.get("data")?.as_str()?;
-                        serde_json::from_str(data).ok()
-                    })
-            }
-            Err(_) => None,
-        }
+        let db = self.clone();
+        let cid = channel_id.to_string();
+        let ts = ts.to_string();
+        tokio::task::spawn_blocking(move || {
+            db.with_conn(|c| {
+                c.query_row(
+                    "SELECT data FROM message WHERE channel = ?1 AND ts = ?2 LIMIT 1",
+                    params![cid, ts],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok()
+                .and_then(|data| serde_json::from_str(&data).ok())
+            })
+        })
+        .await
+        .ok()?
     }
 
-    /// Get the oldest indexed message timestamp for a channel.
     pub async fn oldest_indexed_ts(&self, channel_id: &str) -> Option<String> {
-        let result: Result<Vec<serde_json::Value>, _> = self
-            .db
-            .query("SELECT ts FROM message WHERE channel = $channel ORDER BY ts ASC LIMIT 1")
-            .bind(("channel", channel_id.to_string()))
-            .await
-            .map(|mut r| r.take(0).unwrap_or_default());
-
-        match result {
-            Ok(rows) => rows
-                .first()
-                .and_then(|row| row.get("ts")?.as_str().map(|s| s.to_string())),
-            Err(e) => {
-                tracing::warn!("Failed to get oldest indexed ts for {channel_id}: {e}");
-                None
-            }
-        }
+        let db = self.clone();
+        let cid = channel_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            db.with_conn(|c| {
+                c.query_row(
+                    "SELECT ts FROM message WHERE channel = ?1 ORDER BY ts ASC LIMIT 1",
+                    params![cid],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok()
+            })
+        })
+        .await
+        .ok()?
     }
 
     /// Full-text search across all indexed messages.
-    /// Returns matching messages scored by relevance and recency.
     pub async fn search_messages(&self, query: &str) -> Vec<(String, Message)> {
         let now = chrono::Utc::now().timestamp() as f64;
-
-        let result = self
-            .db
-            .query(
-                "SELECT channel, ts, data, search::score(0) AS score
-                 FROM message
-                 WHERE text @0@ $query
-                 ORDER BY score DESC
-                 LIMIT 200",
-            )
-            .bind(("query", query.to_string()))
-            .await;
-
-        match result {
-            Ok(mut response) => {
-                let rows: Result<Vec<serde_json::Value>, _> = response.take(0);
-                match rows {
-                    Ok(rows) => {
-                        tracing::debug!("FTS returned {} rows for {query:?}", rows.len());
-                        let mut scored: Vec<(f64, String, Message)> = rows
-                            .into_iter()
-                            .filter_map(|row| {
-                                let channel = row.get("channel")?.as_str()?.to_string();
-                                let ts_str = row.get("ts")?.as_str()?;
-                                let data = row.get("data")?.as_str()?;
-                                let msg: Message = serde_json::from_str(data).ok()?;
-                                let relevance = row.get("score")?.as_f64().unwrap_or(0.0);
-
-                                // Recency: days since message, decayed exponentially
-                                // Half-life of ~7 days: a week-old message gets ~0.5 boost
-                                let msg_ts: f64 = ts_str.split('.').next()?.parse().ok()?;
-                                let age_days = (now - msg_ts) / 86400.0;
-                                let recency = (-age_days / 10.0).exp(); // 0..1
-
-                                // Combined: relevance dominant, recency as tiebreaker
-                                let combined = relevance + 0.3 * recency;
-
-                                Some((combined, channel, msg))
-                            })
-                            .collect();
-
-                        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-                        scored.truncate(50);
-                        scored.into_iter().map(|(_, ch, msg)| (ch, msg)).collect()
-                    }
+        let db = self.clone();
+        let query = query.to_string();
+        tokio::task::spawn_blocking(move || {
+            db.with_conn(|c| {
+                // FTS5 MATCH query; bm25() gives relevance (lower = better match)
+                let mut stmt = match c.prepare(
+                    "SELECT m.channel, m.ts, m.data, bm25(message_fts) AS score
+                     FROM message_fts
+                     JOIN message m ON m.rowid = message_fts.rowid
+                     WHERE message_fts MATCH ?1
+                     ORDER BY score
+                     LIMIT 200",
+                ) {
+                    Ok(s) => s,
                     Err(e) => {
-                        error!("FTS search statement error for {query:?}: {e}");
-                        Vec::new()
+                        error!("FTS search query error for {query:?}: {e}");
+                        return Vec::new();
                     }
-                }
-            }
-            Err(e) => {
-                error!("FTS search query error for {query:?}: {e}");
-                Vec::new()
-            }
-        }
+                };
+                let rows = match stmt.query_map(params![query], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, f64>(3)?,
+                    ))
+                }) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        error!("FTS search error for {query:?}: {e}");
+                        return Vec::new();
+                    }
+                };
+
+                let mut scored: Vec<(f64, String, Message)> = rows
+                    .filter_map(|r| r.ok())
+                    .filter_map(|(channel, ts_str, data, bm25)| {
+                        let msg: Message = serde_json::from_str(&data).ok()?;
+                        // bm25() returns negative values; negate for positive relevance
+                        let relevance = -bm25;
+                        let msg_ts: f64 = ts_str.split('.').next()?.parse().ok()?;
+                        let age_days = (now - msg_ts) / 86400.0;
+                        let recency = (-age_days / 10.0).exp();
+                        let combined = relevance + 0.3 * recency;
+                        Some((combined, channel, msg))
+                    })
+                    .collect();
+
+                scored.sort_by(|a, b| {
+                    b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                scored.truncate(50);
+                scored.into_iter().map(|(_, ch, msg)| (ch, msg)).collect()
+            })
+        })
+        .await
+        .unwrap_or_default()
     }
 
     /// Search messages in a specific channel, returning highlighted text.
-    /// Returns (Message, highlighted_text) pairs sorted by relevance.
     pub async fn search_channel_messages(
         &self,
         channel_id: &str,
         query: &str,
     ) -> Vec<(Message, String)> {
-        let result = self
-            .db
-            .query(
-                "SELECT ts, data, search::score(0) AS score,
-                        search::highlight('<b>', '</b>', 0) AS highlighted
-                 FROM message
-                 WHERE channel = $channel AND text @0@ $query
-                 ORDER BY ts ASC
-                 LIMIT 50",
-            )
-            .bind(("channel", channel_id.to_string()))
-            .bind(("query", query.to_string()))
-            .await;
-
-        match result {
-            Ok(mut response) => {
-                let rows: Result<Vec<serde_json::Value>, _> = response.take(0);
-                match rows {
-                    Ok(rows) => {
-                        tracing::debug!(
-                            "Channel FTS returned {} rows for {query:?} in {channel_id}",
-                            rows.len()
-                        );
-                        rows.into_iter()
-                            .filter_map(|row| {
-                                let data = row.get("data")?.as_str()?;
-                                let msg: Message = serde_json::from_str(data).ok()?;
-                                let highlighted = row
-                                    .get("highlighted")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or(&msg.text)
-                                    .to_string();
-                                Some((msg, highlighted))
-                            })
-                            .collect()
-                    }
+        let db = self.clone();
+        let cid = channel_id.to_string();
+        let query = query.to_string();
+        tokio::task::spawn_blocking(move || {
+            db.with_conn(|c| {
+                let mut stmt = match c.prepare(
+                    "SELECT m.ts, m.data, highlight(message_fts, 0, '<b>', '</b>') AS highlighted
+                     FROM message_fts
+                     JOIN message m ON m.rowid = message_fts.rowid
+                     WHERE message_fts MATCH ?1 AND m.channel = ?2
+                     ORDER BY m.ts ASC
+                     LIMIT 50",
+                ) {
+                    Ok(s) => s,
                     Err(e) => {
-                        error!("Channel FTS statement error for {query:?}: {e}");
-                        Vec::new()
+                        error!("Channel FTS query error for {query:?}: {e}");
+                        return Vec::new();
                     }
-                }
-            }
-            Err(e) => {
-                error!("Channel FTS query error for {query:?}: {e}");
-                Vec::new()
-            }
-        }
+                };
+                let rows = match stmt.query_map(params![query, cid], |row| {
+                    Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                }) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        error!("Channel FTS error for {query:?}: {e}");
+                        return Vec::new();
+                    }
+                };
+                rows.filter_map(|r| r.ok())
+                    .filter_map(|(data, highlighted)| {
+                        let msg: Message = serde_json::from_str(&data).ok()?;
+                        Some((msg, highlighted))
+                    })
+                    .collect()
+            })
+        })
+        .await
+        .unwrap_or_default()
     }
 
     // ── Presence watches ──
 
-    /// Save the set of user IDs to watch for presence changes.
     pub async fn save_presence_watches(&self, user_ids: &[String]) {
         let json = serde_json::to_string(user_ids).unwrap_or_default();
-        let cache = JsonCache { data: json };
-        let _: Result<Option<JsonCache>, _> = self.db.delete(("settings", "presence_watches")).await;
-        let _: Result<Option<JsonCache>, _> = self
-            .db
-            .create(("settings", "presence_watches"))
-            .content(cache)
-            .await;
+        let db = self.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            db.kv_set("settings:presence_watches", &json);
+        })
+        .await;
     }
 
-    /// Load the set of user IDs being watched for presence changes.
     pub async fn load_presence_watches(&self) -> Vec<String> {
-        match self
-            .db
-            .select::<Option<JsonCache>>(("settings", "presence_watches"))
-            .await
-        {
-            Ok(Some(cache)) => serde_json::from_str(&cache.data).unwrap_or_default(),
-            _ => Vec::new(),
-        }
+        let db = self.clone();
+        let json = tokio::task::spawn_blocking(move || {
+            db.kv_get("settings:presence_watches")
+        })
+        .await
+        .ok()
+        .flatten();
+        json.and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or_default()
     }
 
-    /// Add a user ID to the presence watch list.
     pub async fn add_presence_watch(&self, user_id: &str) {
         let mut watches = self.load_presence_watches().await;
         if !watches.iter().any(|u| u == user_id) {
@@ -954,7 +972,6 @@ impl Database {
         }
     }
 
-    /// Remove a user ID from the presence watch list.
     pub async fn remove_presence_watch(&self, user_id: &str) {
         let mut watches = self.load_presence_watches().await;
         let before = watches.len();
@@ -964,9 +981,29 @@ impl Database {
         }
     }
 
+    // ── Preferences ──
+
+    pub async fn save_preferences(&self, prefs: &Preferences) {
+        let json = serde_json::to_string(prefs).unwrap_or_default();
+        let db = self.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            db.kv_set("settings:preferences", &json);
+        })
+        .await;
+    }
+
+    pub async fn load_preferences(&self) -> Preferences {
+        let db = self.clone();
+        let json = tokio::task::spawn_blocking(move || db.kv_get("settings:preferences"))
+            .await
+            .ok()
+            .flatten();
+        json.and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or_default()
+    }
+
     // ── Recent emoji ──
 
-    /// Push an emoji shortcode to the front of the recent list (deduplicating, max 50).
     pub async fn push_recent_emoji(&self, shortcode: &str) {
         if shortcode.is_empty() {
             return;
@@ -976,51 +1013,18 @@ impl Database {
         list.insert(0, shortcode.to_string());
         list.truncate(50);
         let json = serde_json::to_string(&list).unwrap_or_default();
-        let cache = JsonCache { data: json };
-        let _: Result<Option<JsonCache>, _> = self.db.delete(("cache", "recent_emoji")).await;
-        let _: Result<Option<JsonCache>, _> = self
-            .db
-            .create(("cache", "recent_emoji"))
-            .content(cache)
-            .await;
+        let db = self.clone();
+        let _ =
+            tokio::task::spawn_blocking(move || db.kv_set("cache:recent_emoji", &json)).await;
     }
 
     pub async fn load_recent_emoji(&self) -> Vec<String> {
-        match self
-            .db
-            .select::<Option<JsonCache>>(("cache", "recent_emoji"))
+        let db = self.clone();
+        let json = tokio::task::spawn_blocking(move || db.kv_get("cache:recent_emoji"))
             .await
-        {
-            Ok(Some(cache)) => serde_json::from_str(&cache.data).unwrap_or_default(),
-            _ => Vec::new(),
-        }
-    }
-
-    pub async fn load_channels(&self) -> Option<Vec<Channel>> {
-        match self
-            .db
-            .select::<Option<JsonCache>>(("cache", "channels"))
-            .await
-        {
-            Ok(Some(cache)) => match serde_json::from_str(&cache.data) {
-                Ok(channels) => {
-                    let channels: Vec<Channel> = channels;
-                    info!("Loaded {} cached channels from database", channels.len());
-                    Some(channels)
-                }
-                Err(e) => {
-                    error!("Failed to deserialize cached channels: {e}");
-                    None
-                }
-            },
-            Ok(None) => {
-                info!("No cached channels found");
-                None
-            }
-            Err(e) => {
-                error!("DB load channels error: {e}");
-                None
-            }
-        }
+            .ok()
+            .flatten();
+        json.and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or_default()
     }
 }

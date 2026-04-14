@@ -1,7 +1,8 @@
 use std::collections::HashMap;
-use reqwest::header::{HeaderMap, HeaderValue, COOKIE};
+use std::time::Duration;
+use reqwest::header::{HeaderMap, HeaderValue, COOKIE, RETRY_AFTER};
 use slacko::types::{Channel, Message, User};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Generic Slack API response envelope for stealth-mode raw HTTP calls.
 #[derive(Debug, serde::Deserialize)]
@@ -229,37 +230,89 @@ impl Client {
         let mut all_fields: Vec<(&str, &str)> = fields.to_vec();
         all_fields.push(("token", &creds.xoxc_token));
 
-        let resp = http
-            .post(&url)
-            .headers(Self::stealth_headers(creds))
-            .form(&all_fields)
-            .send()
-            .await
-            .map_err(|e| format!("HTTP error: {e}"))?;
+        // Retry loop for HTTP 429 (rate limiting) and `ratelimited` API errors.
+        // Slack returns a `Retry-After` header (seconds); honor it, otherwise
+        // fall back to exponential backoff. Cap at MAX_ATTEMPTS to avoid hangs.
+        const MAX_ATTEMPTS: u32 = 6;
+        const MAX_DELAY_SECS: u64 = 60;
+        let mut attempt: u32 = 0;
 
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            error!("Stealth {method} HTTP {status}: {text}");
-            return Err(format!("{method} HTTP {status}: {text}"));
+        loop {
+            attempt += 1;
+
+            let resp = http
+                .post(&url)
+                .headers(Self::stealth_headers(creds))
+                .form(&all_fields)
+                .send()
+                .await
+                .map_err(|e| format!("HTTP error: {e}"))?;
+
+            let status = resp.status();
+
+            if status.as_u16() == 429 {
+                let retry_after = resp
+                    .headers()
+                    .get(RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.trim().parse::<u64>().ok());
+                let _ = resp.text().await;
+                if attempt >= MAX_ATTEMPTS {
+                    error!(
+                        "Stealth {method} HTTP 429 after {attempt} attempts, giving up"
+                    );
+                    return Err(format!("{method} HTTP 429: rate limited"));
+                }
+                let delay = retry_after
+                    .unwrap_or_else(|| {
+                        // Exponential backoff: 1, 2, 4, 8, 16, … seconds.
+                        1u64 << (attempt - 1).min(6)
+                    })
+                    .min(MAX_DELAY_SECS);
+                warn!(
+                    "Stealth {method} HTTP 429 (attempt {attempt}/{MAX_ATTEMPTS}), \
+                     backing off {delay}s"
+                );
+                tokio::time::sleep(Duration::from_secs(delay)).await;
+                continue;
+            }
+
+            if !status.is_success() {
+                let text = resp.text().await.unwrap_or_default();
+                error!("Stealth {method} HTTP {status}: {text}");
+                return Err(format!("{method} HTTP {status}: {text}"));
+            }
+
+            let text = resp
+                .text()
+                .await
+                .map_err(|e| format!("Read error: {e}"))?;
+            debug!("Stealth {method} response: {}", &text[..text.len().min(500)]);
+
+            let body: RawResponse<T> = serde_json::from_str(&text)
+                .map_err(|e| format!("Parse error (status {status}): {e}"))?;
+
+            if !body.ok {
+                let err = body.error.unwrap_or_else(|| "unknown".into());
+                // Slack can also signal rate limiting via an API-level error
+                // with ok=false and error="ratelimited" (status 200).
+                if err == "ratelimited" && attempt < MAX_ATTEMPTS {
+                    let delay = (1u64 << (attempt - 1).min(6)).min(MAX_DELAY_SECS);
+                    warn!(
+                        "Stealth {method} ratelimited (attempt {attempt}/{MAX_ATTEMPTS}), \
+                         backing off {delay}s"
+                    );
+                    tokio::time::sleep(Duration::from_secs(delay)).await;
+                    continue;
+                }
+                error!("Slack API {method} error: {err}");
+                return Err(format!("{method} - {err}"));
+            }
+
+            return body
+                .data
+                .ok_or_else(|| format!("{method}: empty response"));
         }
-
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| format!("Read error: {e}"))?;
-        debug!("Stealth {method} response: {}", &text[..text.len().min(500)]);
-
-        let body: RawResponse<T> =
-            serde_json::from_str(&text).map_err(|e| format!("Parse error (status {status}): {e}"))?;
-
-        if !body.ok {
-            let err = body.error.unwrap_or_else(|| "unknown".into());
-            error!("Slack API {method} error: {err}");
-            return Err(format!("{method} - {err}"));
-        }
-
-        body.data.ok_or_else(|| format!("{method}: empty response"))
     }
 
     // ── Auth ──

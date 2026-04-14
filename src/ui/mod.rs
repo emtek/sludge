@@ -5,5 +5,5 @@ pub mod image_viewer;
 pub mod login;
 pub mod message_input;
 pub mod message_view;
+pub mod preferences;
 pub mod send_button;
-pub mod thread_panel;

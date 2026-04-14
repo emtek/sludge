@@ -10,6 +10,64 @@ use crate::slack::client::Client;
 use crate::slack::socket::SlackEvent;
 use crate::ui::app::build_app;
 
+/// Try to auto-login with saved credentials; fall back to the login form.
+/// Used on initial startup and after "Clear cache" to replay the first-launch flow.
+pub fn launch_or_login(app: &Application, rt: tokio::runtime::Handle, db: Arc<Database>) {
+    let db_saved = db.clone();
+    let rt_saved = rt.clone();
+    let app_clone = app.clone();
+    gtk4::glib::spawn_future_local(async move {
+        let saved = rt_saved
+            .spawn(async move { db_saved.load_credentials().await })
+            .await
+            .unwrap();
+        let Some(creds) = saved else {
+            show_login(&app_clone, rt_saved, db);
+            return;
+        };
+
+        let creds_clone = creds.clone();
+        let rt2 = rt_saved.clone();
+        let result = rt2
+            .spawn(async move {
+                let xoxc = creds_clone.xoxc_token.unwrap_or_default();
+                let xoxd = creds_clone.xoxd_cookie.unwrap_or_default();
+                if xoxc.is_empty() || xoxd.is_empty() {
+                    return Err::<(crate::slack::client::Client, crate::slack::client::AuthInfo), String>(
+                        "incomplete credentials".into()
+                    );
+                }
+                let mut client = crate::slack::client::Client::new(xoxc, xoxd, creds_clone.workspace_url);
+                let info = client.auth_test().await?;
+                Ok((client, info))
+            })
+            .await
+            .unwrap();
+
+        match result {
+            Ok((client, info)) => {
+                let (event_tx, event_rx) = mpsc::unbounded_channel::<SlackEvent>();
+                let (presence_tx, presence_rx) = mpsc::unbounded_channel::<Vec<String>>();
+                let (http, xoxc, xoxd, ws_url) = client.rtm_params();
+                rt_saved.spawn(crate::slack::socket::run_rtm_stealth(
+                    http, xoxc, xoxd, ws_url, event_tx, presence_rx,
+                ));
+                build_app(&app_clone, client, rt_saved, event_rx, db, info.user_id, presence_tx, None, false);
+            }
+            Err(e) => {
+                tracing::warn!("Auto-login failed: {e}");
+                let _ = rt_saved
+                    .spawn({
+                        let db = db.clone();
+                        async move { db.clear_credentials().await }
+                    })
+                    .await;
+                show_login(&app_clone, rt_saved, db);
+            }
+        }
+    });
+}
+
 pub fn show_login(app: &Application, rt: tokio::runtime::Handle, db: Arc<Database>) {
     let window = ApplicationWindow::builder()
         .application(app)
@@ -163,7 +221,7 @@ pub fn show_login(app: &Application, rt: tokio::runtime::Handle, db: Arc<Databas
                         http, xoxc, xoxd, ws_url, event_tx, presence_rx,
                     ));
 
-                    build_app(&app_ref, client, rt, event_rx, db, info.user_id, presence_tx, None);
+                    build_app(&app_ref, client, rt, event_rx, db, info.user_id, presence_tx, None, false);
                     window_ref.close();
                 }
                 Err(e) => {

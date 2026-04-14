@@ -16,7 +16,6 @@ use crate::slack::socket::SlackEvent;
 use crate::ui::channel_sidebar::ChannelSidebar;
 use crate::ui::message_input::MessageInput;
 use crate::ui::message_view::MessageView;
-use crate::ui::thread_panel::ThreadPanel;
 
 /// Returns true if the error string indicates an authentication/authorization
 /// failure that means the current token is unusable.
@@ -162,6 +161,7 @@ pub fn build_app(
     user_id: String,
     presence_tx: mpsc::UnboundedSender<Vec<String>>,
     startup_action: Option<StartupAction>,
+    start_hidden: bool,
 ) {
     let window = ApplicationWindow::builder()
         .application(app)
@@ -169,6 +169,16 @@ pub fn build_app(
         .default_width(1200)
         .default_height(800)
         .build();
+
+    // Load user preferences up front; these drive the activity filter window
+    // (sidebar) and the history backfill depth. Persisted via the preferences
+    // dialog.
+    let initial_prefs = {
+        let db = db.clone();
+        rt.block_on(async move { db.load_preferences().await })
+    };
+    let history_months_state: Rc<std::cell::Cell<u32>> =
+        Rc::new(std::cell::Cell::new(initial_prefs.history_months));
 
     // ── Layout ──
     // [ Sidebar | Message area ]
@@ -439,19 +449,253 @@ pub fn build_app(
     profile_btn.set_popover(Some(&popover));
     profile_btn.add_css_class("flat");
 
+    // ── Hamburger menu: preferences / shortcuts / log out ──
+    let menu_popover = gtk::Popover::new();
+    let menu_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    menu_box.set_margin_top(6);
+    menu_box.set_margin_bottom(6);
+    menu_box.set_margin_start(6);
+    menu_box.set_margin_end(6);
+    menu_box.set_width_request(180);
+
+    fn flat_menu_button(label: &str, icon: &str) -> gtk::Button {
+        let btn = gtk::Button::new();
+        let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        hbox.set_margin_start(4);
+        hbox.set_margin_end(4);
+        let img = gtk::Image::from_icon_name(icon);
+        let lbl = Label::new(Some(label));
+        lbl.set_halign(gtk::Align::Start);
+        lbl.set_hexpand(true);
+        hbox.append(&img);
+        hbox.append(&lbl);
+        btn.set_child(Some(&hbox));
+        btn.add_css_class("flat");
+        btn
+    }
+
+    let preferences_btn = flat_menu_button("Preferences…", "preferences-system-symbolic");
+    let shortcuts_btn = flat_menu_button("Keyboard shortcuts", "preferences-desktop-keyboard-symbolic");
+    let logout_btn = flat_menu_button("Log out", "system-log-out-symbolic");
+    menu_box.append(&preferences_btn);
+    menu_box.append(&shortcuts_btn);
+    let sep = gtk::Separator::new(gtk::Orientation::Horizontal);
+    sep.set_margin_top(2);
+    sep.set_margin_bottom(2);
+    menu_box.append(&sep);
+    menu_box.append(&logout_btn);
+
+    menu_popover.set_child(Some(&menu_box));
+    let menu_btn = gtk::MenuButton::new();
+    menu_btn.set_icon_name("open-menu-symbolic");
+    menu_btn.set_popover(Some(&menu_popover));
+    menu_btn.add_css_class("flat");
+
+    // pack_end fills right-to-left: hamburger first → rightmost, then profile to its left.
+    header_bar.pack_end(&menu_btn);
     header_bar.pack_end(&profile_btn);
 
+    // Preferences handler is wired up below, after the sidebar is created
+    // (so the on-change callback can update activity-filter visibility live).
+
+    // Keyboard shortcuts handler
+    {
+        let menu_popover_sc = menu_popover.clone();
+        let window_sc = window.clone();
+        shortcuts_btn.connect_clicked(move |_| {
+            menu_popover_sc.popdown();
+            let dialog = gtk::Window::builder()
+                .title("Keyboard Shortcuts")
+                .transient_for(&window_sc)
+                .modal(true)
+                .default_width(500)
+                .default_height(520)
+                .build();
+            let scrolled = gtk::ScrolledWindow::new();
+            scrolled.set_vexpand(true);
+            let vbox = gtk::Box::new(gtk::Orientation::Vertical, 12);
+            vbox.set_margin_top(16);
+            vbox.set_margin_bottom(16);
+            vbox.set_margin_start(16);
+            vbox.set_margin_end(16);
+
+            let section = |title: &str, shortcuts: &[(&str, &str)]| -> gtk::Box {
+                let sec = gtk::Box::new(gtk::Orientation::Vertical, 4);
+                let heading = Label::new(Some(title));
+                heading.add_css_class("heading");
+                heading.set_halign(gtk::Align::Start);
+                heading.set_margin_bottom(4);
+                sec.append(&heading);
+                for (keys, desc) in shortcuts {
+                    let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+                    let keys_lbl = Label::new(Some(keys));
+                    keys_lbl.add_css_class("dim-label");
+                    keys_lbl.add_css_class("caption");
+                    keys_lbl.set_halign(gtk::Align::Start);
+                    keys_lbl.set_width_chars(22);
+                    keys_lbl.set_xalign(0.0);
+                    let desc_lbl = Label::new(Some(desc));
+                    desc_lbl.set_halign(gtk::Align::Start);
+                    desc_lbl.set_hexpand(true);
+                    desc_lbl.set_wrap(true);
+                    desc_lbl.set_xalign(0.0);
+                    row.append(&keys_lbl);
+                    row.append(&desc_lbl);
+                    sec.append(&row);
+                }
+                sec
+            };
+
+            vbox.append(&section("Messages", &[
+                ("Up", "Focus the most recent message from the input box"),
+                ("Down", "Move focus from the last message to the input"),
+                ("Right", "Open thread (if any) or start a reply"),
+                ("Left", "Close open thread / clear reply indicator"),
+                (": or ;", "Open emoji reaction picker on selected message"),
+                ("Delete", "Delete the selected own message"),
+            ]));
+            vbox.append(&section("Input", &[
+                ("Enter", "Send message"),
+                ("Shift+Enter", "Insert newline"),
+                ("Ctrl+V", "Paste image from clipboard"),
+                ("@name", "Mention user (fuzzy autocomplete)"),
+                (":shortcode:", "Emoji autocomplete (fuzzy match)"),
+            ]));
+            vbox.append(&section("Navigation", &[
+                ("Tab", "Move focus from sidebar to input"),
+                ("Escape", "Close popovers and reaction picker"),
+            ]));
+
+            scrolled.set_child(Some(&vbox));
+            dialog.set_child(Some(&scrolled));
+            dialog.present();
+        });
+    }
+
+    // Log out handler
+    {
+        let db_lo = db.clone();
+        let rt_lo = rt.clone();
+        let app_lo = app.clone();
+        let window_lo = window.clone();
+        let menu_popover_lo = menu_popover.clone();
+        logout_btn.connect_clicked(move |_| {
+            menu_popover_lo.popdown();
+            let dialog = gtk::Window::builder()
+                .title("Log out?")
+                .transient_for(&window_lo)
+                .modal(true)
+                .default_width(380)
+                .build();
+            let vbox = gtk::Box::new(gtk::Orientation::Vertical, 12);
+            vbox.set_margin_top(16);
+            vbox.set_margin_bottom(16);
+            vbox.set_margin_start(16);
+            vbox.set_margin_end(16);
+            let msg = Label::new(Some(
+                "This will remove your saved credentials and all cached data. You'll need to log in again.",
+            ));
+            msg.set_wrap(true);
+            msg.set_xalign(0.0);
+            vbox.append(&msg);
+            let btn_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            btn_row.set_halign(gtk::Align::End);
+            let cancel = gtk::Button::with_label("Cancel");
+            let confirm = gtk::Button::with_label("Log out");
+            confirm.add_css_class("destructive-action");
+            btn_row.append(&cancel);
+            btn_row.append(&confirm);
+            vbox.append(&btn_row);
+            dialog.set_child(Some(&vbox));
+
+            let dialog_c = dialog.clone();
+            cancel.connect_clicked(move |_| dialog_c.close());
+
+            let db2 = db_lo.clone();
+            let rt2 = rt_lo.clone();
+            let app2 = app_lo.clone();
+            let window2 = window_lo.clone();
+            let dialog2 = dialog.clone();
+            confirm.connect_clicked(move |_| {
+                let db_for_clear = db2.clone();
+                let db_for_login = db2.clone();
+                let rt_for_spawn = rt2.clone();
+                let rt_for_login = rt2.clone();
+                let app3 = app2.clone();
+                let window3 = window2.clone();
+                let dialog3 = dialog2.clone();
+                gtk4::glib::spawn_future_local(async move {
+                    let _ = rt_for_spawn
+                        .spawn(async move {
+                            db_for_clear.clear_cache().await;
+                            db_for_clear.clear_credentials().await;
+                            let img_dir = dirs::data_dir()
+                                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                                .join("sludge")
+                                .join("image_cache");
+                            let _ = tokio::fs::remove_dir_all(&img_dir).await;
+                        })
+                        .await;
+                    dialog3.close();
+                    window3.close();
+                    crate::ui::login::show_login(&app3, rt_for_login, db_for_login);
+                });
+            });
+            dialog.present();
+        });
+    }
+
     // ── Layout ──
-    // [ Sidebar | Messages+Input | ThreadPanel ]
+    // [ Sidebar | Messages+Input ]
     let main_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
 
     let sidebar = Rc::new(ChannelSidebar::new());
+    sidebar.set_activity_weeks(initial_prefs.activity_weeks);
+
+    // Shared preferences state — updated whenever the user changes a value in
+    // the Preferences dialog, so subsequent opens of the dialog show the
+    // current values (not the initial snapshot).
+    let prefs_state: Rc<RefCell<crate::db::Preferences>> =
+        Rc::new(RefCell::new(initial_prefs.clone()));
+
+    // Preferences: opens the window; live-updates the activity filter, and
+    // buffers the new history-length value for the next backfill.
+    {
+        let app_p = app.clone();
+        let window_p = window.clone();
+        let db_p = db.clone();
+        let rt_p = rt.clone();
+        let menu_popover_p = menu_popover.clone();
+        let sidebar_p = sidebar.clone();
+        let history_months_p = history_months_state.clone();
+        let prefs_state_p = prefs_state.clone();
+        preferences_btn.connect_clicked(move |_| {
+            menu_popover_p.popdown();
+            let sidebar_cb = sidebar_p.clone();
+            let history_cb = history_months_p.clone();
+            let prefs_cb = prefs_state_p.clone();
+            let on_changed: crate::ui::preferences::PreferencesCallback =
+                Rc::new(move |prefs: &crate::db::Preferences| {
+                    sidebar_cb.set_activity_weeks(prefs.activity_weeks);
+                    history_cb.set(prefs.history_months);
+                    *prefs_cb.borrow_mut() = prefs.clone();
+                });
+            let current = prefs_state_p.borrow().clone();
+            crate::ui::preferences::show_preferences_window(
+                &app_p,
+                window_p.upcast_ref::<gtk::Window>(),
+                db_p.clone(),
+                rt_p.clone(),
+                current,
+                on_changed,
+            );
+        });
+    }
 
     // Search entries packed into the start of the header bar
     window.set_titlebar(Some(&header_bar));
     let message_view = Rc::new(MessageView::new());
     let message_input = Rc::new(MessageInput::new());
-    let thread_panel = Rc::new(ThreadPanel::new());
 
     let right_pane = gtk::Box::new(gtk::Orientation::Vertical, 0);
     right_pane.set_hexpand(true);
@@ -881,7 +1125,6 @@ pub fn build_app(
                 }
             });
         message_view.set_mention_callback(mention_cb.clone());
-        thread_panel.set_mention_callback(mention_cb);
     }
 
     // ── Reaction callback: add/remove reaction via API ──
@@ -1002,7 +1245,6 @@ pub fn build_app(
                 });
             });
         message_view.set_reaction_callback(reaction_cb.clone());
-        thread_panel.set_reaction_callback(reaction_cb);
     }
 
     // ── Channel action callback (leave, archive, close) ──
@@ -1504,8 +1746,6 @@ pub fn build_app(
                 );
             });
         message_view.set_delete_callback(delete_cb.clone());
-        thread_panel.set_delete_callback(delete_cb);
-        thread_panel.set_self_user_id(&user_id);
     }
 
     // ── Edit message callback ──
@@ -1648,7 +1888,6 @@ pub fn build_app(
                 dialog.present();
             });
         message_view.set_edit_callback(edit_cb.clone());
-        thread_panel.set_edit_callback(edit_cb);
     }
 
     // ── Google Meet call button ──
@@ -2012,140 +2251,6 @@ pub fn build_app(
             crate::ui::autocomplete::record_emoji_used(shortcode);
         });
         message_input.set_on_emoji_picked(on_pick.clone());
-        thread_panel.set_on_emoji_picked(on_pick);
-    }
-
-    // ── Thread panel: close button ──
-    {
-        let tp_close = thread_panel.clone();
-        let state = state.clone();
-        thread_panel.close_button.connect_clicked(move |_| {
-            tp_close.hide();
-            state.borrow_mut().current_thread = None;
-        });
-    }
-
-    // ── Thread panel: send reply ──
-    {
-        let tp_reply = thread_panel.clone();
-        let state = state.clone();
-        let client = client.clone();
-        let rt = rt.clone();
-
-        let do_reply = move || {
-            let text = tp_reply.get_reply_text();
-            let files = tp_reply.take_files();
-            if text.trim().is_empty() && files.is_empty() {
-                return;
-            }
-
-            let (thread_ts, channel_id) = match state.borrow().current_thread.clone() {
-                Some(t) => t,
-                None => return,
-            };
-
-            tp_reply.clear_reply();
-
-            let client = client.clone();
-            let rt2 = rt.clone();
-            let tp = tp_reply.clone();
-            let state2 = state.clone();
-            let client2 = client.clone();
-            let rt3 = rt.clone();
-            gtk4::glib::spawn_future_local(async move {
-                let c = client.clone();
-                let cid = channel_id.clone();
-                let tts = thread_ts.clone();
-                let txt = text.clone();
-                let sent_ts = rt2
-                    .spawn(async move {
-                        // Upload files first
-                        for path in &files {
-                            let filename = path
-                                .file_name()
-                                .map(|n| n.to_string_lossy().to_string())
-                                .unwrap_or_else(|| "file".into());
-                            match tokio::fs::read(path).await {
-                                Ok(bytes) => {
-                                    let comment = if path == files.first().unwrap() && !txt.trim().is_empty() {
-                                        Some(txt.as_str())
-                                    } else {
-                                        None
-                                    };
-                                    if let Err(e) = c.upload_file(&cid, bytes, &filename, comment, Some(&tts)).await {
-                                        tracing::error!("Failed to upload file {filename}: {e}");
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::error!("Failed to read file {}: {e}", path.display());
-                                }
-                            }
-                        }
-                        // If no files, just send a text message and return the ts
-                        if files.is_empty() && !txt.trim().is_empty() {
-                            match c.post_message(&cid, &txt, Some(&tts)).await {
-                                Ok(ts) => Some(ts),
-                                Err(e) => {
-                                    tracing::error!("Failed to send thread reply: {e}");
-                                    None
-                                }
-                            }
-                        } else {
-                            None
-                        }
-                    })
-                    .await
-                    .unwrap_or(None);
-
-                // Optimistically append the sent message so it's visible immediately
-                if let Some(ts) = sent_ts {
-                    state2.borrow_mut().sent_ts.insert(ts.clone());
-                    if !list_has_ts(&tp.list_box, &ts) {
-                        let st = state2.borrow();
-                        let self_uid = st.self_user_id.clone();
-                        let users = st.user_names.clone();
-                        drop(st);
-                        let msg = Message {
-                            msg_type: "message".into(),
-                            user: Some(self_uid),
-                            bot_id: None,
-                            text,
-                            ts,
-                            thread_ts: Some(thread_ts),
-                            channel: Some(channel_id),
-                            attachments: None,
-                            reactions: None,
-                            files: None,
-                        };
-                        tp.append_message(&msg, &users, &client2, &rt3);
-                    }
-                }
-            });
-        };
-
-        let do_reply_btn = do_reply.clone();
-        let tp_btn = thread_panel.clone();
-        tp_btn.send_button.send.connect_clicked(move |_| {
-            do_reply_btn();
-        });
-
-        let key_controller = gtk::EventControllerKey::new();
-        let do_reply_key = do_reply.clone();
-        let tv = thread_panel.text_view.clone();
-        key_controller.connect_key_pressed(move |_, key, _, modifier| {
-            if key == gtk4::gdk::Key::Return || key == gtk4::gdk::Key::KP_Enter {
-                if modifier.contains(gtk4::gdk::ModifierType::SHIFT_MASK)
-                    || modifier.contains(gtk4::gdk::ModifierType::CONTROL_MASK)
-                {
-                    tv.buffer().insert_at_cursor("\n");
-                    return gtk4::glib::Propagation::Stop;
-                }
-                do_reply_key();
-                return gtk4::glib::Propagation::Stop;
-            }
-            gtk4::glib::Propagation::Proceed
-        });
-        thread_panel.text_view.add_controller(key_controller);
     }
 
     // ── Load initial data from cache, then select last channel ──
@@ -2157,7 +2262,6 @@ pub fn build_app(
         let db = db.clone();
         let message_view = message_view.clone();
         let message_input = message_input.clone();
-        let thread_panel = thread_panel.clone();
         let presence_tx = presence_tx.clone();
         let app_logout = app.clone();
         let window_logout = window.clone();
@@ -2244,7 +2348,6 @@ pub fn build_app(
                 sidebar.set_user_names(&names);
                 sidebar.set_all_status(status_emoji_map, status_text_map);
                 message_input.set_mention_users(&names);
-                thread_panel.set_mention_users(&names);
                 state.borrow_mut().user_names = Rc::new(names);
             }
 
@@ -2380,12 +2483,13 @@ pub fn build_app(
                     sidebar.set_user_names(&names);
                     sidebar.set_all_status(status_emoji_map, status_text_map);
                     message_input.set_mention_users(&names);
-                    thread_panel.set_mention_users(&names);
                     state.borrow_mut().user_names = Rc::new(names);
 
-                    // Rebuild sidebar now that user names are available for DMs
-                    if have_cache {
-                        let chs = state.borrow().channels.clone();
+                    // Rebuild the sidebar so DM rows pick up user display names.
+                    // On a fresh launch channels were rendered before user names
+                    // arrived; rebuild unconditionally whenever we just loaded users.
+                    let chs = state.borrow().channels.clone();
+                    if !chs.is_empty() {
                         sidebar.set_channels(&chs);
                         if let Some(ref cid) = last_channel {
                             sidebar.select_channel_by_id(cid);
@@ -2408,7 +2512,6 @@ pub fn build_app(
                     tracing::info!("Loaded {} subteam names", subteams.len());
                     let names = Rc::new(subteams);
                     message_view.set_subteam_names(names.clone());
-                    thread_panel.set_subteam_names(names.clone());
                     state.borrow_mut().subteam_names = names;
                 } else if let Some(Err(e)) = subteam_result {
                     tracing::error!("Failed to load usergroups: {e}");
@@ -2455,14 +2558,28 @@ pub fn build_app(
                 mv.set_search_results(&results, &users, &channels, &client, &rt);
             }
 
-            // ── Background backfill: fetch up to 1 year of history for all channels ──
+            // ── Background backfill ──
+            // First pass: a fast initial sweep (one 10-message page per channel,
+            // reverse-ordered) so the sidebar picks up real activity quickly.
+            // Second pass: the full history backfill for search indexing.
             {
                 let channel_ids: Vec<String> = state.borrow().channels.iter().map(|c| c.id.clone()).collect();
                 let client = client.clone();
                 let db = db.clone();
                 let rt = rt.clone();
+                let history_months = history_months_state.get();
+                let (bf_tx, mut bf_rx) = mpsc::unbounded_channel::<(String, String)>();
                 rt.spawn(async move {
-                    backfill_history(client, db, channel_ids).await;
+                    // Quick pass first.
+                    backfill_history(client.clone(), db.clone(), channel_ids.clone(), bf_tx.clone(), true, history_months).await;
+                    // Then full history.
+                    backfill_history(client, db, channel_ids, bf_tx, false, history_months).await;
+                });
+                let sidebar_bf = sidebar.clone();
+                gtk4::glib::spawn_future_local(async move {
+                    while let Some((cid, ts)) = bf_rx.recv().await {
+                        sidebar_bf.update_activity(&cid, &ts);
+                    }
                 });
             }
 
@@ -2474,7 +2591,6 @@ pub fn build_app(
                 let rt = rt.clone();
                 let sidebar = sidebar.clone();
                 let message_input = message_input.clone();
-                let thread_panel = thread_panel.clone();
                 gtk4::glib::spawn_future_local(async move {
                     loop {
                         gtk4::glib::timeout_future(std::time::Duration::from_secs(30 * 60)).await;
@@ -2517,7 +2633,6 @@ pub fn build_app(
                         sidebar.set_user_names(&names);
                         sidebar.set_all_status(status_emoji_map, status_text_map);
                         message_input.set_mention_users(&names);
-                        thread_panel.set_mention_users(&names);
                         state.borrow_mut().user_names = Rc::new(names);
                         tracing::info!("Periodic user refresh complete: {} users", users.len());
                     }
@@ -2531,7 +2646,6 @@ pub fn build_app(
         let on_select = {
             let state = state.clone();
             let message_view = message_view.clone();
-            let thread_panel = thread_panel.clone();
             let sidebar = sidebar.clone();
             let rt = rt.clone();
             let client = client.clone();
@@ -2556,7 +2670,6 @@ pub fn build_app(
                 rt2.spawn(async move { db2.save_last_channel(&cid).await });
 
                 // Close thread panel when switching channels
-                thread_panel.hide();
                 {
                     let mut st = state.borrow_mut();
                     st.current_channel = Some(channel_id.clone());
@@ -2594,7 +2707,6 @@ pub fn build_app(
 
                 // Backfill from API since last cached message, then load from DB
                 let mv = message_view.clone();
-                let tp = thread_panel.clone();
                 let state2 = state.clone();
                 let client_fetch = client.clone();
                 let client_img = client.clone();
@@ -2779,7 +2891,6 @@ pub fn build_app(
         let sidebar = sidebar.clone();
         let state = state.clone();
         let message_view = message_view.clone();
-        let thread_panel = thread_panel.clone();
         let window = window.clone();
         let client = client.clone();
         let rt = rt.clone();
@@ -2998,7 +3109,6 @@ pub fn build_app(
         };
 
         message_view.list_box.add_controller(open_reaction_picker(&message_view.list_box));
-        thread_panel.list_box.add_controller(open_reaction_picker(&thread_panel.list_box));
     }
 
     // ── Arrow keys: Right starts reply (or opens thread), Left clears reply ──
@@ -3492,6 +3602,7 @@ pub fn build_app(
                                         .map(|v| v.len())
                                         .unwrap_or(0);
                                     mv.list_box.insert(&row, parent_idx + 1 + existing_count as i32);
+                                    mv.scroll_row_to_bottom(&row);
                                     mv.expanded_threads
                                         .borrow_mut()
                                         .entry(tts.clone())
@@ -3568,7 +3679,6 @@ pub fn build_app(
     {
         let state = state.clone();
         let message_view = message_view.clone();
-        let thread_panel = thread_panel.clone();
         let sidebar = sidebar.clone();
         let client_rt = client.clone();
         let rt_rt = rt.clone();
@@ -3616,6 +3726,51 @@ pub fn build_app(
                             reactions: None,
                             files,
                         };
+
+                        // If this channel isn't in our sidebar, fetch its info
+                        // and add it. Covers the case where users.conversations
+                        // was fetched earlier and we've since been added to a
+                        // channel without receiving a ChannelJoined event.
+                        {
+                            let known = state.borrow().channels.iter().any(|c| c.id == channel);
+                            if !known {
+                                let client2 = client_rt.clone();
+                                let cid = channel.clone();
+                                let sidebar2 = sidebar.clone();
+                                let state2 = state.clone();
+                                let presence_tx2 = presence_tx.clone();
+                                let rt2 = rt_rt.clone();
+                                let rt3 = rt_rt.clone();
+                                let db3 = db.clone();
+                                let new_ts = msg.ts.clone();
+                                gtk4::glib::spawn_future_local(async move {
+                                    let (tx, rx) = tokio::sync::oneshot::channel();
+                                    rt2.spawn(async move {
+                                        let result = client2.conversations_info(&cid).await;
+                                        let _ = tx.send(result);
+                                    });
+                                    if let Ok(Ok(ch)) = rx.await {
+                                        tracing::info!(
+                                            "Auto-added channel from message event: {} ({})",
+                                            ch.name.as_deref().unwrap_or("?"), ch.id
+                                        );
+                                        if sidebar2.add_channel(&ch) {
+                                            if ch.is_im == Some(true) {
+                                                if let Some(uid) = &ch.user {
+                                                    let _ = presence_tx2.send(vec![uid.clone()]);
+                                                }
+                                            }
+                                            sidebar2.update_activity(&ch.id, &new_ts);
+                                            state2.borrow_mut().channels.push(ch.clone());
+                                            let channels = state2.borrow().channels.clone();
+                                            rt3.spawn(async move {
+                                                let _ = db3.save_channels(&channels).await;
+                                            });
+                                        }
+                                    }
+                                });
+                            }
+                        }
 
                         // Skip messages we already appended optimistically
                         if state.borrow_mut().sent_ts.remove(&msg.ts) {
@@ -3718,6 +3873,7 @@ pub fn build_app(
                                             &row,
                                             parent_idx + 1 + existing_count as i32,
                                         );
+                                        message_view.scroll_row_to_bottom(&row);
                                         message_view
                                             .expanded_threads
                                             .borrow_mut()
@@ -3882,19 +4038,6 @@ pub fn build_app(
                             }
                         }
 
-                        // Remove from thread panel if visible
-                        if let Some((_tts, tcid)) = &state.borrow().current_thread {
-                            if *tcid == channel {
-                                let mut idx = 0;
-                                while let Some(row) = thread_panel.list_box.row_at_index(idx) {
-                                    if row.widget_name() == deleted_ts {
-                                        thread_panel.list_box.remove(&row);
-                                        break;
-                                    }
-                                    idx += 1;
-                                }
-                            }
-                        }
                     }
                     SlackEvent::PresenceChange { user, presence } => {
                         tracing::debug!("Presence change: {user} -> {presence}");
@@ -4059,7 +4202,6 @@ pub fn build_app(
                         let reaction2 = reaction.clone();
                         let user2 = user.clone();
                         let message_view2 = message_view.clone();
-                        let thread_panel2 = thread_panel.clone();
                         let state2 = state.clone();
 
                         // Update DB and refresh UI
@@ -4074,7 +4216,6 @@ pub fn build_app(
                             };
                             if is_current {
                                 message_view2.update_reactions(&message_ts, &reactions, &users);
-                                thread_panel2.update_reactions(&message_ts, &reactions, &users);
                             }
                         }
                     }
@@ -4189,7 +4330,9 @@ pub fn build_app(
     // Apply CSS
     load_css();
 
-    window.present();
+    if !start_hidden {
+        window.present();
+    }
 }
 
 /// Check if a ListBox already contains a row with the given widget name (ts).
@@ -4447,19 +4590,38 @@ fn load_css() {
     );
 }
 
-/// Background task: fetch up to 1 year of message history for all channels
-/// and index them for full-text search. Backs off exponentially on rate limits.
-async fn backfill_history(client: Client, db: Arc<Database>, channel_ids: Vec<String>) {
+/// Background task: fetch message history for channels and index for full-text
+/// search. Backs off exponentially on rate limits.
+///
+/// When `initial_only` is true, fetches a single 10-message page per channel —
+/// just enough to surface the newest activity and order the sidebar. The full
+/// `history_months`-deep backfill runs separately (or on a later launch).
+async fn backfill_history(
+    client: Client,
+    db: Arc<Database>,
+    channel_ids: Vec<String>,
+    activity_tx: mpsc::UnboundedSender<(String, String)>,
+    initial_only: bool,
+    history_months: u32,
+) {
     use std::time::Duration;
 
-    let cutoff = (chrono::Utc::now() - chrono::Duration::days(30)).timestamp();
+    // Approximate a month as 30 days — the exact boundary doesn't matter for a
+    // backfill cutoff; users pick by rough depth.
+    let history_days = (history_months.max(1) as i64) * 30;
+    let cutoff = (chrono::Utc::now() - chrono::Duration::days(history_days)).timestamp();
     let oldest = format!("{cutoff}.000000");
-    let page_size = 200u32;
+    let page_size: u32 = if initial_only { 10 } else { 200 };
     let mut backoff = Duration::from_secs(1);
     let max_backoff = Duration::from_secs(300);
     let recheck_days = 3;
 
-    // Check which channels already have indexed history reaching the 30-day cutoff
+    // Process channels in reverse (Slack's conversations.list tends to return
+    // older channels first; reversing puts the newest/most recently-joined
+    // channels ahead in the backfill queue).
+    let channel_ids: Vec<String> = channel_ids.into_iter().rev().collect();
+
+    // Check which channels already have indexed history reaching the configured cutoff
     let channel_meta = db.load_all_channel_meta().await;
     let now = chrono::Utc::now();
     let channels_to_backfill: Vec<&String> = channel_ids
@@ -4504,6 +4666,7 @@ async fn backfill_history(client: Client, db: Arc<Database>, channel_ids: Vec<St
         // Start from the oldest already-indexed message so we don't re-fetch
         let mut latest: Option<String> = db.oldest_indexed_ts(channel_id).await;
         let mut total = 0u32;
+        let mut activity_reported = false;
 
         loop {
             let result = client
@@ -4527,6 +4690,16 @@ async fn backfill_history(client: Client, db: Arc<Database>, channel_ids: Vec<St
 
                     total += messages.len() as u32;
 
+                    // Messages are newest-first; report the channel's real latest
+                    // activity once (on the first page) so the sidebar re-sorts.
+                    if !activity_reported {
+                        if let Some(newest_msg) = messages.first() {
+                            db.update_channel_activity(channel_id, &newest_msg.ts).await;
+                            let _ = activity_tx.send((channel_id.to_string(), newest_msg.ts.clone()));
+                            activity_reported = true;
+                        }
+                    }
+
                     // The oldest message in this batch becomes the next page's `latest`
                     if let Some(oldest_msg) = messages.last() {
                         latest = Some(oldest_msg.ts.clone());
@@ -4537,6 +4710,13 @@ async fn backfill_history(client: Client, db: Arc<Database>, channel_ids: Vec<St
 
                     if !has_more {
                         db.mark_backfill_checked(channel_id).await;
+                        break;
+                    }
+
+                    // Initial-only mode: stop after one page per channel so the
+                    // sidebar reflects real activity quickly without waiting for
+                    // the full history backfill.
+                    if initial_only {
                         break;
                     }
 

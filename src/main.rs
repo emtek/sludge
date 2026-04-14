@@ -13,18 +13,25 @@ use db::Database;
 use slack::socket::SlackEvent;
 use ui::app::StartupAction;
 
-fn parse_startup_action() -> Option<StartupAction> {
+struct StartupFlags {
+    action: Option<StartupAction>,
+    hidden: bool,
+}
+
+fn parse_startup_flags() -> StartupFlags {
     let args: Vec<String> = std::env::args().collect();
+    let mut action = None;
+    let mut hidden = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--open" if i + 1 < args.len() => {
                 let val = &args[i + 1];
                 if let Some(channel_id) = val.strip_prefix("ch:") {
-                    return Some(StartupAction::OpenChannel(channel_id.to_string()));
+                    action = Some(StartupAction::OpenChannel(channel_id.to_string()));
                 } else if let Some(rest) = val.strip_prefix("msg:") {
                     if let Some((channel_id, ts)) = rest.split_once(':') {
-                        return Some(StartupAction::OpenMessage {
+                        action = Some(StartupAction::OpenMessage {
                             channel_id: channel_id.to_string(),
                             message_ts: ts.to_string(),
                         });
@@ -33,12 +40,17 @@ fn parse_startup_action() -> Option<StartupAction> {
                 i += 2;
             }
             "--search" if i + 1 < args.len() => {
-                return Some(StartupAction::Search(args[i + 1].clone()));
+                action = Some(StartupAction::Search(args[i + 1].clone()));
+                i += 2;
+            }
+            "--hidden" => {
+                hidden = true;
+                i += 1;
             }
             _ => i += 1,
         }
     }
-    None
+    StartupFlags { action, hidden }
 }
 
 fn main() {
@@ -60,7 +72,7 @@ fn main() {
         gtk4::glib::ControlFlow::Continue
     });
 
-    let startup_action = parse_startup_action();
+    let startup_flags = parse_startup_flags();
 
     // Handle command-line for single-instance support: first launch calls activate(),
     // subsequent launches navigate via the existing "navigate" action.
@@ -69,7 +81,11 @@ fn main() {
             // First launch — trigger full UI setup via activate
             app.activate();
         } else {
-            // Subsequent launch — parse args and navigate in the running instance
+            // Subsequent launch — present the existing window and optionally
+            // navigate to a specific channel/message.
+            if let Some(window) = app.windows().first() {
+                window.present();
+            }
             let args: Vec<String> = cmdline
                 .arguments()
                 .iter()
@@ -124,7 +140,8 @@ fn main() {
 
         let rt = rt_handle.clone();
         let app = app.clone();
-        let startup_action = startup_action.clone();
+        let startup_action = startup_flags.action.clone();
+        let start_hidden = startup_flags.hidden;
 
         // Hold the application alive synchronously before spawning the async block;
         // the guard is moved into the future and dropped after a window exists.
@@ -201,7 +218,7 @@ fn main() {
                             http, xoxc, xoxd, ws_url, event_tx, presence_rx,
                         ));
 
-                        ui::app::build_app(&app, client, rt, event_rx, db, info.user_id, presence_tx, startup_action.clone());
+                        ui::app::build_app(&app, client, rt, event_rx, db, info.user_id, presence_tx, startup_action.clone(), start_hidden);
                     }
                     Err(e) => {
                         tracing::warn!("Saved credentials expired: {e}");

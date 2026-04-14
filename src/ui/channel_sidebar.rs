@@ -66,6 +66,9 @@ pub struct ChannelSidebar {
     create_group_callback: Rc<RefCell<Option<CreateGroupCallback>>>,
     /// Callback for the "create channel" button.
     create_channel_callback: Rc<RefCell<Option<CreateChannelCallback>>>,
+    /// Number of weeks back to consider a channel/DM "recent" for sidebar filtering.
+    /// Shared so the live-filter closure picks up changes from `set_activity_weeks`.
+    activity_weeks: Rc<RefCell<u32>>,
 }
 
 impl ChannelSidebar {
@@ -199,6 +202,7 @@ impl ChannelSidebar {
         let show_online_only: Rc<RefCell<bool>> = Rc::new(RefCell::new(true));
         let action_callback: Rc<RefCell<Option<ChannelActionCallback>>> =
             Rc::new(RefCell::new(None));
+        let activity_weeks: Rc<RefCell<u32>> = Rc::new(RefCell::new(2));
 
         // Deselect other lists when one is selected
         {
@@ -232,6 +236,7 @@ impl ChannelSidebar {
         let presence_state_filter = presence_state.clone();
         let show_online_filter = show_online_only.clone();
         let activity_filter = activity.clone();
+        let activity_weeks_filter = activity_weeks.clone();
         let scrolled_filter = scrolled.clone();
         search_entry.connect_search_changed(move |entry| {
             let query = entry.text().to_string().to_lowercase();
@@ -240,14 +245,16 @@ impl ChannelSidebar {
             let grs = groups_clone.borrow();
             let names = user_names_clone.borrow();
             let act = activity_filter.borrow();
-            Self::filter_list(&ch_list_clone, &chs, &query, &names, &act);
+            let weeks = *activity_weeks_filter.borrow();
+            Self::filter_list(&ch_list_clone, &chs, &query, &names, &act, weeks);
             Self::filter_dm_list(
                 &dm_list_clone, &dms, &query, &names,
                 &presence_state_filter.borrow(),
                 *show_online_filter.borrow(),
                 &act,
+                weeks,
             );
-            Self::filter_list(&gr_list_clone, &grs, &query, &names, &act);
+            Self::filter_list(&gr_list_clone, &grs, &query, &names, &act, weeks);
 
             if query.is_empty() {
                 // Restore activity-based sort (most recent first, then alphabetical)
@@ -343,6 +350,7 @@ impl ChannelSidebar {
             status_text: Rc::new(RefCell::new(HashMap::new())),
             create_group_callback,
             create_channel_callback,
+            activity_weeks,
         }
     }
 
@@ -356,6 +364,53 @@ impl ChannelSidebar {
 
     pub fn set_create_channel_callback(&self, cb: CreateChannelCallback) {
         *self.create_channel_callback.borrow_mut() = Some(cb);
+    }
+
+    /// Update the "recent activity" window (in weeks) and re-apply row visibility
+    /// to all three sidebar lists so the change is reflected immediately.
+    pub fn set_activity_weeks(&self, weeks: u32) {
+        let weeks = weeks.max(1);
+        *self.activity_weeks.borrow_mut() = weeks;
+        let cutoff = Self::activity_cutoff(weeks);
+        let act = self.activity.borrow();
+
+        // Channels + groups: visibility depends only on recency.
+        for list in [&self.channels_list, &self.group_list] {
+            let mut i = 0;
+            while let Some(row) = list.row_at_index(i) {
+                let cid = row.widget_name().to_string();
+                row.set_visible(Self::is_recent(&act, &cid, &cutoff));
+                i += 1;
+            }
+        }
+
+        // DMs: recency AND (optional) online-only filter.
+        let online_only = *self.show_online_only.borrow();
+        let presence = self.presence_state.borrow();
+        let user_map: HashMap<String, String> = self
+            .dms
+            .borrow()
+            .iter()
+            .filter_map(|ch| Some((ch.id.clone(), ch.user.clone()?)))
+            .collect();
+        let mut i = 0;
+        while let Some(row) = self.dm_list.row_at_index(i) {
+            let cid = row.widget_name().to_string();
+            let recent = Self::is_recent(&act, &cid, &cutoff);
+            let visible = if !recent {
+                false
+            } else if online_only {
+                user_map
+                    .get(&cid)
+                    .and_then(|uid| presence.get(uid))
+                    .copied()
+                    .unwrap_or(false)
+            } else {
+                true
+            };
+            row.set_visible(visible);
+            i += 1;
+        }
     }
 
     /// Set the list of user IDs being watched for presence notifications.
@@ -374,7 +429,8 @@ impl ChannelSidebar {
     }
 
     /// Update activity for a single channel (e.g. from a socket message).
-    /// Makes the channel row visible if it was previously hidden due to inactivity.
+    /// Makes the channel row visible if it was previously hidden due to inactivity,
+    /// and re-sorts so the row moves to the top of its list.
     pub fn update_activity(&self, channel_id: &str, ts: &str) {
         self.activity.borrow_mut().insert(channel_id.to_string(), ts.to_string());
 
@@ -384,11 +440,16 @@ impl ChannelSidebar {
             while let Some(row) = list.row_at_index(idx) {
                 if row.widget_name() == channel_id {
                     row.set_visible(true);
-                    return;
+                    break;
                 }
                 idx += 1;
             }
         }
+        // Re-sort: the list's sort_func reads the activity map, so invalidating
+        // moves the freshly-active row to the top.
+        self.channels_list.invalidate_sort();
+        self.dm_list.invalidate_sort();
+        self.group_list.invalidate_sort();
     }
 
     pub fn set_user_names(&self, names: &HashMap<String, String>) {
@@ -402,8 +463,29 @@ impl ChannelSidebar {
             .is_some_and(|n| n.starts_with("mpdm-"))
     }
 
-    /// Format an mpdm channel name by resolving user names from the `mpdm-user1--user2--...-N` pattern.
-    fn group_display_name(channel: &Channel, user_names: &HashMap<String, String>) -> String {
+    /// Build a reverse lookup from normalized (lowercased) user names to canonical
+    /// display names, used by `group_display_name_with_lookup` to resolve mpdm
+    /// slugs without scanning `user_names.values()` on every lookup.
+    fn build_name_lookup(user_names: &HashMap<String, String>) -> HashMap<String, String> {
+        let mut lookup: HashMap<String, String> = HashMap::with_capacity(user_names.len() * 2);
+        for v in user_names.values() {
+            let lower = v.to_lowercase();
+            let dotted = lower.replace(' ', ".");
+            if dotted != lower {
+                lookup.entry(dotted).or_insert_with(|| v.clone());
+            }
+            lookup.entry(lower).or_insert_with(|| v.clone());
+        }
+        lookup
+    }
+
+    /// Format an mpdm channel name using a pre-built name lookup (see
+    /// `build_name_lookup`). Prefer this when resolving many channels in a row,
+    /// e.g. inside sort comparators or batch rebuilds.
+    fn group_display_name_with_lookup(
+        channel: &Channel,
+        name_lookup: &HashMap<String, String>,
+    ) -> String {
         if let Some(name) = &channel.name {
             if let Some(rest) = name.strip_prefix("mpdm-") {
                 // Strip trailing `-N` (the numeric suffix)
@@ -417,39 +499,43 @@ impl ChannelSidebar {
                     rest
                 };
 
-                let parts: Vec<&str> = without_suffix.split("--").collect();
-                let resolved: Vec<String> = parts
-                    .iter()
-                    .map(|part| {
-                        // Try to find a user whose name matches this part
-                        user_names
-                            .values()
-                            .find(|v| {
-                                v.to_lowercase().replace(' ', ".") == part.to_lowercase()
-                                    || v.to_lowercase() == part.to_lowercase()
-                            })
-                            .cloned()
-                            .unwrap_or_else(|| (*part).to_string())
-                    })
-                    .collect();
-
-                return resolved.join(", ");
+                // Estimate capacity: parts joined by ", ".
+                let mut out = String::with_capacity(without_suffix.len() + 8);
+                let mut first = true;
+                for part in without_suffix.split("--") {
+                    if !first {
+                        out.push_str(", ");
+                    }
+                    first = false;
+                    let key = part.to_lowercase();
+                    match name_lookup.get(&key) {
+                        Some(resolved) => out.push_str(resolved),
+                        None => out.push_str(part),
+                    }
+                }
+                return out;
             }
         }
         channel_display_name(channel)
     }
 
-    /// Returns the 2-week activity cutoff as a Slack-style timestamp string.
-    fn activity_cutoff() -> String {
-        let two_weeks_ago = std::time::SystemTime::now()
+    /// Format an mpdm channel name by resolving user names from the `mpdm-user1--user2--...-N` pattern.
+    fn group_display_name(channel: &Channel, user_names: &HashMap<String, String>) -> String {
+        let lookup = Self::build_name_lookup(user_names);
+        Self::group_display_name_with_lookup(channel, &lookup)
+    }
+
+    /// Returns the activity cutoff (`weeks` weeks ago) as a Slack-style timestamp string.
+    fn activity_cutoff(weeks: u32) -> String {
+        let secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0)
-            .saturating_sub(14 * 24 * 60 * 60);
-        format!("{two_weeks_ago}")
+            .saturating_sub((weeks as u64) * 7 * 24 * 60 * 60);
+        format!("{secs}")
     }
 
-    /// Whether a channel has recent activity (within 2 weeks).
+    /// Whether a channel has recent activity (within the configured window).
     fn is_recent(activity: &HashMap<String, String>, id: &str, cutoff: &str) -> bool {
         match activity.get(id) {
             Some(ts) => ts.as_str() >= cutoff,
@@ -461,7 +547,7 @@ impl ChannelSidebar {
         let names = self.user_names.borrow();
 
         let act = self.activity.borrow();
-        let cutoff = Self::activity_cutoff();
+        let cutoff = Self::activity_cutoff(*self.activity_weeks.borrow());
 
         let mut ch_list: Vec<Channel> = Vec::new();
         let mut dm_list: Vec<Channel> = Vec::new();
@@ -480,36 +566,42 @@ impl ChannelSidebar {
             }
         }
 
-        // Sort by last activity (most recent first), then alphabetical as tiebreaker
-        let activity_sort = |a_id: &str, b_id: &str, a_name: &str, b_name: &str| -> std::cmp::Ordering {
-            let a_ts = act.get(a_id).map(|s| s.as_str()).unwrap_or("0");
-            let b_ts = act.get(b_id).map(|s| s.as_str()).unwrap_or("0");
+        // Precompute a lowercased display name per channel once, up front.
+        // This both feeds the alphabetical tiebreaker inside `sort_by` (avoiding
+        // O(N log N) re-computation) and serves as the persisted `display_names`
+        // search index below.
+        let name_lookup = Self::build_name_lookup(&names);
+        let total = ch_list.len() + dm_list.len() + gr_list.len();
+        let mut dn: HashMap<String, String> = HashMap::with_capacity(total);
+        for ch in &ch_list {
+            dn.insert(ch.id.clone(), channel_display_name(ch).to_lowercase());
+        }
+        for ch in &dm_list {
+            dn.insert(ch.id.clone(), Self::dm_display_name(ch, &names).to_lowercase());
+        }
+        for ch in &gr_list {
+            dn.insert(
+                ch.id.clone(),
+                Self::group_display_name_with_lookup(ch, &name_lookup).to_lowercase(),
+            );
+        }
+
+        // Sort by last activity (most recent first), then alphabetical as tiebreaker.
+        // Name comparisons read from the precomputed `dn` map so comparators
+        // allocate nothing.
+        let empty = String::new();
+        let activity_sort = |a: &Channel, b: &Channel| -> std::cmp::Ordering {
+            let a_ts = act.get(&a.id).map(|s| s.as_str()).unwrap_or("0");
+            let b_ts = act.get(&b.id).map(|s| s.as_str()).unwrap_or("0");
+            let a_name = dn.get(&a.id).unwrap_or(&empty);
+            let b_name = dn.get(&b.id).unwrap_or(&empty);
             // Compare timestamps as strings (Slack ts are epoch-based, lexicographic works)
-            b_ts.cmp(a_ts)
-                .then_with(|| a_name.to_lowercase().cmp(&b_name.to_lowercase()))
+            b_ts.cmp(a_ts).then_with(|| a_name.cmp(b_name))
         };
 
-        ch_list.sort_by(|a, b| {
-            activity_sort(
-                &a.id, &b.id,
-                &channel_display_name(a),
-                &channel_display_name(b),
-            )
-        });
-        dm_list.sort_by(|a, b| {
-            activity_sort(
-                &a.id, &b.id,
-                &Self::dm_display_name(a, &names),
-                &Self::dm_display_name(b, &names),
-            )
-        });
-        gr_list.sort_by(|a, b| {
-            activity_sort(
-                &a.id, &b.id,
-                &Self::group_display_name(a, &names),
-                &Self::group_display_name(b, &names),
-            )
-        });
+        ch_list.sort_by(&activity_sort);
+        dm_list.sort_by(&activity_sort);
+        gr_list.sort_by(&activity_sort);
 
         // Rebuild channels list
         while let Some(child) = self.channels_list.first_child() {
@@ -576,24 +668,8 @@ impl ChannelSidebar {
             new_badges.insert(ch.id.clone(), badge);
         }
 
-        // Build display name lookup for search sorting
-        let mut dn = HashMap::new();
-        for ch in &ch_list {
-            dn.insert(ch.id.clone(), channel_display_name(ch).to_lowercase());
-        }
-        for ch in &dm_list {
-            dn.insert(
-                ch.id.clone(),
-                Self::dm_display_name(ch, &names).to_lowercase(),
-            );
-        }
-        for ch in &gr_list {
-            dn.insert(
-                ch.id.clone(),
-                Self::group_display_name(ch, &names).to_lowercase(),
-            );
-        }
-
+        // `dn` was precomputed above (before sorting); reuse it as the
+        // display-name lookup used by the search sort_func.
         *self.display_names.borrow_mut() = dn;
         *self.badges.borrow_mut() = new_badges;
         *self.presence_icons.borrow_mut() = new_presence_icons;
@@ -603,6 +679,29 @@ impl ChannelSidebar {
         *self.channels.borrow_mut() = ch_list;
         *self.dms.borrow_mut() = dm_list;
         *self.groups.borrow_mut() = gr_list;
+
+        // Install a persistent activity-based sort_func so update_activity
+        // can just call invalidate_sort() and the right order appears.
+        for list in [&self.channels_list, &self.dm_list, &self.group_list] {
+            let act = self.activity.clone();
+            let dn = self.display_names.clone();
+            list.set_sort_func(move |a, b| {
+                let a_id = a.widget_name().to_string();
+                let b_id = b.widget_name().to_string();
+                let activity = act.borrow();
+                let names = dn.borrow();
+                let a_ts = activity.get(&a_id).map(|s| s.as_str()).unwrap_or("0");
+                let b_ts = activity.get(&b_id).map(|s| s.as_str()).unwrap_or("0");
+                let a_name = names.get(&a_id).cloned().unwrap_or_default();
+                let b_name = names.get(&b_id).cloned().unwrap_or_default();
+                match b_ts.cmp(a_ts).then_with(|| a_name.cmp(&b_name)) {
+                    std::cmp::Ordering::Less => gtk::Ordering::Smaller,
+                    std::cmp::Ordering::Equal => gtk::Ordering::Equal,
+                    std::cmp::Ordering::Greater => gtk::Ordering::Larger,
+                }
+            });
+        }
+
         self.search_entry.set_text("");
     }
 
@@ -966,10 +1065,25 @@ impl ChannelSidebar {
         self.update_presence_icon(user_id, active);
     }
 
-    /// Set status emoji and text for multiple users at once (from initial user list load).
+    /// Set status emoji and text for multiple users at once (from initial user
+    /// list load and the periodic 30-minute refresh). After replacing the maps,
+    /// re-renders each user's presence icon so the sidebar reflects the new data.
     pub fn set_all_status(&self, emoji_map: HashMap<String, String>, text_map: HashMap<String, String>) {
         *self.status_emoji.borrow_mut() = emoji_map;
         *self.status_text.borrow_mut() = text_map;
+        // Snapshot user IDs + presence before the loop so we don't hold
+        // borrows across update_presence_icon (which borrows other RefCells).
+        let updates: Vec<(String, bool)> = {
+            let presence = self.presence_state.borrow();
+            self.presence_icons
+                .borrow()
+                .keys()
+                .map(|uid| (uid.clone(), presence.get(uid).copied().unwrap_or(false)))
+                .collect()
+        };
+        for (uid, active) in &updates {
+            self.update_presence_icon(uid, *active);
+        }
     }
 
     /// Set a user's status text.
@@ -990,7 +1104,7 @@ impl ChannelSidebar {
         // Show/hide DM row based on online-only filter + activity recency
         if *self.show_online_only.borrow() {
             if let Some(row) = self.dm_rows.borrow().get(user_id) {
-                let cutoff = Self::activity_cutoff();
+                let cutoff = Self::activity_cutoff(*self.activity_weeks.borrow());
                 let cid = row.widget_name().to_string();
                 let recent = Self::is_recent(&self.activity.borrow(), &cid, &cutoff);
                 row.set_visible(active && recent);
@@ -1115,6 +1229,7 @@ impl ChannelSidebar {
         query: &str,
         user_names: &HashMap<String, String>,
         activity: &HashMap<String, String>,
+        weeks: u32,
     ) {
         let name_map: HashMap<String, String> = channels
             .iter()
@@ -1130,7 +1245,7 @@ impl ChannelSidebar {
             })
             .collect();
 
-        let cutoff = Self::activity_cutoff();
+        let cutoff = Self::activity_cutoff(weeks);
         let mut idx = 0;
         while let Some(row) = list_box.row_at_index(idx) {
             let cid = row.widget_name().to_string();
@@ -1156,6 +1271,7 @@ impl ChannelSidebar {
         presence_state: &HashMap<String, bool>,
         online_only: bool,
         activity: &HashMap<String, String>,
+        weeks: u32,
     ) {
         let name_map: HashMap<String, String> = channels
             .iter()
@@ -1177,7 +1293,7 @@ impl ChannelSidebar {
             .selected_row()
             .map(|r| r.widget_name().to_string());
 
-        let cutoff = Self::activity_cutoff();
+        let cutoff = Self::activity_cutoff(weeks);
         let mut idx = 0;
         while let Some(row) = list_box.row_at_index(idx) {
             let cid = row.widget_name().to_string();

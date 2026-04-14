@@ -287,13 +287,6 @@ impl MessageView {
         }
     }
 
-    /// Invoke the thread open callback programmatically (without user/preview).
-    pub fn open_thread(&self, thread_ts: &str, channel_id: &str) {
-        if let Some(cb) = self.thread_callback.borrow().as_ref() {
-            cb(thread_ts, channel_id, "", "");
-        }
-    }
-
     pub fn set_mention_callback(&self, cb: MentionCallback) {
         *self.mention_callback.borrow_mut() = Some(cb);
     }
@@ -872,11 +865,18 @@ impl MessageView {
             &thread_expand_cb, &self.expanded_threads,
         );
         self.list_box.append(&row);
-        self.scroll_to_bottom_after(&row);
+        // Lightweight scroll: wait for GTK to lay out the new row (next frame),
+        // then snap to bottom. Unlike scroll_to_bottom(), this does not hold a
+        // row reference or start a polling timer — safe to call per-message.
+        let scrolled = self.scrolled.clone();
+        gtk4::glib::timeout_add_local_once(std::time::Duration::from_millis(50), move || {
+            let adj = scrolled.vadjustment();
+            adj.set_value(adj.upper() - adj.page_size());
+        });
     }
 
     pub fn scroll_to_bottom(&self) {
-        // Find the last row and use the reliable row-allocation-aware scroll.
+        // Find the last row and use the reliable row-bounds-aware scroll.
         // Defer via idle so newly-appended rows are picked up.
         let list_box = self.list_box.clone();
         let scrolled = self.scrolled.clone();
@@ -888,21 +888,27 @@ impl MessageView {
                 idx += 1;
             }
             let Some(row) = last else { return };
-            // Poll for allocation (newly-inserted rows take a frame or two).
+            // Poll for layout (newly-inserted rows take a frame or two).
             let scrolled = scrolled.clone();
+            let list_box = list_box.clone();
             let attempts = std::rc::Rc::new(std::cell::Cell::new(0u32));
             gtk4::glib::timeout_add_local(std::time::Duration::from_millis(30), move || {
                 let n = attempts.get();
                 attempts.set(n + 1);
-                let alloc = row.allocation();
-                if alloc.height() < 20 {
+                let Some(bounds) = row.compute_bounds(&list_box) else {
+                    if n >= 40 {
+                        return gtk4::glib::ControlFlow::Break;
+                    }
+                    return gtk4::glib::ControlFlow::Continue;
+                };
+                if (bounds.height() as i32) < 20 {
                     if n >= 40 {
                         return gtk4::glib::ControlFlow::Break;
                     }
                     return gtk4::glib::ControlFlow::Continue;
                 }
                 let adj = scrolled.vadjustment();
-                let row_bottom = (alloc.y() + alloc.height()) as f64;
+                let row_bottom = (bounds.y() + bounds.height()) as f64;
                 let target = (row_bottom - adj.page_size()).max(0.0);
                 adj.set_value(target);
                 if n >= 5 {
@@ -914,40 +920,32 @@ impl MessageView {
         });
     }
 
-    /// Scroll to bottom after a row finishes its layout using double-idle.
-    /// The first idle runs after the current event, the second runs after
-    /// GTK's layout pass has completed.
-    fn scroll_to_bottom_after(&self, _row: &ListBoxRow) {
-        let scrolled = self.scrolled.clone();
-        gtk4::glib::idle_add_local_once(move || {
-            let scrolled = scrolled.clone();
-            gtk4::glib::idle_add_local_once(move || {
-                let adj = scrolled.vadjustment();
-                adj.set_value(adj.upper() - adj.page_size());
-            });
-        });
-    }
-
     /// Scroll so the given row's bottom edge aligns with the viewport's bottom.
-    /// Polls at short intervals until the row is allocated, then snaps.
+    /// Polls at short intervals until the row is laid out, then snaps.
     pub fn scroll_row_to_bottom(&self, row: &ListBoxRow) {
         let scrolled = self.scrolled.clone();
+        let list_box = self.list_box.clone();
         let row = row.clone();
         let attempts = std::rc::Rc::new(std::cell::Cell::new(0u32));
         gtk4::glib::timeout_add_local(std::time::Duration::from_millis(30), move || {
             let n = attempts.get();
             attempts.set(n + 1);
-            let alloc = row.allocation();
+            let Some(bounds) = row.compute_bounds(&list_box) else {
+                if n >= 40 {
+                    return gtk4::glib::ControlFlow::Break;
+                }
+                return gtk4::glib::ControlFlow::Continue;
+            };
             // Real rows are at least ~20px tall. Anything smaller means the row
-            // hasn't been allocated yet (GTK default sentinel is (y=-2, h=4)).
-            if alloc.height() < 20 {
+            // hasn't been laid out yet.
+            if (bounds.height() as i32) < 20 {
                 if n >= 40 {
                     return gtk4::glib::ControlFlow::Break;
                 }
                 return gtk4::glib::ControlFlow::Continue;
             }
             let adj = scrolled.vadjustment();
-            let row_bottom = (alloc.y() + alloc.height()) as f64;
+            let row_bottom = (bounds.y() + bounds.height()) as f64;
             let target = (row_bottom - adj.page_size()).max(0.0);
             adj.set_value(target);
             // Run a few more times to catch any subsequent layout (images, etc.)
@@ -957,14 +955,6 @@ impl MessageView {
                 gtk4::glib::ControlFlow::Continue
             }
         });
-    }
-
-    /// Scroll so the currently-selected message/row sits at the bottom of
-    /// the viewport. No-op if nothing is selected.
-    pub fn scroll_selected_to_bottom(&self) {
-        if let Some(row) = self.list_box.selected_row() {
-            self.scroll_row_to_bottom(&row);
-        }
     }
 
     /// Scroll to a specific message by its ts and briefly highlight it.
