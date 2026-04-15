@@ -70,6 +70,9 @@ pub struct MessageView {
     subteam_names: RefCell<Rc<HashMap<String, String>>>,
     /// Reaction picker cells — take + unparent on clear.
     pub picker_cells: Rc<RefCell<Vec<Rc<RefCell<Option<gtk::Popover>>>>>>,
+    /// Stored textures from image loads — cleared on channel switch to free GPU/pixel memory
+    /// even before GTK finalizes the widget tree.
+    pub stored_textures: Rc<RefCell<Vec<Rc<RefCell<Option<gtk4::gdk::Texture>>>>>>,
     /// Whether a load-more request is in flight (prevents duplicate fetches).
     loading_more: Rc<Cell<bool>>,
     /// Set to false when the server returns fewer messages than requested (no more history).
@@ -212,6 +215,7 @@ impl MessageView {
             search_query: Rc::new(RefCell::new(None)),
             thread_expand_callback: RefCell::new(None),
             expanded_threads: Rc::new(RefCell::new(HashMap::new())),
+            stored_textures: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -423,7 +427,7 @@ impl MessageView {
                 &thread_cb, &mention_cb, &reaction_cb, &delete_cb, &edit_cb,
                 channel_id.as_deref(), &self.thread_counts.borrow(), &self.thread_labels, &self.reaction_boxes, &self_uid,
                 &self.image_generation, &self.picker_cells,
-                &thread_expand_cb, &self.expanded_threads,
+                &thread_expand_cb, &self.expanded_threads, &self.stored_textures,
             );
             self.list_box.prepend(&row);
         }
@@ -484,7 +488,7 @@ impl MessageView {
                 &thread_cb, &mention_cb, &reaction_cb, &delete_cb, &edit_cb,
                 channel_id.as_deref(), &self.thread_counts.borrow(), &self.thread_labels, &self.reaction_boxes, &self_uid,
                 &self.image_generation, &self.picker_cells,
-                &thread_expand_cb, &self.expanded_threads,
+                &thread_expand_cb, &self.expanded_threads, &self.stored_textures,
             );
             self.list_box.append(&row);
         }
@@ -500,15 +504,15 @@ impl MessageView {
     /// Apply a batch of reply counts, refresh thread labels, and promote rows
     /// to thread parents (showing the expander instead of the Reply button).
     /// Typically called right after `set_messages` to populate counts from the DB.
-    pub fn apply_thread_counts(&self, counts: &HashMap<String, usize>) {
+    pub fn apply_thread_counts(&self, counts: HashMap<String, usize>) {
         let mut tc = self.thread_counts.borrow_mut();
-        for (ts, count) in counts {
+        for (ts, count) in &counts {
             tc.insert(ts.clone(), *count);
         }
         drop(tc);
-        let labels = self.thread_labels.borrow().clone();
-        for (ts, count) in counts {
-            if let Some(label) = labels.get(ts) {
+        let labels = self.thread_labels.borrow();
+        for (ts, count) in &counts {
+            if let Some(label) = labels.get(ts.as_str()) {
                 label.set_text(&format!(
                     "{count} {}",
                     if *count == 1 { "reply" } else { "replies" }
@@ -588,6 +592,11 @@ impl MessageView {
 
         // Bump generation so in-flight image downloads from the previous channel bail out
         self.image_generation.set(self.image_generation.get() + 1);
+
+        // Eagerly release Texture pixel data so we don't wait for GTK widget finalization.
+        for tex in self.stored_textures.borrow_mut().drain(..) {
+            tex.borrow_mut().take();
+        }
 
         // Explicitly unparent all tracked emoji choosers — the tree walk may miss
         // popovers because GTK4 set_parent'd popovers don't always appear in
@@ -680,7 +689,7 @@ impl MessageView {
                 &thread_cb, &mention_cb, &reaction_cb, &delete_cb, &edit_cb,
                 channel_id.as_deref(), &self.thread_counts.borrow(), &self.thread_labels, &self.reaction_boxes, &self_uid,
                 &self.image_generation, &self.picker_cells,
-                &thread_expand_cb, &self.expanded_threads,
+                &thread_expand_cb, &self.expanded_threads, &self.stored_textures,
             );
             self.list_box.append(&row);
         }
@@ -721,10 +730,12 @@ impl MessageView {
                     if c.is_im == Some(true) {
                         users
                             .get(c.user.as_deref().unwrap_or(""))
-                            .cloned()
-                            .unwrap_or_else(|| c.name.clone().unwrap_or_default())
+                            .map(|s| s.as_str())
+                            .or(c.name.as_deref())
+                            .unwrap_or_default()
+                            .to_string()
                     } else {
-                        format!("#{}", c.name.clone().unwrap_or_default())
+                        format!("#{}", c.name.as_deref().unwrap_or_default())
                     }
                 })
                 .unwrap_or_default();
@@ -734,7 +745,7 @@ impl MessageView {
                 &thread_cb, &mention_cb, &reaction_cb, &delete_cb, &edit_cb,
                 Some(channel_id), &self.thread_counts.borrow(), &self.thread_labels, &self.reaction_boxes, &self_uid,
                 &self.image_generation, &self.picker_cells,
-                &thread_expand_cb, &self.expanded_threads,
+                &thread_expand_cb, &self.expanded_threads, &self.stored_textures,
             );
 
             // Prepend a channel name label to the row
@@ -800,7 +811,7 @@ impl MessageView {
                 &thread_cb, &mention_cb, &reaction_cb, &delete_cb, &edit_cb,
                 channel_id.as_deref(), &self.thread_counts.borrow(), &self.thread_labels, &self.reaction_boxes, &self_uid,
                 &self.image_generation, &self.picker_cells,
-                &thread_expand_cb, &self.expanded_threads,
+                &thread_expand_cb, &self.expanded_threads, &self.stored_textures,
             );
 
             // Replace the body widget with a highlighted version
@@ -862,7 +873,7 @@ impl MessageView {
             &thread_cb, &mention_cb, &reaction_cb, &delete_cb, &edit_cb,
             channel_id.as_deref(), &self.thread_counts.borrow(), &self.thread_labels, &self.reaction_boxes, &self_uid,
             &self.image_generation, &self.picker_cells,
-            &thread_expand_cb, &self.expanded_threads,
+            &thread_expand_cb, &self.expanded_threads, &self.stored_textures,
         );
         self.list_box.append(&row);
         // Lightweight scroll: wait for GTK to lay out the new row (next frame),
@@ -1019,6 +1030,7 @@ pub fn make_message_row(
     picker_cells: &Rc<RefCell<Vec<Rc<RefCell<Option<gtk::Popover>>>>>>,
     thread_expand_cb: &Option<ThreadExpandCallback>,
     expanded_threads: &Rc<RefCell<HashMap<String, Vec<ListBoxRow>>>>,
+    stored_textures: &Rc<RefCell<Vec<Rc<RefCell<Option<gtk4::gdk::Texture>>>>>>,
 ) -> ListBoxRow {
     let row = ListBoxRow::new();
 
@@ -1036,8 +1048,8 @@ pub fn make_message_row(
         .unwrap_or("unknown");
     let display_name = users
         .get(user_id)
-        .cloned()
-        .unwrap_or_else(|| user_id.to_string());
+        .map(|s| s.as_str())
+        .unwrap_or(user_id);
 
     // Clickable name that opens DM
     let name_btn = gtk::Button::with_label(&display_name);
@@ -1189,7 +1201,7 @@ pub fn make_message_row(
             let reply_thread_ts = msg.thread_ts.clone().unwrap_or_else(|| msg.ts.clone());
             let cid_r = cid.to_string();
             let cb = cb.clone();
-            let user_display = display_name.clone();
+            let user_display = display_name.to_string();
             let preview = msg.text.clone();
             reply_btn.connect_clicked(move |_| {
                 cb(&reply_thread_ts, &cid_r, &user_display, &preview);
@@ -1211,30 +1223,31 @@ pub fn make_message_row(
     // This is crucial for bot/integration messages (e.g. GitHub) that put content in attachments
     if let Some(attachments) = &msg.attachments {
         for att in attachments {
-            let mut att_parts: Vec<String> = Vec::new();
+            let mut att_parts: Vec<&str> = Vec::new();
             if let Some(pretext) = &att.pretext {
                 if !pretext.is_empty() {
-                    att_parts.push(pretext.clone());
+                    att_parts.push(pretext);
                 }
             }
-            if let Some(title) = &att.title {
-                if !title.is_empty() {
-                    if let Some(link) = &att.title_link {
-                        att_parts.push(format!("<{link}|{title}>"));
-                    } else {
-                        att_parts.push(format!("*{title}*"));
-                    }
-                }
+            let title_formatted = match &att.title {
+                Some(title) if !title.is_empty() => Some(match &att.title_link {
+                    Some(link) => format!("<{link}|{title}>"),
+                    None => format!("*{title}*"),
+                }),
+                _ => None,
+            };
+            if let Some(ref tf) = title_formatted {
+                att_parts.push(tf);
             }
             if let Some(text) = &att.text {
                 if !text.is_empty() {
-                    att_parts.push(text.clone());
+                    att_parts.push(text);
                 }
             }
             if att_parts.is_empty() {
                 if let Some(fallback) = &att.fallback {
                     if !fallback.is_empty() {
-                        att_parts.push(fallback.clone());
+                        att_parts.push(fallback);
                     }
                 }
             }
@@ -1320,9 +1333,9 @@ pub fn make_message_row(
                 }
             } else {
                 // Non-image file: show download chip
-                let download_url = file.url_private_download.clone()
-                    .or_else(|| file.url_private.clone());
-                let chip = make_file_attachment_chip(file, download_url.as_deref(), client, rt);
+                let download_url = file.url_private_download.as_deref()
+                    .or(file.url_private.as_deref());
+                let chip = make_file_attachment_chip(file, download_url, client, rt);
                 outer.append(&chip);
             }
         }
@@ -1361,13 +1374,14 @@ pub fn make_message_row(
         picture.set_halign(gtk::Align::Start);
         picture.set_content_fit(gtk::ContentFit::ScaleDown);
         // Fixed size placeholder so layout is stable before image loads
-        picture.set_size_request(300, 200);
+        picture.set_size_request(200, 150);
         picture.set_can_shrink(true);
         picture.set_cursor_from_name(Some("pointer"));
         image_flow.insert(&picture, -1);
 
         // Click to open fullscreen viewer (loads full resolution)
         let stored_texture: Rc<RefCell<Option<gtk4::gdk::Texture>>> = Rc::new(RefCell::new(None));
+        stored_textures.borrow_mut().push(stored_texture.clone());
         {
             let click = gtk::GestureClick::new();
             click.set_button(1);
@@ -1405,11 +1419,12 @@ pub fn make_message_row(
         let stored_texture_weak = Rc::downgrade(&stored_texture);
         // Fetch all candidate URLs on tokio, decode + display on main thread
         gtk4::glib::spawn_future_local(async move {
-            let c = client.clone();
-            let urls2 = urls.clone();
+            // Move client + urls directly into the tokio task so they are freed as
+            // soon as the HTTP request finishes, rather than lingering in the outer
+            // future's state until the Texture decode completes on the main thread.
             let bytes_result = rt.spawn(async move {
-                for url in &urls2 {
-                    match c.fetch_image_bytes(url).await {
+                for url in &urls {
+                    match client.fetch_image_bytes(url).await {
                         Ok(b) => {
                             tracing::debug!("Image loaded from {url}");
                             return Ok(b);
@@ -1430,12 +1445,12 @@ pub fn make_message_row(
                 Ok(Ok(bytes)) => {
                     let gbytes = gtk4::glib::Bytes::from_owned(bytes);
                     let stream = gtk4::gio::MemoryInputStream::from_bytes(&gbytes);
-                    // Decode at display size (max 400px wide) to avoid holding
-                    // full-resolution RGBA buffers (a 5712x4284 photo = 93 MiB).
+                    // Decode at display size to avoid holding full-resolution
+                    // RGBA buffers (a 5712x4284 photo = 93 MiB).
                     match gtk4::gdk_pixbuf::Pixbuf::from_stream_at_scale(
                         &stream,
-                        -1,   // auto width (preserve aspect ratio)
-                        200,  // max height
+                        400,  // max width
+                        150,  // max height
                         true, // preserve_aspect_ratio
                         gtk4::gio::Cancellable::NONE,
                     ) {
@@ -1599,14 +1614,14 @@ pub fn make_reaction_button(
     }
 
     // Right-click shows who reacted
-    let user_names: Vec<String> = reaction
+    let user_names: Vec<&str> = reaction
         .users
         .iter()
         .map(|uid| {
             users
                 .get(uid)
-                .cloned()
-                .unwrap_or_else(|| uid.clone())
+                .map(|s| s.as_str())
+                .unwrap_or(uid)
         })
         .collect();
 

@@ -179,17 +179,12 @@ impl Client {
     async fn fetch_image_bytes_uncached(&self, url: &str) -> Result<bytes::Bytes, String> {
         let is_slack_url = url.contains("slack.com") || url.contains("slack-files.com");
 
-        let http = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::limited(10))
-            .build()
-            .map_err(|e| format!("HTTP client error: {e}"))?;
-
         let req = if is_slack_url {
-            http.get(url)
+            self.http.get(url)
                 .bearer_auth(&self.creds.xoxc_token)
                 .headers(Self::stealth_headers(&self.creds))
         } else {
-            http.get(url)
+            self.http.get(url)
         };
 
         let resp = req.send().await.map_err(|e| format!("Image fetch error: {e}"))?;

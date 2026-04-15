@@ -1074,7 +1074,7 @@ pub fn build_app(
                             &thread_cb, &mention_cb, &reaction_cb, &delete_cb, &edit_cb,
                             Some(&channel_id), &mv.thread_counts.borrow(), &mv.thread_labels, &mv.reaction_boxes, &self_uid,
                             &mv.image_generation, &mv.picker_cells,
-                            &thread_expand_cb, &mv.expanded_threads,
+                            &thread_expand_cb, &mv.expanded_threads, &mv.stored_textures,
                         );
                         // Indent reply rows for tree-like appearance
                         if let Some(child) = row.child() {
@@ -2822,7 +2822,7 @@ pub fn build_app(
                                 .spawn(async move { db_counts.reply_counts_for_channel(&cid_counts).await })
                                 .await
                                 .unwrap_or_default();
-                            mv_counts.apply_thread_counts(&counts);
+                            mv_counts.apply_thread_counts(counts);
                         });
 
                         if pending_ts.is_some() {
@@ -3587,7 +3587,7 @@ pub fn build_app(
                                         &mv.thread_labels, &mv.reaction_boxes,
                                         &self_uid, &mv.image_generation,
                                         &mv.picker_cells,
-                                        &thread_expand_cb, &mv.expanded_threads,
+                                        &thread_expand_cb, &mv.expanded_threads, &mv.stored_textures,
                                     );
                                     if let Some(child) = row.child() {
                                         if let Some(outer) = child.downcast_ref::<gtk::Box>() {
@@ -3854,7 +3854,7 @@ pub fn build_app(
                                             &message_view.thread_labels, &message_view.reaction_boxes,
                                             &self_uid, &message_view.image_generation,
                                             &message_view.picker_cells,
-                                            &thread_expand_cb, &message_view.expanded_threads,
+                                            &thread_expand_cb, &message_view.expanded_threads, &message_view.stored_textures,
                                         );
                                         if let Some(child) = row.child() {
                                             if let Some(outer) = child.downcast_ref::<gtk::Box>() {
@@ -4243,15 +4243,17 @@ pub fn build_app(
                         }
                     }
                     SlackEvent::ChannelMarked { channel, unread_count_display } => {
+                        let is_current = state.borrow().current_channel.as_deref() == Some(&channel);
+                        let effective = if is_current { 0 } else { unread_count_display };
                         {
                             let mut st = state.borrow_mut();
-                            if unread_count_display == 0 {
+                            if effective == 0 {
                                 st.unread_counts.remove(&channel);
                             } else {
-                                st.unread_counts.insert(channel.clone(), unread_count_display);
+                                st.unread_counts.insert(channel.clone(), effective);
                             }
                         }
-                        sidebar.set_unread(&channel, unread_count_display);
+                        sidebar.set_unread(&channel, effective);
                     }
                     SlackEvent::MessageReplied { channel, thread_ts, reply_count } => {
                         let current = state.borrow().current_channel.clone();

@@ -126,7 +126,7 @@ fn search_emoji(query: &str) -> Vec<(String, String, Option<String>)> {
         .enumerate()
         .map(|(i, s)| (s.as_str(), i))
         .collect();
-    let mut seen = std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut m: Vec<(String, String, Option<String>)> = Vec::new();
     let is_empty = query.is_empty();
 
@@ -136,7 +136,7 @@ fn search_emoji(query: &str) -> Vec<(String, String, Option<String>)> {
             if m.len() >= 8 {
                 break;
             }
-            if !seen.insert(sc.clone()) {
+            if !seen.insert(sc) {
                 continue;
             }
             if let Some(glyph) = resolve_slack_shortcode(sc) {
@@ -159,7 +159,7 @@ fn search_emoji(query: &str) -> Vec<(String, String, Option<String>)> {
             if m.len() >= 8 {
                 break;
             }
-            if seen.insert(sc.to_string()) {
+            if seen.insert(sc) {
                 m.push((sc.to_string(), format!("{glyph} :{sc}:"), None));
             }
         }
@@ -200,7 +200,8 @@ fn search_emoji(query: &str) -> Vec<(String, String, Option<String>)> {
             if let Some(score) = fuzzy_score(query, &name) {
                 let rank = recent_rank.get(name.as_str()).copied().unwrap_or(usize::MAX);
                 let image_path = get_custom_emoji_path(&name);
-                scored.push((rank, score, name.clone(), format!(":{name}:"), image_path));
+                let display = format!(":{name}:");
+                scored.push((rank, score, name, display, image_path));
             }
         }
     }
@@ -216,7 +217,7 @@ fn search_emoji(query: &str) -> Vec<(String, String, Option<String>)> {
         if m.len() >= 8 {
             break;
         }
-        if !seen.insert(sc.clone()) {
+        if m.iter().any(|(s, _, _)| *s == sc) {
             continue;
         }
         m.push((sc, display, image_path));

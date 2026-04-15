@@ -107,7 +107,15 @@ fn main() {
     });
 
     let rt_handle = rt.handle().clone();
+    let activated = std::cell::Cell::new(false);
     app.connect_activate(move |app| {
+        if activated.replace(true) {
+            // Already activated (D-Bus + command-line race); just present existing window.
+            if let Some(window) = app.windows().first() {
+                window.present();
+            }
+            return;
+        }
         libadwaita::init().expect("Failed to init libadwaita");
 
         // Install embedded app icon (PNG) into user icon theme.

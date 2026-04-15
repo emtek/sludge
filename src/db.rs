@@ -427,7 +427,23 @@ impl Database {
     }
 
     pub async fn append_message(&self, channel_id: &str, message: &Message) {
-        self.index_messages(channel_id, &[message.clone()]).await;
+        let db = self.clone();
+        let cid = channel_id.to_string();
+        let data = serde_json::to_string(message).unwrap_or_default();
+        let ts = message.ts.clone();
+        let thread_ts = message.thread_ts.clone();
+        let user = message.user.clone();
+        let text = message.text.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            db.with_conn(|c| {
+                let _ = c.execute(
+                    "INSERT OR REPLACE INTO message (channel, ts, thread_ts, user, text, data)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![cid, ts, thread_ts, user, text, data],
+                );
+            });
+        })
+        .await;
     }
 
     pub async fn reply_counts_for_channel(

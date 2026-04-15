@@ -456,6 +456,34 @@ impl ChannelSidebar {
         *self.user_names.borrow_mut() = names.clone();
     }
 
+    /// Remove all rows from a ListBox, unparenting floating widgets (Popovers
+    /// from context menus) first so they don't create ref cycles that leak.
+    fn clear_list(list: &ListBox) {
+        let mut idx = 0;
+        while let Some(row) = list.row_at_index(idx) {
+            Self::unparent_popovers(&row);
+            idx += 1;
+        }
+        while let Some(child) = list.first_child() {
+            list.remove(&child);
+        }
+    }
+
+    /// Unparent any Popover children of a widget. GTK4 popovers attached via
+    /// `set_parent()` are not regular children — they must be explicitly
+    /// unparented or they hold a strong ref to the parent, creating a cycle.
+    fn unparent_popovers(widget: &impl gtk4::prelude::IsA<gtk::Widget>) {
+        let widget = widget.as_ref();
+        let mut child = widget.first_child();
+        while let Some(c) = child {
+            let next = c.next_sibling();
+            if c.downcast_ref::<gtk::Popover>().is_some() {
+                c.unparent();
+            }
+            child = next;
+        }
+    }
+
     /// Detect mpdm (multi-party DM) channels by name prefix.
     fn is_mpdm(ch: &Channel) -> bool {
         ch.name
@@ -603,10 +631,10 @@ impl ChannelSidebar {
         dm_list.sort_by(&activity_sort);
         gr_list.sort_by(&activity_sort);
 
-        // Rebuild channels list
-        while let Some(child) = self.channels_list.first_child() {
-            self.channels_list.remove(&child);
-        }
+        // Rebuild channels list — unparent floating widgets (Popovers from
+        // context menus) before removing rows to break the ref cycle and
+        // prevent leaking.
+        Self::clear_list(&self.channels_list);
         let mut new_badges = HashMap::new();
         let acb = self.action_callback.borrow().clone();
         let watched = &self.watched_users;
@@ -619,9 +647,7 @@ impl ChannelSidebar {
         }
 
         // Rebuild DM list
-        while let Some(child) = self.dm_list.first_child() {
-            self.dm_list.remove(&child);
-        }
+        Self::clear_list(&self.dm_list);
         let mut new_presence_icons = HashMap::new();
         let mut new_status_icons = HashMap::new();
         let mut new_dm_rows = HashMap::new();
@@ -657,9 +683,7 @@ impl ChannelSidebar {
         drop(presence);
 
         // Rebuild group list
-        while let Some(child) = self.group_list.first_child() {
-            self.group_list.remove(&child);
-        }
+        Self::clear_list(&self.group_list);
         for ch in &gr_list {
             let (row, badge) = Self::make_group_row(ch, &names);
             row.set_visible(Self::is_recent(&act, &ch.id, &cutoff));
