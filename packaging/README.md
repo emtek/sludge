@@ -1,60 +1,28 @@
 # Packaging
 
-## Fedora 43 (RPM)
+Both formats are driven entirely by metadata in `Cargo.toml` — no spec files
+or debian/ directories to maintain.
 
-The RPM is built from `[package.metadata.generate-rpm]` in `Cargo.toml`
-using the [cargo-generate-rpm](https://github.com/cat-in-136/cargo-generate-rpm)
-crate — there's no traditional spec file to maintain.
+## RPM (Fedora / RHEL)
 
-### Build with podman (recommended)
-
-```bash
-./packaging/build-rpm.sh
-# Output: dist/sludge-*.rpm
-```
-
-Uses `fedora:43` by default. Override with `IMAGE=fedora:42 ./packaging/build-rpm.sh`.
-
-### Build natively
+Uses [cargo-generate-rpm](https://github.com/cat-in-136/cargo-generate-rpm).
 
 ```bash
-sudo dnf install cargo rust gtk4-devel libadwaita-devel openssl-devel
-cargo install --locked cargo-generate-rpm
-cargo build --release --locked
+cargo install cargo-generate-rpm   # one-time
+cargo build --release
 cargo generate-rpm
 # Output: target/generate-rpm/sludge-*.rpm
+sudo dnf install target/generate-rpm/sludge-*.rpm
 ```
 
-### Install
+## DEB (Debian / Ubuntu)
+
+Uses [cargo-deb](https://github.com/kornelski/cargo-deb).
 
 ```bash
-sudo dnf install ./dist/sludge-*.rpm
-```
-
-## Ubuntu (latest) / Debian
-
-### Build with podman (recommended)
-
-```bash
-./packaging/build-deb.sh
-# Output: dist/sludge_*.deb
-```
-
-Uses `ubuntu:24.04` by default. Override with `IMAGE=ubuntu:25.04 ./packaging/build-deb.sh`.
-
-### Build natively
-
-Copy the packaging files into a `debian/` directory at the repo root, then build:
-
-```bash
-cp -r packaging/debian ./debian
-sudo apt install debhelper cargo rustc pkg-config libgtk-4-dev libadwaita-1-dev libssl-dev
-dpkg-buildpackage -us -uc -b
-# Output: ../sludge_*.deb
-```
-
-### Install
-
-```bash
-sudo apt install ./dist/sludge_*.deb
+cargo install cargo-deb   # one-time
+cargo build --release
+cargo deb --no-build
+# Output: target/debian/sludge_*.deb
+sudo apt install target/debian/sludge_*.deb
 ```

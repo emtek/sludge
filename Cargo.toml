@@ -31,13 +31,13 @@ zbus = { version = "5", default-features = false, features = ["tokio"] }
 [profile.release]
 debug = 1
 
-# ── cargo-generate-rpm configuration ──
+# ── RPM packaging (cargo-generate-rpm) ──
 # Build with:
 #   cargo build --release
 #   cargo generate-rpm
+# Output: target/generate-rpm/sludge-*.rpm
 #
-# Install cargo-generate-rpm once:
-#   cargo install cargo-generate-rpm
+# Install once: cargo install cargo-generate-rpm
 [package.metadata.generate-rpm]
 summary = "A native GTK4/libadwaita Slack client for the Linux desktop"
 assets = [
@@ -68,3 +68,33 @@ hicolor-icon-theme = "*"
 
 [package.metadata.generate-rpm.recommends]
 libnotify = "*"
+
+# ── cargo-deb configuration ──
+# Build with:
+#   cargo build --release
+#   cargo deb --no-build
+#
+# Install cargo-deb once:
+#   cargo install cargo-deb
+[package.metadata.deb]
+section = "net"
+priority = "optional"
+depends = "libgtk-4-1 (>= 4.14), libadwaita-1-0 (>= 1.4), hicolor-icon-theme"
+recommends = "libcanberra-gtk3-0, libnotify-bin"
+copyright = "2026 Emlyn Revell-Nash"
+extended-description = """\
+Sludge is a native GTK4/libadwaita Slack client. Features include real-time \
+messaging via Socket Mode, inline threads, reactions, file uploads, desktop \
+notifications, a GNOME Shell search provider, and fuzzy emoji autocomplete."""
+assets = [
+    ["target/release/sludge", "usr/bin/", "755"],
+    ["assets/dev.sludge.app.desktop", "usr/share/applications/", "644"],
+    ["assets/hicolor/48x48/apps/sludge.png", "usr/share/icons/hicolor/48x48/apps/sludge.png", "644"],
+    ["assets/hicolor/64x64/apps/sludge.png", "usr/share/icons/hicolor/64x64/apps/sludge.png", "644"],
+    ["assets/hicolor/128x128/apps/sludge.png", "usr/share/icons/hicolor/128x128/apps/sludge.png", "644"],
+    ["assets/hicolor/256x256/apps/sludge.png", "usr/share/icons/hicolor/256x256/apps/sludge.png", "644"],
+    ["assets/dev.sludge.app.search-provider.ini", "usr/share/gnome-shell/search-providers/", "644"],
+    ["assets/dev.sludge.app.service", "usr/share/dbus-1/services/", "644"],
+    ["README.md", "usr/share/doc/sludge/README.md", "644"],
+]
+maintainer-scripts = "packaging/debian-scripts/"
