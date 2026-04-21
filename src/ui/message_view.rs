@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::slack::client::Client;
-use crate::slack::helpers::format_message_markup;
+use crate::slack::helpers::{format_message_markup, html_to_pango, looks_like_html};
 
 /// Callback type for starting a reply to a message:
 /// (thread_ts, channel_id, user_display_name, text_preview)
@@ -253,6 +253,7 @@ impl MessageView {
     pub fn remove_thread_replies(&self, thread_ts: &str) {
         if let Some(rows) = self.expanded_threads.borrow_mut().remove(thread_ts) {
             for row in &rows {
+                Self::unparent_floating_recursive(row);
                 self.list_box.remove(row);
             }
         }
@@ -670,7 +671,6 @@ impl MessageView {
         self.has_more_newer.set(false);
         self.loading_more.set(false);
         *self.search_query.borrow_mut() = None;
-        crate::mem::trim_heap();
 
         let thread_cb = self.thread_callback.borrow();
         let mention_cb = self.mention_callback.borrow();
@@ -1223,38 +1223,48 @@ pub fn make_message_row(
     // This is crucial for bot/integration messages (e.g. GitHub) that put content in attachments
     if let Some(attachments) = &msg.attachments {
         for att in attachments {
-            let mut att_parts: Vec<&str> = Vec::new();
+            let render_field = |text: &str| -> String {
+                if looks_like_html(text) {
+                    html_to_pango(text)
+                } else {
+                    format_message_markup(text, users, subteam_names)
+                }
+            };
+
+            let mut markup_parts: Vec<String> = Vec::new();
             if let Some(pretext) = &att.pretext {
                 if !pretext.is_empty() {
-                    att_parts.push(pretext);
+                    markup_parts.push(render_field(pretext));
                 }
             }
-            let title_formatted = match &att.title {
-                Some(title) if !title.is_empty() => Some(match &att.title_link {
-                    Some(link) => format!("<{link}|{title}>"),
-                    None => format!("*{title}*"),
-                }),
-                _ => None,
-            };
-            if let Some(ref tf) = title_formatted {
-                att_parts.push(tf);
+            if let Some(title) = &att.title {
+                if !title.is_empty() {
+                    let title_markup = match &att.title_link {
+                        Some(link) if !link.is_empty() => format!(
+                            "<a href=\"{}\"><b>{}</b></a>",
+                            gtk4::glib::markup_escape_text(link),
+                            gtk4::glib::markup_escape_text(title),
+                        ),
+                        _ => format!("<b>{}</b>", gtk4::glib::markup_escape_text(title)),
+                    };
+                    markup_parts.push(title_markup);
+                }
             }
             if let Some(text) = &att.text {
                 if !text.is_empty() {
-                    att_parts.push(text);
+                    markup_parts.push(render_field(text));
                 }
             }
-            if att_parts.is_empty() {
+            if markup_parts.is_empty() {
                 if let Some(fallback) = &att.fallback {
                     if !fallback.is_empty() {
-                        att_parts.push(fallback);
+                        markup_parts.push(render_field(fallback));
                     }
                 }
             }
 
-            if !att_parts.is_empty() {
-                let att_text = att_parts.join("\n");
-                let markup = format_message_markup(&att_text, users, subteam_names);
+            if !markup_parts.is_empty() {
+                let markup = markup_parts.join("\n");
 
                 let att_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
 
@@ -1717,6 +1727,64 @@ pub fn make_file_attachment_chip(
     chip.append(&info_box);
 
     if let Some(url) = download_url {
+        // ── View button: download to cache and open with system default viewer ──
+        let view_btn = gtk::Button::from_icon_name("document-open-symbolic");
+        view_btn.add_css_class("flat");
+        view_btn.set_valign(gtk::Align::Center);
+        view_btn.set_tooltip_text(Some("Open with system viewer"));
+
+        {
+            let url = url.to_string();
+            let filename = name.to_string();
+            let file_id = file.id.clone();
+            let client = client.clone();
+            let rt = rt.clone();
+            view_btn.connect_clicked(move |btn| {
+                let url = url.clone();
+                let filename = filename.clone();
+                let file_id = file_id.clone();
+                let client = client.clone();
+                let rt = rt.clone();
+                let btn_weak = btn.downgrade();
+
+                btn.set_sensitive(false);
+                btn.set_icon_name("process-working-symbolic");
+
+                gtk4::glib::spawn_future_local(async move {
+                    let result = ensure_file_cached(&client, &rt, &file_id, &filename, &url).await;
+
+                    if let Some(btn) = btn_weak.upgrade() {
+                        btn.set_sensitive(true);
+                        btn.set_icon_name("document-open-symbolic");
+                    }
+
+                    match result {
+                        Ok(path) => {
+                            let uri = gtk4::gio::File::for_path(&path).uri();
+                            if let Err(e) = gtk4::gio::AppInfo::launch_default_for_uri(
+                                &uri,
+                                gtk4::gio::AppLaunchContext::NONE,
+                            ) {
+                                tracing::error!("Failed to open file {}: {e}", path.display());
+                                if let Some(btn) = btn_weak.upgrade() {
+                                    btn.set_icon_name("dialog-error-symbolic");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to cache file for viewing: {e}");
+                            if let Some(btn) = btn_weak.upgrade() {
+                                btn.set_icon_name("dialog-error-symbolic");
+                            }
+                        }
+                    }
+                });
+            });
+        }
+
+        chip.append(&view_btn);
+
+        // ── Save button: prompt for a location and write the file there ──
         let dl_btn = gtk::Button::from_icon_name("folder-download-symbolic");
         dl_btn.add_css_class("flat");
         dl_btn.set_valign(gtk::Align::Center);
@@ -1780,6 +1848,63 @@ pub fn make_file_attachment_chip(
     }
 
     chip
+}
+
+/// Ensure a file is present in the per-user cache and return its path.
+/// Files live under `~/.local/share/sludge/file_cache/{file_id}/{name}` so the
+/// original filename (and therefore its extension) is preserved — GIO relies
+/// on that to pick the right default handler.
+async fn ensure_file_cached(
+    client: &Client,
+    rt: &tokio::runtime::Handle,
+    file_id: &str,
+    name: &str,
+    url: &str,
+) -> Result<std::path::PathBuf, String> {
+    let cache_dir = dirs::data_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("sludge")
+        .join("file_cache")
+        .join(file_id);
+    let safe_name = sanitize_filename(name);
+    let cache_path = cache_dir.join(&safe_name);
+
+    if std::fs::metadata(&cache_path).is_ok() {
+        return Ok(cache_path);
+    }
+
+    let client = client.clone();
+    let url = url.to_string();
+    let cache_dir2 = cache_dir.clone();
+    let cache_path2 = cache_path.clone();
+    rt.spawn(async move {
+        let bytes = client.fetch_image_bytes(&url).await?;
+        tokio::fs::create_dir_all(&cache_dir2)
+            .await
+            .map_err(|e| format!("Create cache dir: {e}"))?;
+        tokio::fs::write(&cache_path2, &bytes)
+            .await
+            .map_err(|e| format!("Write cache file: {e}"))
+    })
+    .await
+    .map_err(|e| format!("Task join error: {e}"))??;
+
+    Ok(cache_path)
+}
+
+/// Strip path separators and other problematic characters so a Slack-supplied
+/// filename can't escape the cache subdirectory.
+fn sanitize_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| if matches!(c, '/' | '\\' | '\0') { '_' } else { c })
+        .collect();
+    let trimmed = cleaned.trim_matches(|c: char| c == '.' || c.is_whitespace());
+    if trimmed.is_empty() {
+        "file".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// Build a message body widget from Slack text.

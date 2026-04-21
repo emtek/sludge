@@ -2307,7 +2307,7 @@ dependencies = [
 
 [[package]]
 name = "sludge"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "bytes",
  "chrono",
@@ -2317,7 +2317,6 @@ dependencies = [
  "futures-util",
  "gtk4",
  "libadwaita",
- "libc",
  "pulldown-cmark",
  "reqwest",
  "rusqlite",

@@ -805,14 +805,16 @@ impl ChannelSidebar {
     ) {
         let Some(acb) = action_cb.clone() else { return };
 
-        let popover = gtk::Popover::new();
-        popover.set_parent(row);
-        popover.set_autohide(true);
+        // Lazy-create the popover on first right-click. With hundreds of
+        // channels in the sidebar, eagerly building a Popover per row holds
+        // ~0.5–1MB that most users never interact with.
+        let popover_cell: Rc<RefCell<Option<gtk::Popover>>> = Rc::new(RefCell::new(None));
 
-        // Unparent popover when row is destroyed to avoid leak
-        let popover_weak = popover.downgrade();
+        // Unparent the popover (if one was ever created) when the row is
+        // destroyed — `set_parent()` creates a strong ref cycle otherwise.
+        let cell_destroy = popover_cell.clone();
         row.connect_destroy(move |_| {
-            if let Some(p) = popover_weak.upgrade() {
+            if let Some(p) = cell_destroy.borrow_mut().take() {
                 p.unparent();
             }
         });
@@ -825,9 +827,18 @@ impl ChannelSidebar {
         let wl = watch_labels.clone();
         let se = status_emoji.clone();
         let st = status_text.clone();
-        let popover_weak = popover.downgrade();
+        let cell = popover_cell.clone();
+        let row_weak = row.downgrade();
         gesture.connect_released(move |_, _, _, _| {
-            let Some(popover) = popover_weak.upgrade() else { return };
+            let Some(row) = row_weak.upgrade() else { return };
+            let popover = cell.borrow_mut()
+                .get_or_insert_with(|| {
+                    let p = gtk::Popover::new();
+                    p.set_parent(&row);
+                    p.set_autohide(true);
+                    p
+                })
+                .clone();
 
             // Rebuild menu content each time so labels reflect current state
             let menu_box = gtk::Box::new(gtk::Orientation::Vertical, 0);

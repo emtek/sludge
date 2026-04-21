@@ -1,4 +1,5 @@
 use futures_util::{SinkExt, StreamExt};
+use std::collections::HashSet;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{debug, error, info, warn};
@@ -15,10 +16,13 @@ pub enum SlackEvent {
         thread_ts: Option<String>,
         files: Option<Vec<slacko::types::File>>,
     },
-    /// A user's presence changed (active/away).
+    /// A user's presence changed (active/away). `manual` is true when the user
+    /// explicitly set it via `users.setPresence` (on any client); false when
+    /// Slack's auto-away/auto-active heuristics produced the change.
     PresenceChange {
         user: String,
         presence: String,
+        manual: bool,
     },
     /// A user's profile was updated (status, avatar, etc.).
     UserProfileChanged {
@@ -70,6 +74,9 @@ pub enum SlackEvent {
 
 /// Run RTM WebSocket for stealth mode with auto-reconnect.
 /// `presence_rx` receives batches of user IDs to subscribe to for presence updates.
+/// Subscriptions accumulate into a single set that persists across reconnects —
+/// Slack's `presence_sub` replaces (not adds to) the prior subscription, so we
+/// always send the full set on each update and re-send it after every reconnect.
 pub async fn run_rtm_stealth(
     http: reqwest::Client,
     xoxc_token: String,
@@ -78,13 +85,16 @@ pub async fn run_rtm_stealth(
     tx: mpsc::UnboundedSender<SlackEvent>,
     mut presence_rx: mpsc::UnboundedReceiver<Vec<String>>,
 ) {
+    let mut subscribed: HashSet<String> = HashSet::new();
     loop {
         match rtm_connect(&http, &xoxc_token, &xoxd_cookie, workspace_url.as_deref()).await {
             Ok(ws_url) => {
                 info!("RTM connecting to WebSocket...");
                 let _ = tx.send(SlackEvent::Connected);
 
-                if let Err(e) = rtm_listen(&ws_url, &xoxd_cookie, &tx, &mut presence_rx).await {
+                if let Err(e) =
+                    rtm_listen(&ws_url, &xoxd_cookie, &tx, &mut presence_rx, &mut subscribed).await
+                {
                     error!("RTM WebSocket error: {e}");
                 }
 
@@ -148,6 +158,7 @@ async fn rtm_listen(
     xoxd_cookie: &str,
     tx: &mpsc::UnboundedSender<SlackEvent>,
     presence_rx: &mut mpsc::UnboundedReceiver<Vec<String>>,
+    subscribed: &mut HashSet<String>,
 ) -> Result<(), String> {
     use tokio_tungstenite::tungstenite::http::Request;
 
@@ -173,6 +184,10 @@ async fn rtm_listen(
 
     let (mut write, mut read) = ws_stream.split();
     let mut msg_id: u64 = 1;
+    // Slack requires us to wait for `hello` before sending commands. Any
+    // presence_rx batches that arrive before then are accumulated into
+    // `subscribed` and flushed once hello lands.
+    let mut hello_received = false;
 
     loop {
         tokio::select! {
@@ -188,6 +203,13 @@ async fn rtm_listen(
                             match evt_type {
                                 "hello" => {
                                     info!("RTM hello received");
+                                    hello_received = true;
+                                    // Flush the current subscription set (either
+                                    // a carryover from a prior connection or
+                                    // additions queued while we were waiting).
+                                    if !subscribed.is_empty() {
+                                        send_presence_sub(&mut write, subscribed, &mut msg_id).await;
+                                    }
                                 }
                                 _ => {
                                     dispatch_event(&evt, tx);
@@ -212,23 +234,46 @@ async fn rtm_listen(
                 }
             }
             Some(user_ids) = presence_rx.recv() => {
-                if !user_ids.is_empty() {
-                    let sub_msg = serde_json::json!({
-                        "type": "presence_sub",
-                        "ids": user_ids,
-                        "id": msg_id,
-                    });
-                    msg_id += 1;
-                    info!("Sending presence_sub for {} users", user_ids.len());
-                    if let Err(e) = write.send(WsMessage::Text(sub_msg.to_string().into())).await {
-                        error!("Failed to send presence_sub: {e}");
+                let mut added = false;
+                for id in user_ids {
+                    if subscribed.insert(id) {
+                        added = true;
                     }
+                }
+                // Only send if there's actually something new, and hello has
+                // landed — otherwise we'd be sending before Slack is ready.
+                if added && hello_received {
+                    send_presence_sub(&mut write, subscribed, &mut msg_id).await;
                 }
             }
         }
     }
 
     Ok(())
+}
+
+/// Send a `presence_sub` command containing the full current subscription set.
+/// Slack treats each `presence_sub` as a replacement for the prior subscription,
+/// so we always send the union rather than deltas.
+async fn send_presence_sub<S>(
+    write: &mut S,
+    subscribed: &HashSet<String>,
+    msg_id: &mut u64,
+) where
+    S: SinkExt<WsMessage> + Unpin,
+    <S as futures_util::Sink<WsMessage>>::Error: std::fmt::Display,
+{
+    let ids: Vec<&String> = subscribed.iter().collect();
+    let sub_msg = serde_json::json!({
+        "type": "presence_sub",
+        "ids": ids,
+        "id": *msg_id,
+    });
+    *msg_id += 1;
+    info!("Sending presence_sub for {} users", ids.len());
+    if let Err(e) = write.send(WsMessage::Text(sub_msg.to_string().into())).await {
+        error!("Failed to send presence_sub: {e}");
+    }
 }
 
 // ── Shared event dispatcher ──
@@ -329,6 +374,7 @@ fn dispatch_event(evt: &serde_json::Value, tx: &mpsc::UnboundedSender<SlackEvent
             if presence.is_empty() {
                 return;
             }
+            let manual = evt_type == "manual_presence_change";
 
             // Batch format: { "type": "presence_change", "users": ["U1","U2"], "presence": "active" }
             if let Some(users) = evt.get("users").and_then(|v| v.as_array()) {
@@ -337,6 +383,7 @@ fn dispatch_event(evt: &serde_json::Value, tx: &mpsc::UnboundedSender<SlackEvent
                         let _ = tx.send(SlackEvent::PresenceChange {
                             user: uid.to_string(),
                             presence: presence.clone(),
+                            manual,
                         });
                     }
                 }
@@ -347,7 +394,7 @@ fn dispatch_event(evt: &serde_json::Value, tx: &mpsc::UnboundedSender<SlackEvent
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let _ = tx.send(SlackEvent::PresenceChange { user, presence });
+                let _ = tx.send(SlackEvent::PresenceChange { user, presence, manual });
             }
         }
         "user_profile_changed" | "user_change" => {

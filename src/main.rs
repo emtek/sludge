@@ -1,5 +1,4 @@
 mod db;
-pub mod mem;
 mod search_provider;
 mod slack;
 mod ui;
@@ -65,12 +64,6 @@ fn main() {
         .application_id("dev.sludge.app")
         .flags(gtk4::gio::ApplicationFlags::HANDLES_COMMAND_LINE)
         .build();
-
-    // Periodic heap trim every 10 seconds
-    gtk4::glib::timeout_add_seconds_local(10, || {
-        mem::trim_heap();
-        gtk4::glib::ControlFlow::Continue
-    });
 
     let startup_flags = parse_startup_flags();
 

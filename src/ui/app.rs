@@ -3689,19 +3689,11 @@ pub fn build_app(
         let emoji_entry_rt = emoji_entry.clone();
         let status_entry_rt = status_entry.clone();
         let self_status_icon_rt = self_status_icon.clone();
-        let nav_action = nav_action.clone();
         let presence_tx = presence_tx.clone();
-        let (notif_nav_tx, mut notif_nav_rx) = mpsc::unbounded_channel::<String>();
-
-        // Drain notification click navigations on the main thread
-        {
-            let nav_action = nav_action.clone();
-            gtk4::glib::spawn_future_local(async move {
-                while let Some(target) = notif_nav_rx.recv().await {
-                    nav_action.activate(Some(&target.to_variant()));
-                }
-            });
-        }
+        let app_rt = app.clone();
+        let active_btn_rt = active_btn.clone();
+        let away_btn_rt = away_btn.clone();
+        let presence_user_changed_rt = presence_user_changed.clone();
 
         gtk4::glib::spawn_future_local(async move {
             while let Some(event) = event_rx.recv().await {
@@ -3783,10 +3775,9 @@ pub fn build_app(
                             let db2 = db.clone();
                             let msg2 = msg.clone();
                             let cid = channel.clone();
-                            let ts = msg.ts.clone();
                             rt_rt.spawn(async move {
                                 db2.append_message(&cid, &msg2).await;
-                                db2.update_channel_activity(&cid, &ts).await;
+                                db2.update_channel_activity(&cid, &msg2.ts).await;
                             });
                             continue;
                         }
@@ -3914,13 +3905,12 @@ pub fn build_app(
                             let client_mark = client_rt.clone();
                             let msg2 = msg.clone();
                             let cid = channel.clone();
-                            let ts = msg.ts.clone();
                             let mark_read = is_current;
                             rt_rt.spawn(async move {
                                 db2.append_message(&cid, &msg2).await;
-                                db2.update_channel_activity(&cid, &ts).await;
+                                db2.update_channel_activity(&cid, &msg2.ts).await;
                                 if mark_read {
-                                    let _ = client_mark.mark_channel(&cid, &ts).await;
+                                    let _ = client_mark.mark_channel(&cid, &msg2.ts).await;
                                 }
                             });
                         }
@@ -3958,60 +3948,34 @@ pub fn build_app(
                                 plain_text
                             };
 
-                            let nav_channel = channel.clone();
-                            let nav_ts = msg.ts.clone();
-                            let nav_thread_ts = thread_ts.clone();
-                            let nav_tx = notif_nav_tx.clone();
+                            // Fire-and-forget notification sound
                             rt_rt.spawn(async move {
-                                // Play notification sound
                                 let _ = tokio::process::Command::new("canberra-gtk-play")
                                     .arg("-i").arg("message-new-instant")
                                     .arg("-d").arg("Sludge notification")
                                     .spawn();
-
-                                let mut child = match tokio::process::Command::new("notify-send")
-                                    .arg("--app-name=Sludge")
-                                    .arg("--urgency=normal")
-                                    .arg("--expire-time=15000")
-                                    .arg("--action=default=Open")
-                                    .arg("--wait")
-                                    .arg(&title)
-                                    .arg(&body)
-                                    .stdout(std::process::Stdio::piped())
-                                    .spawn()
-                                {
-                                    Ok(c) => c,
-                                    Err(_) => return,
-                                };
-                                // Take stdout before waiting so we can still kill on timeout
-                                let stdout_handle = child.stdout.take();
-                                let result = tokio::time::timeout(
-                                    std::time::Duration::from_secs(30),
-                                    child.wait(),
-                                ).await;
-                                match result {
-                                    Ok(Ok(_status)) => {
-                                        if let Some(stdout) = stdout_handle {
-                                            use tokio::io::AsyncReadExt;
-                                            let mut buf = String::new();
-                                            let mut reader = tokio::io::BufReader::new(stdout);
-                                            let _ = reader.read_to_string(&mut buf).await;
-                                            if buf.trim() == "default" {
-                                                let target = if let Some(tts) = &nav_thread_ts {
-                                                    format!("{nav_channel}:{nav_ts}:{tts}")
-                                                } else {
-                                                    format!("{nav_channel}:{nav_ts}")
-                                                };
-                                                let _ = nav_tx.send(target);
-                                            }
-                                        }
-                                    }
-                                    Ok(Err(_)) => {}
-                                    Err(_) => {
-                                        let _ = child.kill().await;
-                                    }
-                                }
                             });
+
+                            // Persistent D-Bus notification: clicking it invokes
+                            // the "app.navigate" action via GIO, even after the
+                            // notification has expired on-screen. The notification
+                            // daemon remembers the action and re-activates the app
+                            // if necessary.
+                            let target = if let Some(tts) = &thread_ts {
+                                format!("{channel}:{}:{tts}", msg.ts)
+                            } else {
+                                format!("{channel}:{}", msg.ts)
+                            };
+                            let notif = gio::Notification::new(&title);
+                            notif.set_body(Some(&body));
+                            notif.set_default_action_and_target_value(
+                                "app.navigate",
+                                Some(&target.to_variant()),
+                            );
+                            // Use the message ts as the notification id; this
+                            // guarantees uniqueness per message while still
+                            // letting the daemon replace duplicates if re-sent.
+                            app_rt.send_notification(Some(&msg.ts), &notif);
                         }
                     }
                     SlackEvent::MessageDeleted { channel, deleted_ts } => {
@@ -4039,17 +4003,43 @@ pub fn build_app(
                         }
 
                     }
-                    SlackEvent::PresenceChange { user, presence } => {
-                        tracing::debug!("Presence change: {user} -> {presence}");
+                    SlackEvent::PresenceChange { user, presence, manual } => {
+                        tracing::debug!("Presence change: {user} -> {presence} (manual={manual})");
                         let is_active = presence == "active";
                         let self_uid = state.borrow().self_user_id.clone();
                         let is_self = user.is_empty() || self_uid == user;
                         if is_self {
-                            *presence_active.borrow_mut() = is_active;
-                            profile_avatar.queue_draw();
+                            let intent_active = *presence_active.borrow();
+                            if manual {
+                                // Authoritative user-initiated change (possibly
+                                // from another client). Sync local intent and
+                                // radio buttons.
+                                *presence_active.borrow_mut() = is_active;
+                                if is_active != intent_active {
+                                    // Temporarily suppress the toggle handler's
+                                    // API call — this change came from Slack.
+                                    *presence_user_changed_rt.borrow_mut() = false;
+                                    if is_active {
+                                        active_btn_rt.set_active(true);
+                                    } else {
+                                        away_btn_rt.set_active(true);
+                                    }
+                                    *presence_user_changed_rt.borrow_mut() = true;
+                                }
+                                profile_avatar.queue_draw();
+                            } else if !is_active && intent_active {
+                                // Slack auto-awayed us but user wants to be
+                                // active. Push back by re-asserting "auto".
+                                let c = client_rt.clone();
+                                rt_rt.spawn(async move {
+                                    if let Err(e) = c.set_presence("auto").await {
+                                        tracing::error!("Re-assert presence failed: {e}");
+                                    }
+                                });
+                            }
                         }
                         // Resolve effective user ID (manual_presence_change has empty user)
-                        let effective_uid = if user.is_empty() { self_uid } else { user.clone() };
+                        let effective_uid = if user.is_empty() { self_uid } else { user };
                         sidebar.set_presence(&effective_uid, is_active);
 
                         // Notify if this user is on the watch list and came online
@@ -4068,50 +4058,37 @@ pub fn build_app(
                                 drop(st);
 
                                 let title = format!("{display_name} is online");
-                                let nav_tx = notif_nav_tx.clone();
-                                let nav_channel = dm_channel_id.clone();
+                                let body = format!("{display_name} is now available");
+
+                                // Fire-and-forget notification sound
                                 rt_rt.spawn(async move {
-                                    // Play notification sound
                                     let _ = tokio::process::Command::new("canberra-gtk-play")
                                         .arg("-i").arg("message-new-instant")
                                         .arg("-d").arg("Sludge notification")
                                         .spawn();
-
-                                    let mut child = match tokio::process::Command::new("notify-send")
-                                        .arg("--app-name=Sludge")
-                                        .arg("--urgency=normal")
-                                        .arg("--action=default=Open")
-                                        .arg("--wait")
-                                        .arg(&title)
-                                        .arg(format!("{display_name} is now available"))
-                                        .stdout(std::process::Stdio::piped())
-                                        .spawn()
-                                    {
-                                        Ok(c) => c,
-                                        Err(_) => return,
-                                    };
-                                    let stdout_handle = child.stdout.take();
-                                    let result = tokio::time::timeout(
-                                        std::time::Duration::from_secs(30),
-                                        child.wait(),
-                                    ).await;
-                                    match result {
-                                        Ok(Ok(_)) => {
-                                            if let (Some(stdout), Some(cid)) = (stdout_handle, nav_channel) {
-                                                use tokio::io::AsyncReadExt;
-                                                let mut buf = String::new();
-                                                let mut reader = tokio::io::BufReader::new(stdout);
-                                                let _ = reader.read_to_string(&mut buf).await;
-                                                if buf.trim() == "default" {
-                                                    // Navigate to the DM channel
-                                                    let _ = nav_tx.send(cid.clone());
-                                                }
-                                            }
-                                        }
-                                        Ok(Err(_)) => {}
-                                        Err(_) => { let _ = child.kill().await; }
-                                    }
                                 });
+
+                                // Persistent D-Bus notification with a default
+                                // action. Clicks route through the "app.navigate"
+                                // action even after the notification has been
+                                // archived in the notification center.
+                                let notif = gio::Notification::new(&title);
+                                notif.set_body(Some(&body));
+                                if let Some(cid) = dm_channel_id {
+                                    let target = format!("ch:{cid}");
+                                    notif.set_default_action_and_target_value(
+                                        "app.navigate",
+                                        Some(&target.to_variant()),
+                                    );
+                                }
+                                // If no DM channel is known we intentionally
+                                // don't set a default action — the notification
+                                // daemon will then fall back to activating the
+                                // app (raising the window).
+                                app_rt.send_notification(
+                                    Some(&format!("presence:{effective_uid}")),
+                                    &notif,
+                                );
                             }
                         }
                     }

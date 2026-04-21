@@ -418,6 +418,360 @@ fn replace_slack_brackets(text: &str, user_names: &HashMap<String, String>, subt
 
 use gtk4::glib;
 
+/// Cheap check for whether a string looks like HTML rather than Slack mrkdwn.
+/// Slack brackets use `<@U…>`, `<#C…>`, `<!subteam^…>`, `<url|label>` — never
+/// real HTML tag names. If we find a structural or inline HTML tag (`<p>`,
+/// `<br>`, `<strong>`, `<ul>`, etc.) or an HTML-only entity, assume HTML.
+pub fn looks_like_html(text: &str) -> bool {
+    const TAG_HINTS: &[&str] = &[
+        "<p>", "<p ", "</p>", "<br>", "<br/>", "<br />", "<div", "</div>",
+        "<ul>", "<ul ", "</ul>", "<ol>", "<ol ", "</ol>", "<li>", "<li ",
+        "</li>", "<h1", "<h2", "<h3", "<h4", "<h5", "<h6", "<pre>", "<pre ",
+        "</pre>", "<blockquote", "</blockquote>", "<table", "</table>", "<tr",
+        "<td", "<th", "<img", "<strong", "</strong>", "<em>", "<em ", "</em>",
+        "<code>", "<code ", "</code>", "<span", "</span>",
+    ];
+    if TAG_HINTS.iter().any(|t| text.contains(t)) {
+        return true;
+    }
+    // HTML-only entities that never appear in Slack mrkdwn
+    text.contains("&nbsp;")
+        || text.contains("&mdash;")
+        || text.contains("&ndash;")
+        || text.contains("&hellip;")
+        || text.contains("&#")
+}
+
+/// Convert a limited subset of HTML to Pango markup safe for `Label::set_markup`.
+/// Unknown tags are dropped, text is XML-escaped, entity references are decoded,
+/// and the tag stack is balanced even for moderately malformed input.
+pub fn html_to_pango(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut stack: Vec<&'static str> = Vec::new();
+    let bytes = html.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'<' {
+            if html[i..].starts_with("<!--") {
+                if let Some(end) = html[i + 4..].find("-->") {
+                    i = i + 4 + end + 3;
+                } else {
+                    i = bytes.len();
+                }
+                continue;
+            }
+            if let Some(end_rel) = html[i + 1..].find('>') {
+                let tag_body = &html[i + 1..i + 1 + end_rel];
+                i = i + 1 + end_rel + 1;
+                process_html_tag(tag_body, &mut out, &mut stack);
+            } else {
+                out.push_str("&lt;");
+                i += 1;
+            }
+        } else if c == b'&' {
+            if let Some(semi) = html[i + 1..].find(|ch: char| ch == ';' || ch.is_whitespace() || ch == '<') {
+                if html[i + 1..].as_bytes().get(semi) == Some(&b';') {
+                    let ent = &html[i + 1..i + 1 + semi];
+                    if let Some(decoded) = decode_html_entity(ent) {
+                        out.push_str(&glib::markup_escape_text(&decoded));
+                        i = i + 1 + semi + 1;
+                        continue;
+                    }
+                }
+            }
+            out.push_str("&amp;");
+            i += 1;
+        } else {
+            let rest = &html[i..];
+            let next = rest.find(|ch: char| ch == '<' || ch == '&').unwrap_or(rest.len());
+            out.push_str(&glib::markup_escape_text(&rest[..next]));
+            i += next;
+        }
+    }
+
+    // Close any still-open tags so the markup is balanced
+    while let Some(t) = stack.pop() {
+        if t != "none" && t != "a-noop" {
+            out.push_str("</");
+            out.push_str(t);
+            out.push('>');
+        }
+    }
+
+    out
+}
+
+fn process_html_tag(body: &str, out: &mut String, stack: &mut Vec<&'static str>) {
+    let s = body.trim();
+    let (is_close, rest) = match s.strip_prefix('/') {
+        Some(r) => (true, r.trim()),
+        None => (false, s),
+    };
+    let rest = rest.trim_end_matches('/').trim();
+    let name_end = rest
+        .find(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
+        .unwrap_or(rest.len());
+    let name = rest[..name_end].to_ascii_lowercase();
+    let attrs = rest[name_end..].trim();
+
+    if is_close {
+        emit_html_close(&name, out, stack);
+    } else {
+        emit_html_open(&name, attrs, out, stack);
+    }
+}
+
+fn emit_html_open(name: &str, attrs: &str, out: &mut String, stack: &mut Vec<&'static str>) {
+    let push_simple = |tag: &'static str, out: &mut String, stack: &mut Vec<&'static str>| {
+        out.push('<');
+        out.push_str(tag);
+        out.push('>');
+        stack.push(tag);
+    };
+    let newline_if_needed = |out: &mut String| {
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+    };
+
+    match name {
+        "b" | "strong" => push_simple("b", out, stack),
+        "i" | "em" | "cite" | "var" | "dfn" => push_simple("i", out, stack),
+        "u" | "ins" => push_simple("u", out, stack),
+        "s" | "strike" | "del" => push_simple("s", out, stack),
+        "tt" | "code" | "kbd" | "samp" | "pre" => push_simple("tt", out, stack),
+        "sup" => push_simple("sup", out, stack),
+        "sub" => push_simple("sub", out, stack),
+        "small" => push_simple("small", out, stack),
+        "big" => push_simple("big", out, stack),
+        "br" => out.push('\n'),
+        "hr" => {
+            newline_if_needed(out);
+            out.push_str("──────\n");
+        }
+        "p" | "div" | "section" | "article" | "header" | "footer" => {
+            newline_if_needed(out);
+            stack.push("none");
+        }
+        "li" => {
+            newline_if_needed(out);
+            out.push_str("• ");
+            stack.push("none");
+        }
+        "blockquote" => {
+            newline_if_needed(out);
+            push_simple("i", out, stack);
+        }
+        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+            newline_if_needed(out);
+            push_simple("b", out, stack);
+        }
+        "a" => match parse_html_attr(attrs, "href") {
+            Some(href) if !href.is_empty() => {
+                let escaped = glib::markup_escape_text(&href);
+                out.push_str("<a href=\"");
+                out.push_str(&escaped);
+                out.push_str("\">");
+                stack.push("a");
+            }
+            _ => stack.push("a-noop"),
+        },
+        "img" => {
+            if let Some(alt) = parse_html_attr(attrs, "alt") {
+                if !alt.is_empty() {
+                    out.push_str(&glib::markup_escape_text(&alt));
+                }
+            }
+        }
+        // Void / metadata elements we drop entirely
+        "meta" | "link" | "input" | "source" | "col" | "area" | "base" | "embed"
+        | "track" | "wbr" => {}
+        // Elements with no Pango counterpart — just track so we balance close tags
+        _ => stack.push("none"),
+    }
+}
+
+fn emit_html_close(name: &str, out: &mut String, stack: &mut Vec<&'static str>) {
+    let expected: Option<&'static str> = match name {
+        "b" | "strong" => Some("b"),
+        "i" | "em" | "cite" | "var" | "dfn" | "blockquote" => Some("i"),
+        "u" | "ins" => Some("u"),
+        "s" | "strike" | "del" => Some("s"),
+        "tt" | "code" | "kbd" | "samp" | "pre" => Some("tt"),
+        "sup" => Some("sup"),
+        "sub" => Some("sub"),
+        "small" => Some("small"),
+        "big" => Some("big"),
+        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => Some("b"),
+        "a" => Some("a"),
+        "p" | "div" => {
+            out.push('\n');
+            // Pop the matching "none" frame we pushed on open
+            if matches!(stack.last().copied(), Some("none")) {
+                stack.pop();
+            }
+            return;
+        }
+        "li" | "section" | "article" | "header" | "footer" => {
+            if matches!(stack.last().copied(), Some("none")) {
+                stack.pop();
+            }
+            return;
+        }
+        _ => None,
+    };
+
+    let Some(exp) = expected else {
+        if matches!(stack.last().copied(), Some("none")) {
+            stack.pop();
+        }
+        return;
+    };
+
+    // Pop-until-match so mild misnesting still produces balanced markup
+    let pos = stack
+        .iter()
+        .rposition(|t| *t == exp || (exp == "a" && *t == "a-noop"));
+    let Some(pos) = pos else { return };
+
+    while stack.len() > pos + 1 {
+        let t = stack.pop().unwrap();
+        if t != "none" && t != "a-noop" {
+            out.push_str("</");
+            out.push_str(t);
+            out.push('>');
+        }
+    }
+    let t = stack.pop().unwrap();
+    if t != "a-noop" {
+        out.push_str("</");
+        out.push_str(t);
+        out.push('>');
+    }
+}
+
+fn parse_html_attr(attrs: &str, name: &str) -> Option<String> {
+    let target = name.to_ascii_lowercase();
+    let bytes = attrs.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let key_start = i;
+        while i < bytes.len()
+            && !bytes[i].is_ascii_whitespace()
+            && bytes[i] != b'='
+            && bytes[i] != b'>'
+        {
+            i += 1;
+        }
+        let key = attrs[key_start..i].to_ascii_lowercase();
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b'=' {
+            if key == target {
+                return Some(String::new());
+            }
+            continue;
+        }
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let (val, new_i) = if i < bytes.len() && (bytes[i] == b'"' || bytes[i] == b'\'') {
+            let quote = bytes[i];
+            i += 1;
+            let start = i;
+            while i < bytes.len() && bytes[i] != quote {
+                i += 1;
+            }
+            let val = &attrs[start..i];
+            if i < bytes.len() {
+                i += 1;
+            }
+            (val, i)
+        } else {
+            let start = i;
+            while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'>' {
+                i += 1;
+            }
+            (&attrs[start..i], i)
+        };
+        if key == target {
+            return Some(decode_html_attr_value(val));
+        }
+        i = new_i;
+    }
+    None
+}
+
+fn decode_html_attr_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after = &rest[amp + 1..];
+        if let Some(semi) = after.find(';') {
+            if let Some(decoded) = decode_html_entity(&after[..semi]) {
+                out.push_str(&decoded);
+                rest = &after[semi + 1..];
+                continue;
+            }
+        }
+        out.push('&');
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+fn decode_html_entity(ent: &str) -> Option<String> {
+    if let Some(num) = ent.strip_prefix('#') {
+        let code = if let Some(hex) = num.strip_prefix('x').or_else(|| num.strip_prefix('X')) {
+            u32::from_str_radix(hex, 16).ok()?
+        } else {
+            num.parse::<u32>().ok()?
+        };
+        return char::from_u32(code).map(|c| c.to_string());
+    }
+    let mapped = match ent {
+        "amp" => "&",
+        "lt" => "<",
+        "gt" => ">",
+        "quot" => "\"",
+        "apos" => "'",
+        "nbsp" => "\u{00A0}",
+        "ndash" => "–",
+        "mdash" => "—",
+        "hellip" => "…",
+        "copy" => "©",
+        "reg" => "®",
+        "trade" => "™",
+        "laquo" => "«",
+        "raquo" => "»",
+        "ldquo" => "\u{201C}",
+        "rdquo" => "\u{201D}",
+        "lsquo" => "\u{2018}",
+        "rsquo" => "\u{2019}",
+        "bull" => "•",
+        "middot" => "·",
+        "times" => "×",
+        "divide" => "÷",
+        "pound" => "£",
+        "euro" => "€",
+        "yen" => "¥",
+        "cent" => "¢",
+        "sect" => "§",
+        "para" => "¶",
+        _ => return None,
+    };
+    Some(mapped.to_string())
+}
+
 /// Resolve a Slack emoji shortcode to a Unicode emoji string.
 /// Handles Slack-specific aliases (e.g. `large_green_circle` → `green_circle`)
 /// and skin tone variants. Returns None if not a standard emoji.
