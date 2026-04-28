@@ -1,0 +1,48 @@
+{
+    "name": "sludge_dev",
+    "build": {
+        "dockerfile": "Dockerfile",
+        "args": {
+            "RUST_VERSION": "stable"
+        }
+    },
+    "runArgs": ["--name", "sludge_dev"],
+    "workspaceFolder": "/workspaces/sludge",
+    "workspaceMount": "source=${localWorkspaceFolder},target=/workspaces/sludge,type=bind,consistency=cached",
+    "remoteUser": "vscode",
+    "containerEnv": {
+        "RUST_BACKTRACE": "1"
+    },
+    "initializeCommand": "mkdir -p ${localEnv:HOME}/.claude ${localEnv:HOME}/.anthropic ${localEnv:HOME}/.docker_fish_data ${localEnv:HOME}/.docker_zoxide_data && touch ${localEnv:HOME}/.claude.json",
+    "mounts": [
+        "source=sludge-cargo-registry,target=/home/vscode/.cargo/registry,type=volume",
+        "source=sludge-cargo-git,target=/home/vscode/.cargo/git,type=volume",
+        "source=sludge-target,target=${containerWorkspaceFolder}/target,type=volume",
+        "source=${localEnv:HOME}/.claude,target=/home/vscode/.claude,type=bind,consistency=cached",
+        "source=${localEnv:HOME}/.claude.json,target=/home/vscode/.claude.json,type=bind,consistency=cached",
+        "source=${localEnv:HOME}/.anthropic,target=/home/vscode/.anthropic,type=bind,consistency=cached",
+        "source=${localEnv:HOME}/.docker_fish_data,target=/home/vscode/.local/share/fish,type=bind,consistency=cached",
+        "source=${localEnv:HOME}/.docker_zoxide_data,target=/home/vscode/.local/share/zoxide,type=bind,consistency=cached"
+    ],
+    "postCreateCommand": "sudo chown -R vscode:vscode /home/vscode/.cargo/registry /home/vscode/.cargo/git ${containerWorkspaceFolder}/target /home/vscode/.local/share/fish /home/vscode/.local/share/zoxide 2>/dev/null || true",
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "rust-lang.rust-analyzer",
+                "tamasfe.even-better-toml",
+                "vadimcn.vscode-lldb",
+                "serayuzgur.crates"
+            ],
+            "settings": {
+                "rust-analyzer.cargo.features": "all",
+                "rust-analyzer.check.command": "clippy",
+                "terminal.integrated.defaultProfile.linux": "fish",
+                "terminal.integrated.profiles.linux": {
+                    "fish": {
+                        "path": "/usr/bin/fish"
+                    }
+                }
+            }
+        }
+    }
+}
