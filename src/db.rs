@@ -3,7 +3,9 @@ use std::sync::{Arc, Mutex};
 
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use slacko::types::{Channel, Message, User};
+use slacko::types::{Channel, User};
+
+use crate::slack::message::MessageExt as Message;
 use tracing::{error, info};
 
 /// Stored login credentials.
@@ -290,6 +292,25 @@ impl Database {
         tokio::task::spawn_blocking(move || db.kv_get("cache:last_channel"))
             .await
             .ok()?
+    }
+
+    // ── Muted channels ──
+
+    pub async fn load_muted_channels(&self) -> std::collections::HashSet<String> {
+        let db = self.clone();
+        tokio::task::spawn_blocking(move || {
+            db.kv_get("muted_channels")
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    pub async fn save_muted_channels(&self, muted: &std::collections::HashSet<String>) {
+        let json = serde_json::to_string(muted).unwrap_or_else(|_| "[]".to_string());
+        let db = self.clone();
+        let _ = tokio::task::spawn_blocking(move || db.kv_set("muted_channels", &json)).await;
     }
 
     // ── Recent statuses ──

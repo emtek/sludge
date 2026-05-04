@@ -581,6 +581,13 @@ pub fn build_reaction_popover(
     tv.set_accepts_tab(false);
     tv.set_wrap_mode(gtk::WrapMode::None);
 
+    // Autocomplete list goes ABOVE the text input. Must be attached inline
+    // (not as a nested Popover) — nested Wayland popup surfaces produce
+    // "Error 71 (Protocol error)" when the outer popover is dismissed by
+    // click-outside / focus-out.
+    let (ac, ac_frame) = Autocomplete::attach_inline(&tv);
+    vbox.append(&ac_frame);
+
     let frame = gtk::Frame::new(None);
     frame.set_child(Some(&tv));
     vbox.append(&frame);
@@ -599,9 +606,6 @@ pub fn build_reaction_popover(
         });
         tv.add_controller(key_ctl);
     }
-
-    // Attach emoji-only autocomplete
-    let ac = Autocomplete::attach(&tv);
 
     // Escape closes the reaction popover (and the autocomplete list with it,
     // since it's a child). Capture phase runs before the autocomplete handler.

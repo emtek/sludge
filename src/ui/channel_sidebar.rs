@@ -17,6 +17,10 @@ pub enum ChannelAction {
     WatchPresence(String),
     /// Stop watching a user's presence (user_id).
     UnwatchPresence(String),
+    /// Toggle mute state for the channel. The sidebar owns the truth for which
+    /// channels are muted; the app handler persists and suppresses
+    /// notifications based on that state.
+    ToggleMute,
 }
 
 /// Callback type for channel actions: (action, channel_id)
@@ -69,6 +73,11 @@ pub struct ChannelSidebar {
     /// Number of weeks back to consider a channel/DM "recent" for sidebar filtering.
     /// Shared so the live-filter closure picks up changes from `set_activity_weeks`.
     activity_weeks: Rc<RefCell<u32>>,
+    /// Muted channel IDs — the source of truth for which rows show the mute
+    /// icon and which context-menu item is labelled "Unmute".
+    muted: Rc<RefCell<std::collections::HashSet<String>>>,
+    /// Mute icon Label per channel ID; `set_muted` toggles its visibility.
+    mute_icons: Rc<RefCell<HashMap<String, Label>>>,
 }
 
 impl ChannelSidebar {
@@ -351,7 +360,54 @@ impl ChannelSidebar {
             create_group_callback,
             create_channel_callback,
             activity_weeks,
+            muted: Rc::new(RefCell::new(std::collections::HashSet::new())),
+            mute_icons: Rc::new(RefCell::new(HashMap::new())),
         }
+    }
+
+    /// Replace the muted set (called once on startup from DB), then update
+    /// every row's icon visibility to match.
+    pub fn set_muted_channels(&self, muted: std::collections::HashSet<String>) {
+        for (cid, icon) in self.mute_icons.borrow().iter() {
+            icon.set_visible(muted.contains(cid));
+        }
+        *self.muted.borrow_mut() = muted;
+    }
+
+    /// Toggle the mute state for a single channel. Returns the new muted state
+    /// (true = now muted). Callers persist this to the DB.
+    pub fn toggle_muted(&self, channel_id: &str) -> bool {
+        let now_muted = {
+            let mut m = self.muted.borrow_mut();
+            if m.contains(channel_id) {
+                m.remove(channel_id);
+                false
+            } else {
+                m.insert(channel_id.to_string());
+                true
+            }
+        };
+        if let Some(icon) = self.mute_icons.borrow().get(channel_id) {
+            icon.set_visible(now_muted);
+        }
+        now_muted
+    }
+
+    pub fn is_muted(&self, channel_id: &str) -> bool {
+        self.muted.borrow().contains(channel_id)
+    }
+
+    pub fn muted_snapshot(&self) -> std::collections::HashSet<String> {
+        self.muted.borrow().clone()
+    }
+
+    fn make_mute_icon() -> Label {
+        // U+1F515 "bell with slash" — matches Slack's muted-channel indicator.
+        let l = Label::new(Some("\u{1F515}"));
+        l.add_css_class("dim-label");
+        l.add_css_class("caption");
+        l.set_visible(false);
+        l
     }
 
     pub fn set_action_callback(&self, cb: ChannelActionCallback) {
@@ -636,14 +692,18 @@ impl ChannelSidebar {
         // prevent leaking.
         Self::clear_list(&self.channels_list);
         let mut new_badges = HashMap::new();
+        let mut new_mute_icons = HashMap::new();
+        let muted_set = self.muted.borrow();
         let acb = self.action_callback.borrow().clone();
         let watched = &self.watched_users;
         for ch in &ch_list {
-            let (row, badge) = Self::make_channel_row(ch);
+            let (row, badge, mute_icon) = Self::make_channel_row(ch);
             row.set_visible(Self::is_recent(&act, &ch.id, &cutoff));
-            Self::attach_context_menu(&row, &ch.id, false, None, &acb, watched, &self.watch_labels, &self.status_emoji, &self.status_text);
+            mute_icon.set_visible(muted_set.contains(&ch.id));
+            Self::attach_context_menu(&row, &ch.id, false, None, &acb, watched, &self.watch_labels, &self.status_emoji, &self.status_text, &self.muted);
             self.channels_list.append(&row);
             new_badges.insert(ch.id.clone(), badge);
+            new_mute_icons.insert(ch.id.clone(), mute_icon);
         }
 
         // Rebuild DM list
@@ -658,8 +718,9 @@ impl ChannelSidebar {
         for ch in &dm_list {
             let user_watched = ch.user.as_ref()
                 .is_some_and(|uid| watched_set.contains(uid));
-            let (row, badge, presence_lbl, status_box, watch_label) = Self::make_dm_row(ch, &names, user_watched);
-            Self::attach_context_menu(&row, &ch.id, true, ch.user.as_deref(), &acb, watched, &self.watch_labels, &self.status_emoji, &self.status_text);
+            let (row, badge, presence_lbl, status_box, watch_label, mute_icon) = Self::make_dm_row(ch, &names, user_watched);
+            mute_icon.set_visible(muted_set.contains(&ch.id));
+            Self::attach_context_menu(&row, &ch.id, true, ch.user.as_deref(), &acb, watched, &self.watch_labels, &self.status_emoji, &self.status_text, &self.muted);
             // Show/hide based on activity recency and presence state
             if !Self::is_recent(&act, &ch.id, &cutoff) {
                 row.set_visible(false);
@@ -672,6 +733,7 @@ impl ChannelSidebar {
             }
             self.dm_list.append(&row);
             new_badges.insert(ch.id.clone(), badge);
+            new_mute_icons.insert(ch.id.clone(), mute_icon);
             if let Some(uid) = &ch.user {
                 new_presence_icons.insert(uid.clone(), presence_lbl);
                 new_status_icons.insert(uid.clone(), status_box);
@@ -685,17 +747,21 @@ impl ChannelSidebar {
         // Rebuild group list
         Self::clear_list(&self.group_list);
         for ch in &gr_list {
-            let (row, badge) = Self::make_group_row(ch, &names);
+            let (row, badge, mute_icon) = Self::make_group_row(ch, &names);
             row.set_visible(Self::is_recent(&act, &ch.id, &cutoff));
-            Self::attach_context_menu(&row, &ch.id, true, None, &acb, watched, &self.watch_labels, &self.status_emoji, &self.status_text);
+            mute_icon.set_visible(muted_set.contains(&ch.id));
+            Self::attach_context_menu(&row, &ch.id, true, None, &acb, watched, &self.watch_labels, &self.status_emoji, &self.status_text, &self.muted);
             self.group_list.append(&row);
             new_badges.insert(ch.id.clone(), badge);
+            new_mute_icons.insert(ch.id.clone(), mute_icon);
         }
+        drop(muted_set);
 
         // `dn` was precomputed above (before sorting); reuse it as the
         // display-name lookup used by the search sort_func.
         *self.display_names.borrow_mut() = dn;
         *self.badges.borrow_mut() = new_badges;
+        *self.mute_icons.borrow_mut() = new_mute_icons;
         *self.presence_icons.borrow_mut() = new_presence_icons;
         *self.status_icons.borrow_mut() = new_status_icons;
         *self.dm_rows.borrow_mut() = new_dm_rows;
@@ -745,12 +811,16 @@ impl ChannelSidebar {
         let acb = self.action_callback.borrow().clone();
         let watched = &self.watched_users;
 
+        let muted_now = self.muted.borrow().contains(id);
+
         if Self::is_mpdm(channel) {
-            let (row, badge) = Self::make_group_row(channel, &names);
+            let (row, badge, mute_icon) = Self::make_group_row(channel, &names);
             row.set_visible(true);
-            Self::attach_context_menu(&row, id, true, None, &acb, watched, &self.watch_labels, &self.status_emoji, &self.status_text);
+            mute_icon.set_visible(muted_now);
+            Self::attach_context_menu(&row, id, true, None, &acb, watched, &self.watch_labels, &self.status_emoji, &self.status_text, &self.muted);
             self.group_list.append(&row);
             self.badges.borrow_mut().insert(id.clone(), badge);
+            self.mute_icons.borrow_mut().insert(id.clone(), mute_icon);
             self.display_names.borrow_mut().insert(
                 id.clone(),
                 Self::group_display_name(channel, &names).to_lowercase(),
@@ -759,12 +829,14 @@ impl ChannelSidebar {
         } else if channel.is_im == Some(true) {
             let user_watched = channel.user.as_ref()
                 .is_some_and(|uid| self.watched_users.borrow().contains(uid));
-            let (row, badge, presence_lbl, status_box, watch_label) =
+            let (row, badge, presence_lbl, status_box, watch_label, mute_icon) =
                 Self::make_dm_row(channel, &names, user_watched);
             row.set_visible(true);
-            Self::attach_context_menu(&row, id, true, channel.user.as_deref(), &acb, watched, &self.watch_labels, &self.status_emoji, &self.status_text);
+            mute_icon.set_visible(muted_now);
+            Self::attach_context_menu(&row, id, true, channel.user.as_deref(), &acb, watched, &self.watch_labels, &self.status_emoji, &self.status_text, &self.muted);
             self.dm_list.append(&row);
             self.badges.borrow_mut().insert(id.clone(), badge);
+            self.mute_icons.borrow_mut().insert(id.clone(), mute_icon);
             self.display_names.borrow_mut().insert(
                 id.clone(),
                 Self::dm_display_name(channel, &names).to_lowercase(),
@@ -777,11 +849,13 @@ impl ChannelSidebar {
             }
             self.dms.borrow_mut().push(channel.clone());
         } else {
-            let (row, badge) = Self::make_channel_row(channel);
+            let (row, badge, mute_icon) = Self::make_channel_row(channel);
             row.set_visible(true);
-            Self::attach_context_menu(&row, id, false, None, &acb, watched, &self.watch_labels, &self.status_emoji, &self.status_text);
+            mute_icon.set_visible(muted_now);
+            Self::attach_context_menu(&row, id, false, None, &acb, watched, &self.watch_labels, &self.status_emoji, &self.status_text, &self.muted);
             self.channels_list.append(&row);
             self.badges.borrow_mut().insert(id.clone(), badge);
+            self.mute_icons.borrow_mut().insert(id.clone(), mute_icon);
             self.display_names.borrow_mut().insert(
                 id.clone(),
                 channel_display_name(channel).to_lowercase(),
@@ -802,8 +876,10 @@ impl ChannelSidebar {
         watch_labels: &Rc<RefCell<HashMap<String, Label>>>,
         status_emoji: &Rc<RefCell<HashMap<String, String>>>,
         status_text: &Rc<RefCell<HashMap<String, String>>>,
+        muted: &Rc<RefCell<std::collections::HashSet<String>>>,
     ) {
         let Some(acb) = action_cb.clone() else { return };
+        let muted = muted.clone();
 
         // Lazy-create the popover on first right-click. With hundreds of
         // channels in the sidebar, eagerly building a Popover per row holds
@@ -950,13 +1026,29 @@ impl ChannelSidebar {
                 }
             }
 
+            // Mute toggle — available for both DMs/groups and channels.
+            {
+                let is_muted = muted.borrow().contains(&cid);
+                let label = if is_muted { "Unmute" } else { "Mute" };
+                let mute_btn = gtk::Button::with_label(label);
+                mute_btn.add_css_class("flat");
+                let cid = cid.clone();
+                let acb2 = acb.clone();
+                let pop = popover.clone();
+                mute_btn.connect_clicked(move |_| {
+                    acb2(ChannelAction::ToggleMute, &cid);
+                    pop.popdown();
+                });
+                menu_box.append(&mute_btn);
+            }
+
             popover.set_child(Some(&menu_box));
             popover.popup();
         });
         row.add_controller(gesture);
     }
 
-    fn make_channel_row(channel: &Channel) -> (ListBoxRow, Label) {
+    fn make_channel_row(channel: &Channel) -> (ListBoxRow, Label, Label) {
         let row = ListBoxRow::new();
 
         let label_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -982,6 +1074,9 @@ impl ChannelSidebar {
         name_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         label_box.append(&name_label);
 
+        let mute_icon = Self::make_mute_icon();
+        label_box.append(&mute_icon);
+
         let badge = Label::new(None);
         badge.add_css_class("unread-badge");
         badge.set_halign(gtk::Align::End);
@@ -991,14 +1086,14 @@ impl ChannelSidebar {
         row.set_child(Some(&label_box));
         row.set_widget_name(&channel.id);
 
-        (row, badge)
+        (row, badge, mute_icon)
     }
 
     fn make_dm_row(
         channel: &Channel,
         user_names: &HashMap<String, String>,
         is_watched: bool,
-    ) -> (ListBoxRow, Label, Label, gtk::Box, Label) {
+    ) -> (ListBoxRow, Label, Label, gtk::Box, Label, Label) {
         let row = ListBoxRow::new();
 
         let label_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -1028,6 +1123,9 @@ impl ChannelSidebar {
         watch_label.set_visible(is_watched);
         label_box.append(&watch_label);
 
+        let mute_icon = Self::make_mute_icon();
+        label_box.append(&mute_icon);
+
         let badge = Label::new(None);
         badge.add_css_class("unread-badge");
         badge.set_halign(gtk::Align::End);
@@ -1037,13 +1135,13 @@ impl ChannelSidebar {
         row.set_child(Some(&label_box));
         row.set_widget_name(&channel.id);
 
-        (row, badge, presence_label, status_container, watch_label)
+        (row, badge, presence_label, status_container, watch_label, mute_icon)
     }
 
     fn make_group_row(
         channel: &Channel,
         user_names: &HashMap<String, String>,
-    ) -> (ListBoxRow, Label) {
+    ) -> (ListBoxRow, Label, Label) {
         let row = ListBoxRow::new();
 
         let label_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
@@ -1063,6 +1161,9 @@ impl ChannelSidebar {
         name_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         label_box.append(&name_label);
 
+        let mute_icon = Self::make_mute_icon();
+        label_box.append(&mute_icon);
+
         let badge = Label::new(None);
         badge.add_css_class("unread-badge");
         badge.set_halign(gtk::Align::End);
@@ -1072,7 +1173,7 @@ impl ChannelSidebar {
         row.set_child(Some(&label_box));
         row.set_widget_name(&channel.id);
 
-        (row, badge)
+        (row, badge, mute_icon)
     }
 
     fn dm_display_name(channel: &Channel, user_names: &HashMap<String, String>) -> String {

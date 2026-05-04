@@ -1,12 +1,12 @@
 use gtk4::prelude::*;
 use gtk4::{self as gtk, Button, Label, ListBox, ListBoxRow, Picture, ScrolledWindow};
-use slacko::types::Message;
+use crate::slack::message::MessageExt as Message;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::slack::client::Client;
-use crate::slack::helpers::{format_message_markup, html_to_pango, looks_like_html};
+use crate::slack::helpers::{decode_slack_entities, format_message_markup, get_team_id, html_to_pango, looks_like_html, resolve_slack_shortcode};
 
 /// Callback type for starting a reply to a message:
 /// (thread_ts, channel_id, user_display_name, text_preview)
@@ -44,6 +44,8 @@ pub struct MessageView {
     pub list_box: ListBox,
     scrolled: ScrolledWindow,
     pub header_label: Label,
+    /// Single-line channel topic shown below the channel name. Hidden when empty.
+    pub topic_label: Label,
     pub search_entry: gtk::SearchEntry,
     pub spinner: gtk::Spinner,
     pub thread_callback: RefCell<Option<ThreadOpenCallback>>,
@@ -114,10 +116,21 @@ impl MessageView {
         search_entry.set_hexpand(true);
         search_entry.set_visible(false);
 
-        let header_stack = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        let topic_label = Label::new(None);
+        topic_label.add_css_class("dim-label");
+        topic_label.add_css_class("caption");
+        topic_label.set_halign(gtk::Align::Start);
+        topic_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        topic_label.set_single_line_mode(true);
+        topic_label.set_xalign(0.0);
+        topic_label.set_visible(false);
+        topic_label.set_use_markup(true);
+
+        let header_stack = gtk::Box::new(gtk::Orientation::Vertical, 0);
         header_stack.set_hexpand(true);
         header_stack.append(&header_label);
         header_stack.append(&search_entry);
+        header_stack.append(&topic_label);
         header.append(&header_stack);
 
         let typing_label = Label::new(None);
@@ -188,6 +201,7 @@ impl MessageView {
             list_box,
             scrolled,
             header_label,
+            topic_label,
             search_entry,
             spinner,
             thread_callback: RefCell::new(None),
@@ -581,6 +595,18 @@ impl MessageView {
         self.header_label.set_text(&format!("# {name}"));
     }
 
+    /// Set the single-line channel topic shown under the channel name.
+    /// Pass an already-formatted Pango markup string, or an empty string to hide.
+    pub fn set_channel_topic_markup(&self, markup: &str) {
+        if markup.is_empty() {
+            self.topic_label.set_visible(false);
+            self.topic_label.set_markup("");
+        } else {
+            self.topic_label.set_markup(markup);
+            self.topic_label.set_visible(true);
+        }
+    }
+
     pub fn set_channel_id(&self, id: &str) {
         *self.channel_id.borrow_mut() = Some(id.to_string());
     }
@@ -709,6 +735,7 @@ impl MessageView {
     ) {
         self.clear();
         self.set_channel_name("Search Results");
+        self.set_channel_topic_markup("");
         self.set_channel_id("");
 
         let thread_cb = self.thread_callback.borrow();
@@ -876,14 +903,12 @@ impl MessageView {
             &thread_expand_cb, &self.expanded_threads, &self.stored_textures,
         );
         self.list_box.append(&row);
-        // Lightweight scroll: wait for GTK to lay out the new row (next frame),
-        // then snap to bottom. Unlike scroll_to_bottom(), this does not hold a
-        // row reference or start a polling timer — safe to call per-message.
-        let scrolled = self.scrolled.clone();
-        gtk4::glib::timeout_add_local_once(std::time::Duration::from_millis(50), move || {
-            let adj = scrolled.vadjustment();
-            adj.set_value(adj.upper() - adj.page_size());
-        });
+        // Poll for the new row's layout, then scroll its bottom to the
+        // viewport bottom. A one-shot timeout is unreliable: if the row hasn't
+        // been laid out yet, `adj.upper()` still reflects the old content and
+        // we snap to the *old* bottom, leaving the new message just below the
+        // viewport.
+        self.scroll_row_to_bottom(&row);
     }
 
     pub fn scroll_to_bottom(&self) {
@@ -1046,9 +1071,13 @@ pub fn make_message_row(
     let user_id = msg.user.as_deref()
         .or(msg.bot_id.as_deref())
         .unwrap_or("unknown");
-    let display_name = users
-        .get(user_id)
-        .map(|s| s.as_str())
+    // Bot messages carry their display name directly on the message (via
+    // `username` / `bot_profile.name`) since bots aren't in the users map.
+    let display_name = msg
+        .username
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .or_else(|| users.get(user_id).map(|s| s.as_str()))
         .unwrap_or(user_id);
 
     // Clickable name that opens DM
@@ -1213,10 +1242,42 @@ pub fn make_message_row(
 
     outer.append(&header);
 
+    // Render Block Kit blocks as widgets when any block type we support is
+    // present; otherwise fall back to `msg.text`. We intentionally gate on
+    // supported types rather than "any block" so that messages with only
+    // unrenderable blocks (actions/input/unknown) still show something via
+    // the text path.
+    let render_block_widgets = msg
+        .blocks
+        .as_ref()
+        .is_some_and(|bs| bs.iter().any(|b| {
+            matches!(
+                b.get("type").and_then(|v| v.as_str()).unwrap_or(""),
+                "section" | "header" | "divider" | "context" | "image" | "rich_text" | "actions",
+            )
+        }));
+
     // Message body with clickable @mentions and inline custom emoji
-    if !msg.text.is_empty() {
+    if !render_block_widgets && !msg.text.is_empty() {
         let body = make_message_body(&msg.text, users, subteam_names, mention_cb);
         outer.append(&body);
+    }
+
+    if render_block_widgets {
+        if let Some(blocks) = &msg.blocks {
+            render_blocks(
+                &outer,
+                blocks,
+                users,
+                subteam_names,
+                mention_cb,
+                client,
+                rt,
+                image_generation,
+                stored_textures,
+                channel_id,
+            );
+        }
     }
 
     // Render attachment text content (title, pretext, text, fallback)
@@ -2046,4 +2107,595 @@ fn make_highlighted_body(highlighted: &str) -> gtk::Widget {
     body.set_selectable(true);
     body.set_xalign(0.0);
     body.upcast()
+}
+
+// ── Block Kit rendering ──
+//
+// Handles the common layout blocks used by bots and integrations: section,
+// header, divider, context, image, rich_text, and actions. For `actions`
+// only `button` elements with a `url` are functional — clicking opens the
+// link. Buttons without a url are rendered but inert: a stealth client has
+// no supported way to dispatch block_actions payloads to the app.
+// `input` and other interactive elements are still skipped.
+
+fn render_blocks(
+    outer: &gtk::Box,
+    blocks: &[serde_json::Value],
+    users: &HashMap<String, String>,
+    subteam_names: &HashMap<String, String>,
+    mention_cb: &Option<MentionCallback>,
+    client: &Client,
+    rt: &tokio::runtime::Handle,
+    image_generation: &Rc<Cell<u64>>,
+    stored_textures: &Rc<RefCell<Vec<Rc<RefCell<Option<gtk4::gdk::Texture>>>>>>,
+    channel_id: Option<&str>,
+) {
+    for block in blocks {
+        let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        match block_type {
+            "section" => render_section_block(outer, block, users, subteam_names, mention_cb),
+            "header" => render_header_block(outer, block),
+            "divider" => {
+                let sep = gtk::Separator::new(gtk::Orientation::Horizontal);
+                sep.set_margin_top(4);
+                sep.set_margin_bottom(4);
+                outer.append(&sep);
+            }
+            "context" => render_context_block(
+                outer, block, users, subteam_names,
+                client, rt, image_generation, stored_textures,
+            ),
+            "image" => render_image_block(
+                outer, block, client, rt, image_generation, stored_textures,
+            ),
+            "rich_text" => render_rich_text_block(outer, block, users, subteam_names, mention_cb),
+            "actions" => render_actions_block(outer, block, channel_id),
+            _ => {
+                // Unknown block type — skip silently. A fallback label here would
+                // produce noise for known-but-unhandled types like `input`.
+            }
+        }
+    }
+}
+
+fn render_section_block(
+    outer: &gtk::Box,
+    block: &serde_json::Value,
+    users: &HashMap<String, String>,
+    subteam_names: &HashMap<String, String>,
+    mention_cb: &Option<MentionCallback>,
+) {
+    // Main text
+    if let Some(text_obj) = block.get("text") {
+        if let Some(markup) = text_object_to_markup(text_obj, users, subteam_names) {
+            let label = make_block_label(&markup, mention_cb);
+            outer.append(&label);
+        }
+    }
+
+    // Fields — two-column grid
+    if let Some(fields) = block.get("fields").and_then(|v| v.as_array()) {
+        if !fields.is_empty() {
+            let grid = gtk::Grid::new();
+            grid.set_column_spacing(16);
+            grid.set_row_spacing(2);
+            grid.set_hexpand(true);
+            for (i, field) in fields.iter().enumerate() {
+                if let Some(markup) = text_object_to_markup(field, users, subteam_names) {
+                    let label = make_block_label(&markup, mention_cb);
+                    label.set_hexpand(true);
+                    let col = (i % 2) as i32;
+                    let row = (i / 2) as i32;
+                    grid.attach(&label, col, row, 1, 1);
+                }
+            }
+            outer.append(&grid);
+        }
+    }
+}
+
+fn render_header_block(outer: &gtk::Box, block: &serde_json::Value) {
+    let Some(text) = block
+        .get("text")
+        .and_then(|t| t.get("text"))
+        .and_then(|v| v.as_str())
+    else {
+        return;
+    };
+    let label = Label::new(None);
+    let markup = format!(
+        "<span size=\"large\" weight=\"bold\">{}</span>",
+        gtk4::glib::markup_escape_text(text),
+    );
+    label.set_markup(&markup);
+    label.set_wrap(true);
+    label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    label.set_halign(gtk::Align::Start);
+    label.set_xalign(0.0);
+    label.set_selectable(true);
+    label.set_margin_top(4);
+    label.set_margin_bottom(2);
+    outer.append(&label);
+}
+
+fn render_context_block(
+    outer: &gtk::Box,
+    block: &serde_json::Value,
+    users: &HashMap<String, String>,
+    subteam_names: &HashMap<String, String>,
+    client: &Client,
+    rt: &tokio::runtime::Handle,
+    image_generation: &Rc<Cell<u64>>,
+    stored_textures: &Rc<RefCell<Vec<Rc<RefCell<Option<gtk4::gdk::Texture>>>>>>,
+) {
+    let Some(elements) = block.get("elements").and_then(|v| v.as_array()) else {
+        return;
+    };
+
+    let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    hbox.set_halign(gtk::Align::Start);
+
+    for el in elements {
+        let el_type = el.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        match el_type {
+            "image" => {
+                let Some(url) = el.get("image_url").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let picture = Picture::new();
+                picture.set_size_request(20, 20);
+                picture.set_can_shrink(true);
+                picture.set_content_fit(gtk::ContentFit::Contain);
+                load_image_into_picture(
+                    &picture, url, client, rt, image_generation, stored_textures,
+                );
+                hbox.append(&picture);
+            }
+            "mrkdwn" | "plain_text" => {
+                if let Some(markup) = text_object_to_markup(el, users, subteam_names) {
+                    let label = Label::new(None);
+                    label.set_markup(&format!(
+                        "<span size=\"small\" foreground=\"#888\">{markup}</span>"
+                    ));
+                    label.set_wrap(true);
+                    label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+                    label.set_halign(gtk::Align::Start);
+                    label.set_xalign(0.0);
+                    label.set_selectable(true);
+                    hbox.append(&label);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    outer.append(&hbox);
+}
+
+fn render_image_block(
+    outer: &gtk::Box,
+    block: &serde_json::Value,
+    client: &Client,
+    rt: &tokio::runtime::Handle,
+    image_generation: &Rc<Cell<u64>>,
+    stored_textures: &Rc<RefCell<Vec<Rc<RefCell<Option<gtk4::gdk::Texture>>>>>>,
+) {
+    let Some(url) = block.get("image_url").and_then(|v| v.as_str()) else {
+        return;
+    };
+
+    if let Some(title) = block
+        .get("title")
+        .and_then(|t| t.get("text"))
+        .and_then(|v| v.as_str())
+    {
+        if !title.is_empty() {
+            let label = Label::new(None);
+            label.set_markup(&format!(
+                "<b>{}</b>",
+                gtk4::glib::markup_escape_text(title),
+            ));
+            label.set_halign(gtk::Align::Start);
+            label.set_xalign(0.0);
+            label.set_selectable(true);
+            outer.append(&label);
+        }
+    }
+
+    let picture = Picture::new();
+    picture.set_halign(gtk::Align::Start);
+    picture.set_content_fit(gtk::ContentFit::ScaleDown);
+    picture.set_size_request(200, 150);
+    picture.set_can_shrink(true);
+    load_image_into_picture(
+        &picture, url, client, rt, image_generation, stored_textures,
+    );
+    outer.append(&picture);
+}
+
+fn render_rich_text_block(
+    outer: &gtk::Box,
+    block: &serde_json::Value,
+    users: &HashMap<String, String>,
+    subteam_names: &HashMap<String, String>,
+    mention_cb: &Option<MentionCallback>,
+) {
+    let Some(elements) = block.get("elements").and_then(|v| v.as_array()) else {
+        return;
+    };
+
+    let mut lines: Vec<String> = Vec::new();
+    for el in elements {
+        let el_type = el.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        match el_type {
+            "rich_text_section" => {
+                if let Some(line) = rich_text_section_to_markup(el, users, subteam_names) {
+                    lines.push(line);
+                }
+            }
+            "rich_text_preformatted" => {
+                if let Some(inner) = el.get("elements").and_then(|v| v.as_array()) {
+                    let raw: String = inner
+                        .iter()
+                        .filter_map(|e| e.get("text").and_then(|v| v.as_str()))
+                        .collect();
+                    if !raw.is_empty() {
+                        lines.push(format!(
+                            "<tt>{}</tt>",
+                            gtk4::glib::markup_escape_text(&raw),
+                        ));
+                    }
+                }
+            }
+            "rich_text_quote" => {
+                if let Some(line) = rich_text_section_to_markup(el, users, subteam_names) {
+                    for l in line.lines() {
+                        lines.push(format!(
+                            "<span foreground=\"#888\">▏</span> {l}"
+                        ));
+                    }
+                }
+            }
+            "rich_text_list" => {
+                let style = el.get("style").and_then(|v| v.as_str()).unwrap_or("bullet");
+                let indent = el.get("indent").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                if let Some(items) = el.get("elements").and_then(|v| v.as_array()) {
+                    for (i, item) in items.iter().enumerate() {
+                        if let Some(line) = rich_text_section_to_markup(item, users, subteam_names) {
+                            let prefix = if style == "ordered" {
+                                format!("{}. ", i + 1)
+                            } else {
+                                "• ".to_string()
+                            };
+                            let pad = "    ".repeat(indent);
+                            lines.push(format!("{pad}{prefix}{line}"));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if lines.is_empty() {
+        return;
+    }
+
+    let label = make_block_label(&lines.join("\n"), mention_cb);
+    outer.append(&label);
+}
+
+/// Render an `actions` block as a horizontal row of buttons. Only `button`
+/// elements are supported; selects/datepickers/etc. are skipped. Buttons with
+/// a `url` open the link on click. Buttons without one fall back to opening
+/// the channel in the Slack web app — we can't dispatch `block_actions`, but
+/// most action buttons trigger flows that ultimately surface back in-channel,
+/// so this gets the user where they need to go.
+fn render_actions_block(
+    outer: &gtk::Box,
+    block: &serde_json::Value,
+    channel_id: Option<&str>,
+) {
+    let Some(elements) = block.get("elements").and_then(|v| v.as_array()) else {
+        return;
+    };
+
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    row.set_halign(gtk::Align::Start);
+    row.set_margin_top(2);
+    row.set_margin_bottom(2);
+
+    let mut any = false;
+    for el in elements {
+        if el.get("type").and_then(|v| v.as_str()) != Some("button") {
+            continue;
+        }
+        let raw = el
+            .get("text")
+            .and_then(|t| t.get("text"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let label = expand_unicode_emoji(raw);
+
+        let btn = Button::with_label(&label);
+        match el.get("style").and_then(|v| v.as_str()) {
+            Some("primary") => btn.add_css_class("suggested-action"),
+            Some("danger") => btn.add_css_class("destructive-action"),
+            _ => {}
+        }
+
+        let target_url = el
+            .get("url")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .or_else(|| channel_web_url(channel_id));
+
+        if let Some(url) = target_url {
+            btn.connect_clicked(move |_| {
+                if let Err(e) = gtk4::gio::AppInfo::launch_default_for_uri(
+                    &url,
+                    gtk4::gio::AppLaunchContext::NONE,
+                ) {
+                    tracing::error!("Failed to open block button URL {url}: {e}");
+                }
+            });
+        } else {
+            btn.set_sensitive(false);
+        }
+
+        row.append(&btn);
+        any = true;
+    }
+
+    if any {
+        outer.append(&row);
+    }
+}
+
+/// Build the Slack web-app deep link for the given channel, e.g.
+/// `https://app.slack.com/client/T04SSGLGV/D0AUE0W6CHY`. Returns `None` if
+/// either the channel id or the workspace team id is unknown.
+fn channel_web_url(channel_id: Option<&str>) -> Option<String> {
+    let cid = channel_id?;
+    let team = get_team_id()?;
+    Some(format!("https://app.slack.com/client/{team}/{cid}"))
+}
+
+/// Replace `:shortcode:` sequences with Unicode emoji where possible. Used
+/// for plain-text widget contexts (button labels, tooltips) that can't render
+/// the U+FFFC custom-emoji placeholder used in markup paths. Unknown or
+/// custom shortcodes are left as their literal `:name:` text.
+fn expand_unicode_emoji(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(':') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        if let Some(end) = after.find(':') {
+            let code = &after[..end];
+            if !code.is_empty()
+                && code.len() <= 50
+                && code
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'+')
+                && let Some(unicode) = resolve_slack_shortcode(code)
+            {
+                out.push_str(unicode);
+                rest = &after[end + 1..];
+                continue;
+            }
+            out.push(':');
+            rest = after;
+        } else {
+            out.push(':');
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Convert a `rich_text_section` (or `rich_text_quote`) element list into a
+/// single-line Pango markup string, applying bold/italic/code/strike styles
+/// and resolving mentions and emoji.
+fn rich_text_section_to_markup(
+    section: &serde_json::Value,
+    users: &HashMap<String, String>,
+    subteam_names: &HashMap<String, String>,
+) -> Option<String> {
+    let elements = section.get("elements").and_then(|v| v.as_array())?;
+    let mut out = String::new();
+    for e in elements {
+        let t = e.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let style = e.get("style");
+        let piece = match t {
+            "text" => {
+                let txt = e.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                let decoded = decode_slack_entities(txt);
+                gtk4::glib::markup_escape_text(&decoded).to_string()
+            }
+            "link" => {
+                let url = e.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                let raw_display = e.get("text").and_then(|v| v.as_str()).unwrap_or(url);
+                let decoded_url = decode_slack_entities(url);
+                let decoded_display = decode_slack_entities(raw_display);
+                format!(
+                    "<a href=\"{}\">{}</a>",
+                    gtk4::glib::markup_escape_text(&decoded_url),
+                    gtk4::glib::markup_escape_text(&decoded_display),
+                )
+            }
+            "user" => {
+                let uid = e.get("user_id").and_then(|v| v.as_str()).unwrap_or("");
+                let name = users.get(uid).map(|s| s.as_str()).unwrap_or(uid);
+                format!(
+                    "<a href=\"mention:{}\">@{}</a>",
+                    gtk4::glib::markup_escape_text(uid),
+                    gtk4::glib::markup_escape_text(name),
+                )
+            }
+            "usergroup" => {
+                let id = e.get("usergroup_id").and_then(|v| v.as_str()).unwrap_or("");
+                let name = subteam_names.get(id).map(|s| s.as_str()).unwrap_or(id);
+                format!("@{}", gtk4::glib::markup_escape_text(name))
+            }
+            "channel" => {
+                let id = e.get("channel_id").and_then(|v| v.as_str()).unwrap_or("");
+                format!("#{}", gtk4::glib::markup_escape_text(id))
+            }
+            "emoji" => {
+                let name = e.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let unicode = e.get("unicode").and_then(|v| v.as_str());
+                if let Some(u) = unicode {
+                    decode_emoji_unicode(u)
+                        .unwrap_or_else(|| format!(":{}:", gtk4::glib::markup_escape_text(name)))
+                } else {
+                    format!(":{}:", gtk4::glib::markup_escape_text(name))
+                }
+            }
+            "broadcast" => {
+                let range = e.get("range").and_then(|v| v.as_str()).unwrap_or("");
+                format!("@{range}")
+            }
+            _ => String::new(),
+        };
+
+        if piece.is_empty() {
+            continue;
+        }
+
+        let styled = apply_rich_text_style(&piece, style, t == "text");
+        out.push_str(&styled);
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+fn apply_rich_text_style(
+    piece: &str,
+    style: Option<&serde_json::Value>,
+    apply_code: bool,
+) -> String {
+    let Some(style) = style else {
+        return piece.to_string();
+    };
+    let mut s = piece.to_string();
+    // Code wrapping escapes markup inside, so only apply to plain text pieces
+    // to avoid double-escaping links/mentions that already carry tags.
+    if apply_code && style.get("code").and_then(|v| v.as_bool()) == Some(true) {
+        s = format!("<tt>{s}</tt>");
+    }
+    if style.get("bold").and_then(|v| v.as_bool()) == Some(true) {
+        s = format!("<b>{s}</b>");
+    }
+    if style.get("italic").and_then(|v| v.as_bool()) == Some(true) {
+        s = format!("<i>{s}</i>");
+    }
+    if style.get("strike").and_then(|v| v.as_bool()) == Some(true) {
+        s = format!("<s>{s}</s>");
+    }
+    s
+}
+
+/// Decode a Slack emoji unicode codepoint string (e.g. "1f600" or "1f1ec-1f1e7").
+fn decode_emoji_unicode(s: &str) -> Option<String> {
+    let mut out = String::new();
+    for part in s.split('-') {
+        let cp = u32::from_str_radix(part, 16).ok()?;
+        out.push(char::from_u32(cp)?);
+    }
+    Some(gtk4::glib::markup_escape_text(&out).to_string())
+}
+
+/// Turn a `mrkdwn` or `plain_text` composition object into a Pango markup string.
+fn text_object_to_markup(
+    obj: &serde_json::Value,
+    users: &HashMap<String, String>,
+    subteam_names: &HashMap<String, String>,
+) -> Option<String> {
+    let text = obj.get("text").and_then(|v| v.as_str())?;
+    if text.is_empty() {
+        return None;
+    }
+    let ty = obj.get("type").and_then(|v| v.as_str()).unwrap_or("mrkdwn");
+    match ty {
+        "mrkdwn" => Some(format_message_markup(text, users, subteam_names)),
+        _ => Some(gtk4::glib::markup_escape_text(text).to_string()),
+    }
+}
+
+/// Build a standard block-content Label wired up with the same mention/link
+/// click handling as regular message bodies.
+fn make_block_label(markup: &str, mention_cb: &Option<MentionCallback>) -> Label {
+    let label = Label::new(None);
+    label.set_markup(markup);
+    label.set_wrap(true);
+    label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    label.set_halign(gtk::Align::Fill);
+    label.set_hexpand(true);
+    label.set_selectable(true);
+    label.set_xalign(0.0);
+    label.set_use_markup(true);
+    if let Some(cb) = mention_cb.clone() {
+        label.connect_activate_link(move |_, uri| {
+            if let Some(user_id) = uri.strip_prefix("mention:") {
+                cb(user_id);
+                return gtk4::glib::Propagation::Stop;
+            }
+            gtk4::glib::Propagation::Proceed
+        });
+    }
+    label
+}
+
+/// Async-load an image URL into an existing `gtk::Picture` using the same
+/// staleness-tracked pattern as attachment images.
+fn load_image_into_picture(
+    picture: &Picture,
+    url: &str,
+    client: &Client,
+    rt: &tokio::runtime::Handle,
+    image_generation: &Rc<Cell<u64>>,
+    stored_textures: &Rc<RefCell<Vec<Rc<RefCell<Option<gtk4::gdk::Texture>>>>>>,
+) {
+    let url = url.to_string();
+    let client = client.clone();
+    let rt = rt.clone();
+    let picture_weak = picture.downgrade();
+    let img_gen = image_generation.clone();
+    let gen_at_start = img_gen.get();
+    let stored_texture: Rc<RefCell<Option<gtk4::gdk::Texture>>> = Rc::new(RefCell::new(None));
+    stored_textures.borrow_mut().push(stored_texture.clone());
+    let stored_weak = Rc::downgrade(&stored_texture);
+
+    gtk4::glib::spawn_future_local(async move {
+        let bytes_result = rt.spawn(async move { client.fetch_image_bytes(&url).await }).await;
+
+        if img_gen.get() != gen_at_start {
+            return;
+        }
+        let Some(picture) = picture_weak.upgrade() else { return; };
+        let Some(stored) = stored_weak.upgrade() else { return; };
+
+        match bytes_result {
+            Ok(Ok(bytes)) => {
+                let gbytes = gtk4::glib::Bytes::from_owned(bytes);
+                let stream = gtk4::gio::MemoryInputStream::from_bytes(&gbytes);
+                match gtk4::gdk_pixbuf::Pixbuf::from_stream_at_scale(
+                    &stream, 400, 300, true, gtk4::gio::Cancellable::NONE,
+                ) {
+                    Ok(pixbuf) => {
+                        let texture = gtk4::gdk::Texture::for_pixbuf(&pixbuf);
+                        picture.set_paintable(Some(&texture));
+                        *stored.borrow_mut() = Some(texture);
+                    }
+                    Err(_) => picture.set_visible(false),
+                }
+            }
+            _ => picture.set_visible(false),
+        }
+    });
 }

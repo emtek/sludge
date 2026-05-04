@@ -10,6 +10,18 @@ static CUSTOM_EMOJI: RwLock<Option<HashMap<String, String>>> = RwLock::new(None)
 /// Global ordered list of recently used emoji shortcodes (most recent first).
 static RECENT_EMOJI: RwLock<Vec<String>> = RwLock::new(Vec::new());
 
+/// Workspace team id (e.g. `T04SSGLGV`), set once after `auth.test`. Used to
+/// build deep-link URLs like `https://app.slack.com/client/<team>/<channel>`.
+static TEAM_ID: RwLock<Option<String>> = RwLock::new(None);
+
+pub fn set_team_id(team_id: String) {
+    *TEAM_ID.write().unwrap() = Some(team_id);
+}
+
+pub fn get_team_id() -> Option<String> {
+    TEAM_ID.read().unwrap().clone()
+}
+
 /// Set the custom emoji map (name → local file path for images, or "alias:name" for aliases).
 pub fn set_custom_emoji(emoji: HashMap<String, String>) {
     *CUSTOM_EMOJI.write().unwrap() = Some(emoji);
@@ -76,8 +88,9 @@ pub fn user_display_name(user: &User) -> String {
 /// Replaces `<@UXXXX>` with @Name, `<#CXXXX|name>` with #name,
 /// `<url|label>` with label, `<url>` with url, and emoji shortcodes with unicode.
 pub fn format_message_plain(text: &str, user_names: &HashMap<String, String>, subteam_names: &HashMap<String, String>) -> String {
-    let mut result = String::with_capacity(text.len());
-    let mut rest = text;
+    let decoded = decode_slack_entities(text);
+    let mut result = String::with_capacity(decoded.len());
+    let mut rest = decoded.as_str();
 
     while let Some(start) = rest.find('<') {
         result.push_str(&rest[..start]);
@@ -130,12 +143,43 @@ pub fn format_message_plain(text: &str, user_names: &HashMap<String, String>, su
 /// Format a Slack message as Pango markup with emoji, clickable @mentions, links, and markdown.
 /// The returned string is safe for `Label::set_markup`.
 pub fn format_message_markup(text: &str, user_names: &HashMap<String, String>, subteam_names: &HashMap<String, String>) -> String {
+    // 0. Decode Slack's wire-level HTML entities (&amp;, &lt;, &gt;) so that
+    //    bracket syntax like <http://…> is visible to the next step and so
+    //    literal `>` characters display correctly instead of as `&gt;`.
+    let decoded = decode_slack_entities(text);
     // 1. Process Slack <...> constructs (mentions, links) — also XML-escapes text
-    let with_links = replace_slack_brackets(text, user_names, subteam_names);
+    let with_links = replace_slack_brackets(&decoded, user_names, subteam_names);
     // 2. Apply Slack markdown (bold, italic, strikethrough, code)
     let with_md = apply_slack_markdown(&with_links);
     // 3. Replace emoji shortcodes
     replace_emoji_shortcodes(&with_md)
+}
+
+/// Decode the three HTML entities Slack uses in its wire format (`&amp;`,
+/// `&lt;`, `&gt;`). Single-pass so nested cases like `&amp;lt;` resolve to
+/// `&lt;` rather than `<`.
+pub fn decode_slack_entities(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after = &rest[amp + 1..];
+        if let Some(s) = after.strip_prefix("amp;") {
+            out.push('&');
+            rest = s;
+        } else if let Some(s) = after.strip_prefix("lt;") {
+            out.push('<');
+            rest = s;
+        } else if let Some(s) = after.strip_prefix("gt;") {
+            out.push('>');
+            rest = s;
+        } else {
+            out.push('&');
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Convert Slack markdown to Pango markup.

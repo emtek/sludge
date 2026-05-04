@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::time::Duration;
 use reqwest::header::{HeaderMap, HeaderValue, COOKIE, RETRY_AFTER};
-use slacko::types::{Channel, Message, User};
+use slacko::types::{Channel, User};
+
+use crate::slack::message::MessageExt as Message;
 use tracing::{debug, error, info, warn};
 
 /// Generic Slack API response envelope for stealth-mode raw HTTP calls.
@@ -509,6 +511,7 @@ impl Client {
         Ok(())
     }
 
+
     // ── Reactions ──
 
     pub async fn add_reaction(
@@ -883,3 +886,4 @@ impl Client {
         Ok(all)
     }
 }
+

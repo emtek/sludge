@@ -11,10 +11,17 @@ pub enum SlackEvent {
     MessageReceived {
         channel: String,
         user: Option<String>,
+        /// Set on bot/integration messages (subtype `bot_message`).
+        bot_id: Option<String>,
+        /// Display name the bot/integration posted under (top-level `username`
+        /// on the message, or `bot_profile.name` as a fallback). Bots aren't
+        /// in `users.list`, so this is the only source of a friendly name.
+        username: Option<String>,
         text: String,
         ts: String,
         thread_ts: Option<String>,
         files: Option<Vec<slacko::types::File>>,
+        blocks: Option<Vec<serde_json::Value>>,
     },
     /// A user's presence changed (active/away). `manual` is true when the user
     /// explicitly set it via `users.setPresence` (on any client); false when
@@ -329,6 +336,20 @@ fn dispatch_event(evt: &serde_json::Value, tx: &mpsc::UnboundedSender<SlackEvent
                 .unwrap_or("")
                 .to_string();
             let user = evt.get("user").and_then(|v| v.as_str()).map(String::from);
+            let bot_id = evt.get("bot_id").and_then(|v| v.as_str()).map(String::from);
+            // Prefer the top-level `username` (set by integrations like Geekbot);
+            // fall back to `bot_profile.name` which many apps populate instead.
+            let username = evt
+                .get("username")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .or_else(|| {
+                    evt.get("bot_profile")
+                        .and_then(|p| p.get("name"))
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                })
+                .filter(|s| !s.is_empty());
             let mut text = evt
                 .get("text")
                 .and_then(|v| v.as_str())
@@ -354,14 +375,22 @@ fn dispatch_event(evt: &serde_json::Value, tx: &mpsc::UnboundedSender<SlackEvent
                 .get("files")
                 .and_then(|v| serde_json::from_value(v.clone()).ok());
 
+            let blocks: Option<Vec<serde_json::Value>> = evt
+                .get("blocks")
+                .and_then(|v| v.as_array())
+                .map(|a| a.clone());
+
             if !channel.is_empty() && !ts.is_empty() {
                 let _ = tx.send(SlackEvent::MessageReceived {
                     channel,
                     user,
+                    bot_id,
+                    username,
                     text,
                     ts,
                     thread_ts,
                     files,
+                    blocks,
                 });
             }
         }

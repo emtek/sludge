@@ -1,7 +1,10 @@
 use gtk4::prelude::*;
 use gtk4::{self as gtk, Application, ApplicationWindow, Label};
 use gtk4::gio;
-use slacko::types::{Channel, Message};
+use slacko::types::Channel;
+use slacko::types::Message as SlackoMessage;
+
+use crate::slack::message::MessageExt as Message;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -1259,7 +1262,7 @@ pub fn build_app(
         let window = window.clone();
         let action_cb: crate::ui::channel_sidebar::ChannelActionCallback =
             Rc::new(move |action, channel_id| {
-                // Presence watch/unwatch — no confirmation needed
+                // Presence watch/unwatch and mute toggle — no confirmation needed
                 match &action {
                     ChannelAction::WatchPresence(uid) => {
                         let db2 = db.clone();
@@ -1271,6 +1274,13 @@ pub fn build_app(
                         let db2 = db.clone();
                         let uid = uid.clone();
                         rt.spawn(async move { db2.remove_presence_watch(&uid).await });
+                        return;
+                    }
+                    ChannelAction::ToggleMute => {
+                        sidebar_action.toggle_muted(channel_id);
+                        let snapshot = sidebar_action.muted_snapshot();
+                        let db2 = db.clone();
+                        rt.spawn(async move { db2.save_muted_channels(&snapshot).await });
                         return;
                     }
                     _ => {}
@@ -1289,7 +1299,9 @@ pub fn build_app(
                         "Close conversation?",
                         "You can reopen it later.",
                     ),
-                    ChannelAction::WatchPresence(_) | ChannelAction::UnwatchPresence(_) => unreachable!(),
+                    ChannelAction::WatchPresence(_)
+                    | ChannelAction::UnwatchPresence(_)
+                    | ChannelAction::ToggleMute => unreachable!(),
                 };
 
                 let dialog = gtk::AlertDialog::builder()
@@ -1342,6 +1354,7 @@ pub fn build_app(
                         // Clear message view if showing this channel
                         mv.clear();
                         mv.set_channel_name("Select a channel");
+                        mv.set_channel_topic_markup("");
 
                         // Call API
                         let c = c.clone();
@@ -1351,7 +1364,9 @@ pub fn build_app(
                                 ChannelAction::Leave => c.leave_channel(&cid2).await,
                                 ChannelAction::Archive => c.archive_channel(&cid2).await,
                                 ChannelAction::Close => c.close_conversation(&cid2).await,
-                                ChannelAction::WatchPresence(_) | ChannelAction::UnwatchPresence(_) => return,
+                                ChannelAction::WatchPresence(_)
+                                | ChannelAction::UnwatchPresence(_)
+                                | ChannelAction::ToggleMute => return,
                             };
                             if let Err(e) = result {
                                 tracing::error!("Channel action failed: {e}");
@@ -2267,7 +2282,7 @@ pub fn build_app(
         let window_logout = window.clone();
         gtk4::glib::spawn_future_local(async move {
             // Load cached data in parallel: channels, users, last channel, activity, watched, emoji
-            let (cached_channels, cached_users, last_channel, activity, watched_users, cached_emoji, recent_emoji) = {
+            let (cached_channels, cached_users, last_channel, activity, watched_users, cached_emoji, recent_emoji, muted_channels) = {
                 let db_ch = db.clone();
                 let db_us = db.clone();
                 let db_lc = db.clone();
@@ -2276,6 +2291,7 @@ pub fn build_app(
                 let db_em = db.clone();
                 let db_re = db.clone();
                 let db_meta = db.clone();
+                let db_mu = db.clone();
                 let rt2 = rt.clone();
                 rt2.spawn(async move {
                     let ch = db_ch.load_channels().await;
@@ -2285,6 +2301,7 @@ pub fn build_app(
                     let pw = db_pw.load_presence_watches().await;
                     let em = db_em.load_custom_emoji().await;
                     let re = db_re.load_recent_emoji().await;
+                    let mu = db_mu.load_muted_channels().await;
                     // Merge channel meta newest_ts into activity (use whichever is newer)
                     let meta = db_meta.load_all_channel_meta().await;
                     for (cid, (_oldest, newest, _checked)) in &meta {
@@ -2293,7 +2310,7 @@ pub fn build_app(
                             *entry = newest.clone();
                         }
                     }
-                    (ch, us, lc, act, pw, em, re)
+                    (ch, us, lc, act, pw, em, re, mu)
                 })
                 .await
                 .unwrap()
@@ -2324,6 +2341,10 @@ pub fn build_app(
 
             // Apply watched presence users
             sidebar.set_watched_users(watched_users.into_iter().collect());
+
+            // Apply muted channels — must happen before set_channels so rows
+            // render the mute icon on first paint.
+            sidebar.set_muted_channels(muted_channels);
 
             // Apply cached users
             if let Some(users) = cached_users {
@@ -2697,6 +2718,23 @@ pub fn build_app(
                         message_view.set_channel_name(&name);
                         message_view.members_button.set_visible(!is_dm && !is_mpdm);
                         window.set_title(Some(&format!("{name} — Sludge")));
+
+                        // Topic: channels only (not DMs/MPDMs), formatted with
+                        // the same mrkdwn pipeline as message bodies so
+                        // entities decode and <url|label> shows as label.
+                        let topic_markup = if is_dm || is_mpdm {
+                            String::new()
+                        } else {
+                            ch.topic
+                                .as_ref()
+                                .map(|t| t.value.trim())
+                                .filter(|s| !s.is_empty())
+                                .map(|s| crate::slack::helpers::format_message_markup(
+                                    s, &st.user_names, &st.subteam_names,
+                                ))
+                                .unwrap_or_default()
+                        };
+                        message_view.set_channel_topic_markup(&topic_markup);
                     }
                 }
 
@@ -3550,16 +3588,20 @@ pub fn build_app(
                         let subteam_names = st.subteam_names.clone();
                         drop(st);
                         let msg = Message {
-                            msg_type: "message".into(),
-                            user: Some(self_uid.clone()),
-                            bot_id: None,
-                            text,
-                            ts,
-                            thread_ts: reply_thread_ts.clone(),
-                            channel: Some(channel.clone()),
-                            attachments: None,
-                            reactions: None,
-                            files: None,
+                            inner: SlackoMessage {
+                                msg_type: "message".into(),
+                                user: Some(self_uid.clone()),
+                                bot_id: None,
+                                text,
+                                ts,
+                                thread_ts: reply_thread_ts.clone(),
+                                channel: Some(channel.clone()),
+                                attachments: None,
+                                reactions: None,
+                                files: None,
+                            },
+                            blocks: None,
+                            username: None,
                         };
                         if let Some(tts) = &reply_thread_ts {
                             // Thread reply — insert inline if the thread is expanded
@@ -3701,22 +3743,29 @@ pub fn build_app(
                     SlackEvent::MessageReceived {
                         channel,
                         user,
+                        bot_id,
+                        username,
                         text,
                         ts,
                         thread_ts,
                         files,
+                        blocks,
                     } => {
                         let msg = Message {
-                            msg_type: "message".into(),
-                            user: user.clone(),
-                            bot_id: None,
-                            text: text.clone(),
-                            ts,
-                            thread_ts: thread_ts.clone(),
-                            channel: Some(channel.clone()),
-                            attachments: None,
-                            reactions: None,
-                            files,
+                            inner: SlackoMessage {
+                                msg_type: "message".into(),
+                                user: user.clone(),
+                                bot_id,
+                                text: text.clone(),
+                                ts,
+                                thread_ts: thread_ts.clone(),
+                                channel: Some(channel.clone()),
+                                attachments: None,
+                                reactions: None,
+                                files,
+                            },
+                            blocks,
+                            username,
                         };
 
                         // If this channel isn't in our sidebar, fetch its info
@@ -3915,8 +3964,24 @@ pub fn build_app(
                             });
                         }
 
-                        // Desktop notification for messages not in the active channel
-                        if !is_current {
+                        // Desktop notification for messages not in the active
+                        // channel. Muted channels are suppressed *unless* the
+                        // message mentions the user directly or is a
+                        // `@channel` / `@here` / `@everyone` broadcast — those
+                        // break through mute.
+                        let should_notify = !is_current && {
+                            let mentions_self = {
+                                let self_uid = state.borrow().self_user_id.clone();
+                                !self_uid.is_empty()
+                                    && text.contains(&format!("<@{self_uid}>"))
+                            };
+                            let broadcast = text.contains("<!channel>")
+                                || text.contains("<!here>")
+                                || text.contains("<!everyone>");
+                            !sidebar.is_muted(&channel) || mentions_self || broadcast
+                        };
+
+                        if should_notify {
                             let st = state.borrow();
                             let sender = user
                                 .as_deref()

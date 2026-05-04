@@ -203,6 +203,9 @@ fn main() {
                         }
                         let mut client = slack::client::Client::new(xoxc, xoxd, creds_clone.workspace_url);
                         let info = client.auth_test().await?;
+                        if !info.team_id.is_empty() {
+                            slack::helpers::set_team_id(info.team_id.clone());
+                        }
                         Ok::<(slack::client::Client, slack::client::AuthInfo), String>((client, info))
                     })
                     .await

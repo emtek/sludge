@@ -39,6 +39,9 @@ pub fn launch_or_login(app: &Application, rt: tokio::runtime::Handle, db: Arc<Da
                 }
                 let mut client = crate::slack::client::Client::new(xoxc, xoxd, creds_clone.workspace_url);
                 let info = client.auth_test().await?;
+                if !info.team_id.is_empty() {
+                    crate::slack::helpers::set_team_id(info.team_id.clone());
+                }
                 Ok((client, info))
             })
             .await
@@ -187,6 +190,9 @@ pub fn show_login(app: &Application, rt: tokio::runtime::Handle, db: Arc<Databas
                         tracing::error!("auth.test failed: {e}");
                         e
                     })?;
+                    if !info.team_id.is_empty() {
+                        crate::slack::helpers::set_team_id(info.team_id.clone());
+                    }
 
                     // Save credentials to database
                     let mut creds_to_save = saved_creds_clone;
