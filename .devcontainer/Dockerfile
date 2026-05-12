@@ -25,7 +25,7 @@ ARG RUST_VERSION=stable
 # Shell/UX extras:
 #   fish, zoxide                    -> default shell + smarter cd
 # Misc:
-#   git, curl, tar, gzip, ca-certificates, findutils, which, sudo, shadow-utils
+#   git, gh, curl, tar, gzip, ca-certificates, findutils, which, sudo, shadow-utils
 RUN microdnf install -y --setopt=install_weak_deps=0 --nodocs \
         gcc gcc-c++ make pkgconf-pkg-config \
         gtk4-devel libadwaita-devel \
@@ -35,7 +35,7 @@ RUN microdnf install -y --setopt=install_weak_deps=0 --nodocs \
         openssl-devel sqlite-devel \
         hicolor-icon-theme desktop-file-utils dbus-libs \
         fish zoxide \
-        git curl tar gzip ca-certificates findutils which sudo shadow-utils \
+        git gh curl tar gzip ca-certificates findutils which sudo shadow-utils \
     && microdnf clean all \
     && rm -rf /var/cache/yum /var/cache/dnf
 

@@ -778,32 +778,35 @@ pub fn build_app(
                 rebuild_recent(recents);
             }
 
-            let uid = user_id.clone();
-            let c = client.clone();
-            let result = rt
-                .spawn(async move {
-                    let profile = c.get_user_profile(&uid).await;
-                    let presence = c.get_presence(&uid).await;
-                    (profile, presence)
-                })
-                .await
-                .unwrap();
-
-            let (profile_result, presence_result) = result;
-
-            // Set presence state (without triggering API call)
-            if let Ok(presence) = presence_result {
-                let is_active = presence == "active";
-                *presence_active.borrow_mut() = is_active;
-                if is_active {
-                    active_btn.set_active(true);
-                } else {
-                    away_btn.set_active(true);
-                }
-                profile_avatar.queue_draw();
+            // Sludge is the source of truth for our own presence. Load the
+            // stored intent, reflect it in the UI, and push it to Slack —
+            // don't inherit whatever Slack last knew.
+            let intent_active = db.load_self_presence_intent().await;
+            *presence_active.borrow_mut() = intent_active;
+            if intent_active {
+                active_btn.set_active(true);
+            } else {
+                away_btn.set_active(true);
+            }
+            profile_avatar.queue_draw();
+            {
+                let c = client.clone();
+                rt.spawn(async move {
+                    let target = if intent_active { "auto" } else { "away" };
+                    if let Err(e) = c.set_presence(target).await {
+                        tracing::error!("Failed to assert startup presence: {e}");
+                    }
+                });
             }
             // Now allow toggle handlers to call the API
             *presence_user_changed.borrow_mut() = true;
+
+            let uid = user_id.clone();
+            let c = client.clone();
+            let profile_result = rt
+                .spawn(async move { c.get_user_profile(&uid).await })
+                .await
+                .unwrap();
 
             if let Ok(profile) = profile_result {
                 // Pre-fill current status in the popover
@@ -854,6 +857,7 @@ pub fn build_app(
     {
         let client_p = client.clone();
         let rt_p = rt.clone();
+        let db_p = db.clone();
         let presence_active_ref = presence_active.clone();
         let avatar_ref = profile_avatar.clone();
         let user_changed = presence_user_changed.clone();
@@ -868,7 +872,9 @@ pub fn build_app(
             }
             let c = client_p.clone();
             let rt = rt_p.clone();
+            let db = db_p.clone();
             rt.spawn(async move {
+                db.save_self_presence_intent(true).await;
                 if let Err(e) = c.set_presence("auto").await {
                     tracing::error!("Failed to set presence: {e}");
                 }
@@ -877,6 +883,7 @@ pub fn build_app(
 
         let client_p = client.clone();
         let rt_p = rt.clone();
+        let db_p = db.clone();
         let presence_active_ref = presence_active.clone();
         let avatar_ref = profile_avatar.clone();
         let user_changed = presence_user_changed.clone();
@@ -891,7 +898,9 @@ pub fn build_app(
             }
             let c = client_p.clone();
             let rt = rt_p.clone();
+            let db = db_p.clone();
             rt.spawn(async move {
+                db.save_self_presence_intent(false).await;
                 if let Err(e) = c.set_presence("away").await {
                     tracing::error!("Failed to set presence: {e}");
                 }
@@ -3733,9 +3742,6 @@ pub fn build_app(
         let self_status_icon_rt = self_status_icon.clone();
         let presence_tx = presence_tx.clone();
         let app_rt = app.clone();
-        let active_btn_rt = active_btn.clone();
-        let away_btn_rt = away_btn.clone();
-        let presence_user_changed_rt = presence_user_changed.clone();
 
         gtk4::glib::spawn_future_local(async move {
             while let Some(event) = event_rx.recv().await {
@@ -4074,34 +4080,22 @@ pub fn build_app(
                         let self_uid = state.borrow().self_user_id.clone();
                         let is_self = user.is_empty() || self_uid == user;
                         if is_self {
+                            // Sludge is the source of truth. If Slack reports
+                            // a state that disagrees with our intent (auto-away
+                            // after idle, or a toggle from another client),
+                            // push our intent back. We deliberately don't sync
+                            // the local UI to other clients.
                             let intent_active = *presence_active.borrow();
-                            if manual {
-                                // Authoritative user-initiated change (possibly
-                                // from another client). Sync local intent and
-                                // radio buttons.
-                                *presence_active.borrow_mut() = is_active;
-                                if is_active != intent_active {
-                                    // Temporarily suppress the toggle handler's
-                                    // API call — this change came from Slack.
-                                    *presence_user_changed_rt.borrow_mut() = false;
-                                    if is_active {
-                                        active_btn_rt.set_active(true);
-                                    } else {
-                                        away_btn_rt.set_active(true);
-                                    }
-                                    *presence_user_changed_rt.borrow_mut() = true;
-                                }
-                                profile_avatar.queue_draw();
-                            } else if !is_active && intent_active {
-                                // Slack auto-awayed us but user wants to be
-                                // active. Push back by re-asserting "auto".
+                            if is_active != intent_active {
+                                let target = if intent_active { "auto" } else { "away" };
                                 let c = client_rt.clone();
                                 rt_rt.spawn(async move {
-                                    if let Err(e) = c.set_presence("auto").await {
+                                    if let Err(e) = c.set_presence(target).await {
                                         tracing::error!("Re-assert presence failed: {e}");
                                     }
                                 });
                             }
+                            let _ = manual;
                         }
                         // Resolve effective user ID (manual_presence_change has empty user)
                         let effective_uid = if user.is_empty() { self_uid } else { user };

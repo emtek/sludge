@@ -59,11 +59,6 @@ struct RawProfileResponse {
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct RawPresenceResponse {
-    presence: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize)]
 struct RawCallsRequest {
     url: String,
 }
@@ -492,15 +487,6 @@ impl Client {
     }
 
     // ── Presence ──
-
-    /// Get presence for a user. Returns "active" or "away".
-    pub async fn get_presence(&self, user_id: &str) -> Result<String, String> {
-        info!("Calling users.getPresence for user={user_id}");
-        let data: RawPresenceResponse =
-            Self::stealth_post(&self.http, &self.creds, "users.getPresence", &[("user", user_id)])
-                .await?;
-        Ok(data.presence.unwrap_or_else(|| "active".into()))
-    }
 
     /// Set presence: "auto" (active) or "away".
     pub async fn set_presence(&self, presence: &str) -> Result<(), String> {

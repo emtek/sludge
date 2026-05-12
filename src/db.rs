@@ -1018,6 +1018,31 @@ impl Database {
         }
     }
 
+    // ── Self presence intent ──
+    // Our local source of truth for whether we want to be "active" or "away".
+    // Persisted so a fresh launch can re-assert it to Slack instead of
+    // inheriting whatever Slack last knew.
+
+    pub async fn save_self_presence_intent(&self, active: bool) {
+        let db = self.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            db.kv_set("settings:self_presence_intent", if active { "auto" } else { "away" });
+        })
+        .await;
+    }
+
+    pub async fn load_self_presence_intent(&self) -> bool {
+        let db = self.clone();
+        let val = tokio::task::spawn_blocking(move || {
+            db.kv_get("settings:self_presence_intent")
+        })
+        .await
+        .ok()
+        .flatten();
+        // Default: active. Only an explicit stored "away" makes us away.
+        !matches!(val.as_deref(), Some("away"))
+    }
+
     // ── Preferences ──
 
     pub async fn save_preferences(&self, prefs: &Preferences) {
